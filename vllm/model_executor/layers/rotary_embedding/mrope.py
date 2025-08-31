@@ -25,6 +25,7 @@ def _triton_qwen2vl_mrope_forward(
     n_qh: tl.constexpr,
     n_kh: tl.constexpr,
     hd: tl.constexpr,
+    rd: tl.constexpr,
     pad_n_qh: tl.constexpr,
     pad_n_kh: tl.constexpr,
     pad_hd: tl.constexpr,
@@ -51,19 +52,19 @@ def _triton_qwen2vl_mrope_forward(
     h_end = t_end + mrope_section_h
 
     # Updated stride calculation for half head_dim
-    half_hd = hd // 2
-    t_cos = cos + pid * half_hd
-    h_cos = t_cos + num_tokens * half_hd
-    w_cos = h_cos + num_tokens * half_hd
-    t_sin = sin + pid * half_hd
-    h_sin = t_sin + num_tokens * half_hd
-    w_sin = h_sin + num_tokens * half_hd
+    half_rd = rd // 2
+    t_cos = cos + pid * half_rd
+    h_cos = t_cos + num_tokens * half_rd
+    w_cos = h_cos + num_tokens * half_rd
+    t_sin = sin + pid * half_rd
+    h_sin = t_sin + num_tokens * half_rd
+    w_sin = h_sin + num_tokens * half_rd
 
     # Updated offsets for half head_dim
     cos_offsets = tl.arange(0, pad_hd // 2)
     t_mask = cos_offsets < t_end
     h_mask = (t_end <= cos_offsets) & (cos_offsets < h_end)
-    w_mask = (h_end <= cos_offsets) & (cos_offsets < half_hd)
+    w_mask = (h_end <= cos_offsets) & (cos_offsets < half_rd)
 
     t_cos_row = tl.load(t_cos + cos_offsets, mask=t_mask, other=0)
     h_cos_row = tl.load(h_cos + cos_offsets, mask=h_mask, other=0)
@@ -85,9 +86,9 @@ def _triton_qwen2vl_mrope_forward(
     first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(
         0, pad_hd // 2)[None, :]
     first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (tl.arange(
-        0, pad_hd // 2)[None, :] < hd // 2)
+        0, pad_hd // 2)[None, :] < rd // 2)
     first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (tl.arange(
-        0, pad_hd // 2)[None, :] < hd // 2)
+        0, pad_hd // 2)[None, :] < rd // 2)
 
     q_tile_1 = tl.load(q_ptr + first_half_q_offsets,
                        mask=first_q_mask,
@@ -97,8 +98,8 @@ def _triton_qwen2vl_mrope_forward(
                        other=0).to(sin_row.dtype)
 
     # right half of the head
-    second_half_q_offsets = first_half_q_offsets + (hd // 2)
-    second_half_k_offsets = first_half_k_offsets + (hd // 2)
+    second_half_q_offsets = first_half_q_offsets + (rd // 2)
+    second_half_k_offsets = first_half_k_offsets + (rd // 2)
     second_q_mask = first_q_mask
     second_k_mask = first_k_mask
 
@@ -130,6 +131,7 @@ def triton_mrope(
     sin: torch.Tensor,
     mrope_section: list[int],
     head_size: int,
+    rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Qwen2VL mrope kernel.
 
@@ -166,6 +168,7 @@ def triton_mrope(
         n_q_head,
         n_kv_head,
         head_size,
+        rotary_dim,
         pad_n_q_head,
         pad_n_kv_head,
         pad_hd,
@@ -300,6 +303,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 sin,
                 self.mrope_section,
                 self.head_size,
+                self.rotary_dim,
             )
 
             return q.reshape(query_shape), k.reshape(key_shape)
@@ -382,6 +386,15 @@ class MRotaryEmbedding(RotaryEmbedding):
             )
         elif hf_config.model_type in ["glm4v", "glm4v_moe"]:
             return cls._glm4v_get_input_positions_tensor(
+                input_tokens=input_tokens,
+                hf_config=hf_config,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                context_len=context_len,
+                seq_len=seq_len,
+            )
+        elif hf_config.model_type in ["ernie4_5_moe_vl", "ernie4_5_vl"]:
+            return cls._ernie_get_input_positions_tensor(
                 input_tokens=input_tokens,
                 hf_config=hf_config,
                 image_grid_thw=image_grid_thw,
@@ -510,6 +523,120 @@ class MRotaryEmbedding(RotaryEmbedding):
         return llm_positions, mrope_position_delta
 
     @classmethod
+    def _ernie_get_input_positions_tensor(
+        cls,
+        input_tokens: list[int],
+        hf_config: PretrainedConfig,
+        image_grid_thw: Union[list[list[int]], torch.Tensor],
+        video_grid_thw: Union[list[list[int]], torch.Tensor],
+        context_len: int = 0,
+        seq_len: Optional[int] = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Get mrope input positions and delta value for Ernie VL."""
+
+        image_token_id = hf_config.im_patch_id
+        video_start_token_id = hf_config.video_start_token_id
+        video_end_token_id = hf_config.video_end_token_id
+        spatial_conv_size = hf_config.spatial_conv_size
+        temporal_conv_size = hf_config.temporal_conv_size
+        llm_pos_ids_list: list = []
+
+        if not (image_grid_thw is None and video_grid_thw is None):
+            if isinstance(image_grid_thw, torch.Tensor):
+                image_grid_thw = image_grid_thw.tolist()
+
+            input_token_type: list[str] = []
+            video_check_flg = False
+            for token in input_tokens:
+                if token == video_start_token_id:
+                    video_check_flg = True
+                elif token == video_end_token_id:
+                    video_check_flg = False
+
+                if (token == image_token_id) and (video_check_flg is False):
+                    input_token_type.append("image")
+                elif (token == image_token_id) and (video_check_flg is True):
+                    input_token_type.append("video")
+                else:
+                    input_token_type.append("text")
+
+            input_type_group: list[tuple[str, int, int]] = []
+            for key, group_iter in itertools.groupby(
+                    enumerate(input_token_type), lambda x: x[1]):
+                group_list = list(group_iter)
+                start_index = group_list[0][0]
+                end_index = group_list[-1][0] + 1
+                input_type_group.append((key, start_index, end_index))
+
+            video_frame_num = 1
+            mm_data_idx = 0
+            for modality_type, start_idx, end_idx in input_type_group:
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(
+                    llm_pos_ids_list) > 0 else 0
+                if modality_type == "image":
+                    t, h, w = (
+                        image_grid_thw[mm_data_idx][0],
+                        image_grid_thw[mm_data_idx][1],
+                        image_grid_thw[mm_data_idx][2],
+                    )
+                    llm_grid_t, llm_grid_h, llm_grid_w = \
+                        t, h // spatial_conv_size, w // spatial_conv_size
+
+                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(
+                        -1, llm_grid_h * llm_grid_w).flatten()
+                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
+                        llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
+                        llm_grid_t, llm_grid_h, -1).flatten()
+                    llm_pos_ids_list.append(
+                        torch.stack([t_index, h_index, w_index]) + st_idx)
+                    mm_data_idx += 1
+
+                elif modality_type == "video":
+                    t, h, w = (
+                        video_grid_thw[mm_data_idx][0],
+                        video_grid_thw[mm_data_idx][1],
+                        video_grid_thw[mm_data_idx][2],
+                    )
+                    llm_grid_t, llm_grid_h, llm_grid_w = (t //
+                                                          temporal_conv_size,
+                                                          h //
+                                                          spatial_conv_size,
+                                                          w //
+                                                          spatial_conv_size)
+
+                    for t_idx in range(llm_grid_t):
+                        t_index = torch.tensor(t_idx).view(-1, 1).expand(
+                            -1, llm_grid_h * llm_grid_w).flatten()
+                        h_index = torch.arange(llm_grid_h).view(
+                            1, -1, 1).expand(1, -1, llm_grid_w).flatten()
+                        w_index = torch.arange(llm_grid_w).view(
+                            1, 1, -1).expand(1, llm_grid_h, -1).flatten()
+                        llm_pos_ids_list.append(
+                            torch.stack([t_index, h_index, w_index]) + st_idx)
+
+                    mm_data_idx += 1
+                    video_frame_num += 1
+
+                else:
+                    text_len = end_idx - start_idx
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len).view(1, -1).expand(3, -1) +
+                        st_idx)
+                    video_frame_num = 1
+
+        else:
+            text_len = len(input_tokens)
+            llm_pos_ids_list.append(
+                torch.arange(text_len).view(1, -1).expand(3, -1))
+
+        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+        llm_positions = llm_positions[:, context_len:seq_len]
+        mrope_position_delta = (llm_positions.max() + 1 -
+                                len(input_tokens)).item()
+        return llm_positions, mrope_position_delta
+
+    @classmethod
     def _vl_get_input_positions_tensor(
         cls,
         input_tokens: list[int],
@@ -543,12 +670,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         image_index, video_index = 0, 0
         for _ in range(image_nums + video_nums):
             video_second_per_grid_t = 0.0
-            if image_token_id in input_tokens and remain_images > 0:
-                ed_image = input_tokens.index(image_token_id, st)
+            if remain_images > 0:
+                try:
+                    ed_image = input_tokens.index(image_token_id, st)
+                except ValueError:
+                    ed_image = len(input_tokens) + 1
             else:
                 ed_image = len(input_tokens) + 1
-            if video_token_id in input_tokens and remain_videos > 0:
-                ed_video = input_tokens.index(video_token_id, st)
+            if remain_videos > 0:
+                try:
+                    ed_video = input_tokens.index(video_token_id, st)
+                except ValueError:
+                    ed_video = len(input_tokens) + 1
             else:
                 ed_video = len(input_tokens) + 1
             if ed_image < ed_video:

@@ -23,6 +23,7 @@
 # This file is based on the LLama model definition file in transformers
 """PyTorch Cohere model."""
 from collections.abc import Iterable
+from itertools import islice
 from typing import Optional, Union
 
 import torch
@@ -182,21 +183,13 @@ class CohereAttention(nn.Module):
         )
 
         # Model v2 has interleaved sliding windows, v1 does not
-        interleaved_sliding_window = getattr(config,
-                                             "interleaved_sliding_window",
-                                             None)
-        self.v1 = interleaved_sliding_window is None
+        self.v1 = isinstance(config, CohereConfig)
 
-        layer_idx = extract_layer_index(prefix)
-        layer_has_sliding_window = (
-            getattr(config, "sliding_window_pattern", False) and
-            (layer_idx + 1) % self.config.sliding_window_pattern
-            != 0) or (getattr(config, "layer_types", False)
-                      and config.layer_types[layer_idx] == "sliding_attention")
-
-        self.sliding_window = (interleaved_sliding_window
-                               or config.sliding_window
-                               if layer_has_sliding_window else None)
+        self.sliding_window = None
+        if not self.v1:
+            layer_idx = extract_layer_index(prefix)
+            if config.layer_types[layer_idx] == "sliding_attention":
+                self.sliding_window = config.sliding_window
 
         self.attn = Attention(self.num_heads,
                               self.head_dim,
@@ -330,7 +323,7 @@ class CohereModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
