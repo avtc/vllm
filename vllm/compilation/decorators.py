@@ -491,7 +491,7 @@ def _torch27_patch_tensor_subclasses():
     def return_false(*args, **kwargs):
         return False
 
-    if version.parse("2.7") <= version.parse(torch.__version__) < version.parse("2.8"):
+    if version.parse("2.7") <= version.parse(torch.__version__) < version.parse("2.7.1"):
         yield
         return
 
