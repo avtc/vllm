@@ -3,9 +3,14 @@
 
 import pickle
 import time
+import io
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
+from multiprocessing.reduction import ForkingPickler
+# To use shared tensor serialization with torch.multiprocessing,
+# call 'init_reductions' after importing to register custom reducer functions.
+import torch.multiprocessing
 from threading import Event
 from typing import Any
 from unittest.mock import patch
@@ -502,10 +507,15 @@ class MessageQueue:
                 self._read_spin_timer.record_activity()
                 break
 
-    def enqueue(self, obj, timeout: float | None = None):
+    def enqueue(self, obj, timeout: float | None = None, use_torch_shared_pickler=False):
         """Write to message queue with optional timeout (in seconds)"""
         assert self._is_writer, "Only writers can enqueue"
-        serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        if use_torch_shared_pickler:
+            buf = io.BytesIO()
+            ForkingPickler(buf, pickle.HIGHEST_PROTOCOL).dump(obj)
+            serialized_obj = buf.getvalue()
+        else:
+            serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
         if self.n_local_reader > 0:
             if len(serialized_obj) >= self.buffer.max_chunk_bytes:
                 with self.acquire_write(timeout) as buf:

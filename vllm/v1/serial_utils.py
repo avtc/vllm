@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import zmq
 from msgspec import msgpack
+import base64
 
 from vllm import envs
 from vllm.logger import init_logger
@@ -428,3 +429,9 @@ class MsgpackDecoder:
                 return cloudpickle.loads(data)
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
+
+def image_to_base64(file_path):
+    with open(file_path, "rb") as image_file:
+        image_data = image_file.read()
+        base64_encoded = base64.b64encode(image_data).decode('utf-8')
+        return base64_encoded

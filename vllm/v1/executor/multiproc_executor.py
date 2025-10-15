@@ -176,6 +176,16 @@ class MultiprocExecutor(Executor):
         else:
             self.failure_callback = callback
 
+    def custom_execute_model(
+        self, *args, **kwargs
+    ):
+        (output, ) = self.collective_rpc("custom_execute_model",
+                                args=args, kwargs=kwargs,
+                                unique_reply_rank=self.output_rank,
+                                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+                                use_torch_shared_pickler=False)
+        return output
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -223,6 +233,7 @@ class MultiprocExecutor(Executor):
         kwargs: dict | None = None,
         non_block: bool = False,
         unique_reply_rank: int | None = None,
+        use_torch_shared_pickler: bool = False,
     ) -> list[Any]:
         if self.is_failed:
             raise RuntimeError("Executor failed.")
@@ -241,7 +252,8 @@ class MultiprocExecutor(Executor):
                     method, protocol=pickle.HIGHEST_PROTOCOL
                 )
             self.rpc_broadcast_mq.enqueue(
-                (send_method, args, kwargs, unique_reply_rank)
+                (send_method, args, kwargs, unique_reply_rank),
+                use_torch_shared_pickler=use_torch_shared_pickler,
             )
 
             workers = (
@@ -652,12 +664,15 @@ class WorkerProc:
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
+        use_torch_shared_pickler = output["use_torch_shared_pickler"]
+        output = output["output"]
+
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
-            response_mq.enqueue(result)
+            response_mq.enqueue(result, use_torch_shared_pickler=use_torch_shared_pickler)
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
@@ -675,12 +690,18 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def use_torch_shared_pickler(self, method):
+        if isinstance(method, str):
+            return method in ["custom_execute_model"]
+        return False
+
     def worker_busy_loop(self, cancel: threading.Event | None = None):
         """Main busy loop for Multiprocessing Workers"""
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 cancel=cancel, indefinite=True
             )
+            use_torch_shared_pickler = self.use_torch_shared_pickler(method)
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
@@ -696,10 +717,12 @@ class WorkerProc:
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
-                    self.handle_output(e)
+                    output = dict(output=e, use_torch_shared_pickler=use_torch_shared_pickler)
+                    self.handle_output(output)
                 continue
 
             if output_rank is None or self.rank == output_rank:
+                output = dict(output=output, use_torch_shared_pickler=use_torch_shared_pickler)
                 self.handle_output(output)
 
     @staticmethod

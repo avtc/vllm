@@ -4,7 +4,7 @@
 import enum
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Optional
 
 import msgspec
 import torch
@@ -71,6 +71,10 @@ class EngineCoreRequest(
 
     trace_headers: Mapping[str, str] | None = None
 
+    raw_conversation: list[dict] | None = None
+    task_type: str | None = None
+    task_extra_kwargs: dict[str, Any] | None = None
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
@@ -121,6 +125,7 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    image: str | None = None
 
     @property
     def finished(self) -> bool:

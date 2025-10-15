@@ -28,6 +28,7 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
+    conversation_message_to_dict,
     apply_hf_chat_template,
     apply_mistral_chat_template,
     parse_chat_messages_futures,
@@ -1149,6 +1150,12 @@ class OpenAIServing:
 
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
+
+        # Record raw conversation for t2i pipeleine
+        engine_prompt["raw_conversation"] = [conversation_message_to_dict(message) for message in conversation]
+        engine_prompt["task_type"] = request.task_type
+        if request.task_extra_kwargs is not None:
+            engine_prompt["task_extra_kwargs"] = request.task_extra_kwargs
 
         return conversation, [request_prompt], [engine_prompt]
 

@@ -1392,6 +1392,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+    "VLLM_ENABLE_HUNYUAN_IMAGE3_TASK": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_HUNYUAN_IMAGE3_TASK", "0"))
+    ),
 }
 
 # --8<-- [end:env-vars-definition]

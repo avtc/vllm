@@ -47,7 +47,7 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr, image_to_base64
 
 logger = init_logger(__name__)
 
@@ -677,6 +677,9 @@ class SyncMPClient(MPClient):
                     frames = out_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    for output in outputs.outputs:
+                        if output.image is not None:
+                            output.image = image_to_base64(output.image)
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output, utility_results)
                     else:
@@ -848,6 +851,9 @@ class AsyncMPClient(MPClient):
                     frames = await output_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    for output in outputs.outputs:
+                        if output.image is not None:
+                            output.image = image_to_base64(output.image)
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output, utility_results)
                         continue

@@ -8,4 +8,7 @@ GENERATION_TASKS = get_args(GenerationTask)
 PoolingTask = Literal["encode", "embed", "classify", "score"]
 POOLING_TASKS = get_args(PoolingTask)
 
-SupportedTask = Literal[GenerationTask, PoolingTask]
+CustomTask = Literal["hunyuan_image3"]
+CUSTOM_TASKS = get_args(CustomTask)
+
+SupportedTask = Literal[GenerationTask, PoolingTask, CustomTask]

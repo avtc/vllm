@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast, Callable, Dict
 
 import numpy as np
 import torch
@@ -152,6 +152,7 @@ from .utils import (
     sanity_check_mm_encoder_outputs,
     scatter_mm_placeholders,
 )
+from vllm.multimodal.tasks.hunyuan_image3_orchestrator import register_hunyuan_image3_modelrunner_task_callable
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -163,6 +164,11 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+def _assert_callable(obj: Any, name: str) -> Callable[..., Any]:
+    """Ensure the object is callable; otherwise raise TypeError immediately."""
+    if not callable(obj):
+        raise TypeError(f"{name} is not callable: {obj!r}")
+    return obj
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -510,6 +516,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device="cpu",
             pin_memory=self.pin_memory,
         )
+
+        self._CUSTOM_TASK_REGISTRY: Dict[str, Dict[str, Callable[..., Any]]] = {}
+
+        if envs.VLLM_ENABLE_HUNYUAN_IMAGE3_TASK:
+            register_hunyuan_image3_modelrunner_task_callable(self)
+
+    def register_task_callables(
+        self,
+        task_type: str,
+        preprocess_fn: Callable[..., Any],
+        postprocess_fn: Callable[..., Any],
+        custom_forward_method: str,
+    ) -> None:
+        self._CUSTOM_TASK_REGISTRY[task_type] = {
+            "preprocess_fn": preprocess_fn,
+            "postprocess_fn": postprocess_fn,
+            "custom_forward_method": custom_forward_method,
+        }
+
+    def _get_task_callables(self, task_type: str) -> Dict[str, Any]:
+        try:
+            return self._CUSTOM_TASK_REGISTRY[task_type]
+        except KeyError as exc:
+            raise KeyError(
+                f"task_type={task_type} not registered!"
+            ) from exc
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2676,6 +2708,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
         return async_output
+
+    @torch.inference_mode()
+    def custom_execute_model(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        Execute a single custom forward pass.
+
+        Any missing or non-callable element will raise an exception immediately.
+        """
+        task_type: str = kwargs.pop("task_type", "None")
+        callables: Dict[str, Any] = self._get_task_callables(task_type)
+
+        preprocess_fn  = _assert_callable(callables["preprocess_fn"],  "preprocess_fn")
+        forward_method = callables["custom_forward_method"]            # attribute name only
+        postprocess_fn = _assert_callable(callables["postprocess_fn"], "postprocess_fn")
+
+        attn_meta, exec_args, exec_kwargs = preprocess_fn(*args, **kwargs)
+
+        with set_forward_context(attn_meta, self.vllm_config):
+            forward_callable = _assert_callable(
+                getattr(self.model, forward_method),
+                f"model.{forward_method}"
+            )
+            result = forward_callable(*exec_args, **exec_kwargs)
+
+        return postprocess_fn(result)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._draft_token_ids is None:

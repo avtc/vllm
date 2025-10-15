@@ -5,6 +5,7 @@ import contextlib
 import copy
 import os
 import warnings
+import importlib.util
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -212,13 +213,24 @@ def get_tokenizer(
         )
     else:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+            if kwargs['architectures'][0] == 'HunyuanImage3ForCausalMM':
+                logger.info(f"Loading tokenizer from {tokenizer_name}")
+                module_path = tokenizer_name+"/tokenizer_wrapper.py"
+                module_name = "TokenizerWrapper"
+                spec = importlib.util.spec_from_file_location(module_name, module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                TokenizerWrapper = module.TokenizerWrapper
+                tw = TokenizerWrapper(tokenizer_name)
+                tokenizer = tw.tokenizer
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
         except ValueError as e:
             # If the error pertains to the tokenizer class not existing or not
             # currently being imported,
@@ -292,4 +304,5 @@ def init_tokenizer_from_configs(model_config: ModelConfig):
         trust_remote_code=model_config.trust_remote_code,
         revision=model_config.tokenizer_revision,
         truncation_side=truncation_side,
+        architectures=model_config.hf_config.architectures
     )
