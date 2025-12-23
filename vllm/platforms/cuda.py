@@ -13,6 +13,7 @@ import torch
 from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
+from vllm import envs
 import vllm._C  # noqa
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.logger import init_logger
