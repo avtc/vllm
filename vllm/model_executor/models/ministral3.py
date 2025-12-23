@@ -29,6 +29,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
     PPMissingLayer,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
@@ -208,6 +209,7 @@ class Ministral3Model(nn.Module):
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
         self.config = config
         self.padding_idx = config.pad_token_id
 
@@ -215,6 +217,7 @@ class Ministral3Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=quant_config,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -282,6 +285,7 @@ class Ministral3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
 
         self.model = Ministral3Model(vllm_config=vllm_config, prefix=prefix)
         self.unpadded_vocab_size = self.config.vocab_size
@@ -290,6 +294,7 @@ class Ministral3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = ParallelLMHead(
                 self.unpadded_vocab_size,
                 self.config.hidden_size,
+                quant_config=quant_config,
             )
             logit_scale = getattr(self.config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
@@ -319,51 +324,6 @@ class Ministral3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            is_packed = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                is_packed = True
-                break
-            if is_packed:
-                loaded_params.add(name)
-                continue
-
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-
-            if name not in params_dict:
-                continue
-
-            if is_pp_missing_parameter(name, self):
-                continue
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        from .utils import AutoWeightsLoader
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
