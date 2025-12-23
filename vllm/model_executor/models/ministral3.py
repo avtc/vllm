@@ -16,7 +16,7 @@ from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
 )
@@ -47,9 +48,9 @@ class Ministral3MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            2 * intermediate_size,
+            [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
@@ -268,6 +269,10 @@ class Ministral3Model(nn.Module):
 
 
 class Ministral3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -313,15 +318,16 @@ class Ministral3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "k"),
+            ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -331,18 +337,33 @@ class Ministral3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 is_packed = True
                 break
             if is_packed:
+                loaded_params.add(name)
+                continue
+
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
                 continue
 
             if name not in params_dict:
+                continue
+
+            if is_pp_missing_parameter(name, self):
                 continue
 
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
