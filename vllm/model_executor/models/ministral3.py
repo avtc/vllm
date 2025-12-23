@@ -111,11 +111,14 @@ class Ministral3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        rope_parameters = config.rope_parameters or {}
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=max_position_embeddings,
-            base=int(config.rope_parameters.get("rope_theta", 1000000.0)),
-            rope_parameters=config.rope_parameters,
+            rope_parameters={
+                "rope_theta": 1000000.0,
+                **rope_parameters
+            },
         )
         self.attn = Attention(self.num_heads,
                               self.head_dim,
