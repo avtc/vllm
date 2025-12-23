@@ -120,10 +120,13 @@ class Ministral3Attention(nn.Module):
                 **rope_parameters
             },
         )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads)
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            scale=self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            prefix=prefix,
+        )
 
     def forward(
         self,
