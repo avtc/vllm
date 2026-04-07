@@ -205,6 +205,8 @@ class ModelProvider:
         device_map["vision_model"] = "cuda:0"
         device_map["vision_aligner"] = "cuda:0"
         device_map["timestep_emb"] = "cuda:0"
+        device_map["guidance_emb"] = "cuda:0"
+        device_map["timestep_r_emb"] = "cuda:0"
         device_map["patch_embed"] = "cuda:0"
         device_map["time_embed"] = "cuda:0"
         device_map["time_embed_2"] = "cuda:0"
