@@ -156,6 +156,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MambaSpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -7186,17 +7187,21 @@ class GPUModelRunner(
                         shape_block_size = kernel_block_size
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
-                    # the unquantized shape.
-                    layer_cache_dtype_str = (
-                        "auto"
-                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                        else getattr(
-                            kv_cache_spec,
-                            "cache_dtype_str",
-                            None,
+                    # the unquantized shape. TurboQuant specs have
+                    # kv_quant_mode=NONE but use the global cache_dtype.
+                    if isinstance(kv_cache_spec, TQFullAttentionSpec):
+                        layer_cache_dtype_str = self.cache_config.cache_dtype
+                    elif kv_cache_spec.kv_quant_mode == KVQuantMode.NONE:
+                        layer_cache_dtype_str = "auto"
+                    else:
+                        layer_cache_dtype_str = (
+                            getattr(
+                                kv_cache_spec,
+                                "cache_dtype_str",
+                                None,
+                            )
+                            or self.cache_config.cache_dtype
                         )
-                        or self.cache_config.cache_dtype
-                    )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         shape_block_size,
