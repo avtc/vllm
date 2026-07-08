@@ -155,14 +155,6 @@ class TurboQuantAttentionBackend(AttentionBackend):
         head_size is the model's real head_dim. slot_size_aligned is computed
         from the TQ config to ensure correct cache allocation for all head dims.
         """
-        # Skip layers (--kv-cache-dtype-skip-layers) use the native dtype
-        # ("auto") and need the standard (num_blocks, 2, block_size, ...) shape
-        # even though they share a KV cache group with TurboQuant layers.
-        if cache_dtype_str == "auto" or not cache_dtype_str.startswith(
-            "turboquant_"
-        ):
-            return (num_blocks, 2, block_size, num_kv_heads, head_size)
-
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
         )
