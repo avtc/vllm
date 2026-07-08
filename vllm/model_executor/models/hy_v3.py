@@ -572,6 +572,8 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
+            if ".shared_experts." in name:
+                name = name.replace(".shared_experts.", ".shared_mlp.")
             if "scale" in name:
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
@@ -639,6 +641,8 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                     continue
                 if "router.gate." in name:
                     name = name.replace("router.", "")
+                if "e_score_correction_bias" in name:
+                    name = name.replace("e_score_correction_bias", "expert_bias")
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
