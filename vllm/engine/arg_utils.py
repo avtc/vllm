@@ -1950,11 +1950,15 @@ class EngineArgs:
                 TurboQuantConfig,
             )
 
-            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
+            # Boundary skip layers (first/last N) use FLASH_ATTN with native
+            # dtype while the rest use TURBOQUANT. The KV cache allocation
+            # infrastructure does not yet support mixed backends in the same
+            # group (raw tensor size mismatch during reshape). Skip adding
+            # boundary layers until that is fixed. Users can still manually
+            # pass --kv-cache-dtype-skip-layers if needed.
+            # boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
             existing = set(cache_config.kv_cache_dtype_skip_layers)
-            cache_config.kv_cache_dtype_skip_layers = sorted(
-                existing | set(boundary), key=int
-            )
+            cache_config.kv_cache_dtype_skip_layers = sorted(existing, key=int)
 
         ray_runtime_env = None
         if is_ray_initialized():
