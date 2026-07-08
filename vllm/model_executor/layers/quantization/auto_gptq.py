@@ -243,16 +243,35 @@ class AutoGPTQConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
+            # Resolve dynamic per-module overrides for this MoE layer so that
+            # both the Marlin support check and the WNA16 fallback use the
+            # group_size/bits the layer was actually quantized with. Without
+            # this, the global config values are used, which can (a) wrongly
+            # fail the Marlin support check and (b) cause shape mismatches in
+            # the WNA16 fallback.
+            override_group_size = get_dynamic_override(
+                self, prefix, "group_size"
+            )
+            effective_group_size = (
+                override_group_size
+                if isinstance(override_group_size, int)
+                else self.group_size
+            )
+
             if not check_moe_marlin_supports_layer(
-                layer, self.group_size, allow_tile_padding=not self.desc_act
+                layer, effective_group_size, allow_tile_padding=not self.desc_act
             ):
                 logger.warning_once(
                     f"Layer '{prefix}' is not supported by GPTQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."
                 )
-                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
-                    layer, prefix
-                )
+                wna16_full_config = self.full_config
+                if effective_group_size != self.group_size:
+                    wna16_full_config = deepcopy(self.full_config)
+                    wna16_full_config["group_size"] = effective_group_size
+                return MoeWNA16Config.from_config(
+                    wna16_full_config
+                ).get_quant_method(layer, prefix)
             moe_quant_method = get_moe_quant_method(
                 self, layer, prefix, AutoGPTQMoEMethod
             )
