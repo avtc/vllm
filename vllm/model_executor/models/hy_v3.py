@@ -69,11 +69,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.hy_v3 import HYV3Config
 
-from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
-    get_spec_layer_idx_from_weight_name,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -178,9 +178,7 @@ class HYV3MoEFused(nn.Module):
         else:
             self.shared_mlp = None
 
-        self.expert_bias = nn.Parameter(
-            torch.empty(config.num_experts, dtype=torch.float32)
-        )
+        self.expert_bias = nn.Parameter(torch.empty(config.num_experts))
         scoring_func = "sigmoid"
         e_score_correction_bias = self.expert_bias
 
@@ -271,7 +269,7 @@ class HYV3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             quant_config=quant_config,
-            bias=False,
+            bias=None,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -575,8 +573,6 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if ".shared_experts." in name:
-                name = name.replace(".shared_experts.", ".shared_mlp.")
             if "scale" in name:
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
@@ -642,10 +638,6 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue
-                if "router.gate." in name:
-                    name = name.replace("router.", "")
-                if "e_score_correction_bias" in name:
-                    name = name.replace("e_score_correction_bias", "expert_bias")
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -655,11 +647,38 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         return loaded_params
 
 
-class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+def get_spec_layer_idx_from_weight_name(
+    config: PretrainedConfig, weight_name: str
+) -> int | None:
+    # HYV3MTP is enabled only when num_nextn_predict_layers is greater than 1
+    if (
+        hasattr(config, "num_nextn_predict_layers")
+        and config.num_nextn_predict_layers > 0
+    ):
+        layer_idx = config.num_hidden_layers
+        for i in range(config.num_nextn_predict_layers):
+            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
+                return layer_idx + i
+    return None
+
+
+class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsQuant):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    # Transformers 5.x renames HY3 weight keys via conversion_mapping.py when
+    # loading checkpoints. Quantized checkpoints (e.g. GPTQModel output) save
+    # with these renamed keys. Map them back to the vLLM parameter names so
+    # both weight loading and quantization-layer detection work correctly.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".shared_experts.": ".shared_mlp.",
+            ".e_score_correction_bias": ".expert_bias",
+            ".router.gate.": ".gate.",
+        }
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -723,7 +742,9 @@ class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(_filter_weights(weights))
+        return loader.load_weights(
+            _filter_weights(weights), mapper=self.hf_to_vllm_mapper
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
