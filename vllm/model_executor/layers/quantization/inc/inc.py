@@ -159,11 +159,22 @@ class INCConfig(QuantizationConfig):
 
         layer_config = self.config_parser.resolve(layer, prefix)
         if not layer_config.quantized:
+            logger.debug(
+                "[INC] %s: unquantized (bits=%d)", prefix, layer_config.bits
+            )
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             if isinstance(layer, RoutedExperts):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             return None
+
+        logger.info(
+            "[INC] %s: bits=%d group_size=%d sym=%s",
+            prefix,
+            layer_config.bits,
+            layer_config.group_size,
+            layer_config.sym,
+        )
 
         logger.debug(
             "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",

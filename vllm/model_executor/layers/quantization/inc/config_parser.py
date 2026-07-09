@@ -74,21 +74,24 @@ class INCConfigParser:
 
         def is_explicitly_configured(name: str) -> bool:
             """Return True if *name* has an explicit entry in extra_config,
-            either via exact key match or via a regex pattern key."""
+            either via exact key match, substring match (for plain string
+            keys like "shared_mlp"), or via a regex pattern key."""
             if not self._config.extra_config:
                 return False
             if name in self._config.extra_config:
                 return True
             for pattern in self._config.extra_config:
-                if not isinstance(pattern, str) or not any(
-                    c in REGEX_SPECIAL_CHARS for c in pattern
-                ):
+                if not isinstance(pattern, str):
                     continue
-                try:
-                    if re.search(re.compile(pattern), name) is not None:
-                        return True
-                except re.error:
-                    continue
+                if any(c in REGEX_SPECIAL_CHARS for c in pattern):
+                    try:
+                        if re.search(re.compile(pattern), name) is not None:
+                            return True
+                    except re.error:
+                        continue
+                elif pattern in name:
+                    # Plain string key (no regex chars): substring match
+                    return True
             return False
 
         def get_config(name: str, quantized: bool = True) -> tuple[int, int, bool]:
@@ -112,26 +115,29 @@ class INCConfigParser:
 
             regex_special_chars = set(r"*+?^$()[]{}|\\")
             for pattern, cfg in self._config.extra_config.items():
-                if not isinstance(pattern, str) or not any(
-                    c in regex_special_chars for c in pattern
-                ):
+                if not isinstance(pattern, str):
+                    continue
+                if any(c in regex_special_chars for c in pattern):
+                    try:
+                        if re.search(re.compile(pattern), name) is None:
+                            continue
+                    except re.error:
+                        continue
+                elif pattern not in name:
+                    # Plain string key (no regex chars): substring match
                     continue
 
-                try:
-                    if re.search(re.compile(pattern), name) is not None:
-                        return (
-                            cfg.get(
-                                "bits",
-                                self._config.weight_bits if quantized else 16,
-                            ),
-                            cfg.get(
-                                "group_size",
-                                self._config.group_size if quantized else -1,
-                            ),
-                            cfg.get("sym", self._config.sym if quantized else True),
-                        )
-                except re.error:
-                    continue
+                return (
+                    cfg.get(
+                        "bits",
+                        self._config.weight_bits if quantized else 16,
+                    ),
+                    cfg.get(
+                        "group_size",
+                        self._config.group_size if quantized else -1,
+                    ),
+                    cfg.get("sym", self._config.sym if quantized else True),
+                )
 
             return (
                 self._config.weight_bits if quantized else 16,
