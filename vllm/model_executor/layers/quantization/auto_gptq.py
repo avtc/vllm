@@ -565,6 +565,40 @@ def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
             e0 = d.detach().reshape(-1)[:8].to(torch.float32).tolist()
             logger.warning("[GPTQ-MOE-DIAG] %s %s e0[:8]=%s", prefix, name, e0)
 
+    # Dequant probe: reconstruct expert 0 gate weights from the LOADED
+    # w13_qweight + w13_scales and report stats. Compare against the
+    # standalone checkpoint dequant (verify_rtn_dequant.py) — a mismatch
+    # means the loading corrupted the weights.
+    import numpy
+    qw = getattr(layer, "w13_qweight", None)
+    sc = getattr(layer, "w13_scales", None)
+    if qw is not None and sc is not None:
+        try:
+            e0_qw = qw.data[0]          # [K/pack, 2*Npart]
+            e0_sc = sc.data[0]          # [groups, 2*Npart]
+            kpack, n2 = e0_qw.shape
+            pf = 8
+            k = kpack * pf
+            q = e0_qw.to(torch.int32).cpu().numpy().astype("uint32")
+            out = numpy.zeros((k, n2), dtype=numpy.int32)
+            mask = 0xF
+            for i in range(pf):
+                out[i::pf] = q & mask
+                q >>= 4
+            q4 = torch.from_numpy(out).to(torch.float32)
+            gs = e0_sc.shape[0]
+            scale_rep = e0_sc.to(torch.float32).repeat_interleave(k // gs, dim=0)
+            dq = (q4 - 8.0) * scale_rep
+            logger.warning(
+                "[GPTQ-MOE-DIAG] %s DEQUANT(e0 gate): min=%.4f max=%.4f "
+                "mean=%.5f std=%.5f first4=%s",
+                prefix, float(dq.min()), float(dq.max()),
+                float(dq.mean()), float(dq.std()),
+                dq.reshape(-1)[:4].tolist(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[GPTQ-MOE-DIAG] %s dequant probe failed: %s", prefix, exc)
+
 
 class AutoGPTQMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
