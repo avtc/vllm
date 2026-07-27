@@ -9,6 +9,7 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import PretrainedConfig
 
 import vllm.model_executor.layers.fused_moe  # noqa
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
@@ -483,6 +484,61 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         return self.kernel.apply_weights(layer, x, bias)
 
 
+def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
+    """Print expert weight stats to debug GPTQ MoE loading (RTN garbage bug).
+
+    Activated by VLLM_DEBUG_GPTQ_MOE=1. Logs, for each RoutedExperts layer:
+    - resolved quant config (sym/bits/group/desc_act) and backend/experts_cls
+    - qweight & scales stats (shape, min/max/mean/uniq) for expert 0 BEFORE
+      Marlin repacking, to verify checkpoint data landed in the right params.
+    """
+    import torch
+
+    cfg = method.quant_config
+    prefix = getattr(layer, "prefix", "") or ""
+    logger.warning(
+        "[GPTQ-MOE-DIAG] %s backend=%s experts_cls=%s | "
+        "bits=%d group=%d sym=%s desc_act=%s pack_factor=%s",
+        prefix,
+        method.wna16_moe_backend,
+        getattr(method, "experts_cls", "?"),
+        cfg.weight_bits,
+        cfg.group_size,
+        cfg.is_sym,
+        cfg.desc_act,
+        cfg.pack_factor,
+    )
+    logger.warning(
+        "[GPTQ-MOE-DIAG] %s layer.intermediate_size_per_partition=%s "
+        "hidden_size=%s num_experts=%s",
+        prefix,
+        getattr(layer, "intermediate_size_per_partition", "?"),
+        getattr(layer, "hidden_size", "?"),
+        getattr(layer, "global_num_experts", "?"),
+    )
+    for name in ("w13_qweight", "w2_qweight", "w13_scales", "w2_scales"):
+        t = getattr(layer, name, None)
+        if t is None:
+            logger.warning("[GPTQ-MOE-DIAG] %s %s = MISSING", prefix, name)
+            continue
+        d = t.data
+        on_meta = d.is_meta or d.numel() == 0
+        if on_meta:
+            logger.warning(
+                "[GPTQ-MOE-DIAG] %s %s shape=%s META/EMPTY (not loaded!)",
+                prefix, name, tuple(d.shape),
+            )
+            continue
+        f = d.detach().to(torch.float32).flatten()
+        logger.warning(
+            "[GPTQ-MOE-DIAG] %s %s shape=%s dtype=%s "
+            "min=%g max=%g mean=%g uniq=%d",
+            prefix, name, tuple(d.shape), d.dtype,
+            float(f.min()), float(f.max()), float(f.mean()),
+            int(f.unique().numel()),
+        )
+
+
 class AutoGPTQMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
 
@@ -718,6 +774,9 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         if "w2_bias" not in layer._loaded_expert_biases:
             layer.register_parameter("w2_bias", None)
             w2_bias = None
+
+        if envs.VLLM_DEBUG_GPTQ_MOE:
+            _moe_diag_log(layer, self)
 
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_moe_backend,
