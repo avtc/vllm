@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -29,6 +30,8 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNoOP,
 )
+
+logger = init_logger(__name__)
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
@@ -312,6 +315,37 @@ def fused_marlin_moe(
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
     assert num_bits in [4, 8]
     assert topk_weights.dtype == torch.float32
+
+    # ONE-TIME diagnostic: dump fused_marlin_moe args to compare with
+    # standalone test (test_marlin_moe_kernel.py proved cos=1.0 in isolation).
+    from vllm import envs
+    if envs.VLLM_DEBUG_GPTQ_MOE and not getattr(
+        fused_marlin_moe, "_diag_done", False
+    ):
+        fused_marlin_moe._diag_done = True  # type: ignore[attr-defined]
+        _hs = hidden_states.float()
+        _w1s = w1_scale.float()
+        _w2s = w2_scale.float()
+        logger.warning(
+            "[MARLIN-RUNTIME] hidden_states %s w1 %s w2 %s "
+            "w1_scale %s w2_scale %s",
+            tuple(hidden_states.shape), tuple(w1.shape), tuple(w2.shape),
+            tuple(w1_scale.shape), tuple(w2_scale.shape),
+        )
+        logger.warning(
+            "[MARLIN-RUNTIME] hs min=%g max=%g mean=%g | w1_scale min=%g "
+            "max=%g mean=%g NEG=%.1f%% | topk_ids[:4]=%s topk_weights[:4]=%s "
+            "global_num_experts=%d E=%d quant_type=%s",
+            float(_hs.min()), float(_hs.max()), float(_hs.mean()),
+            float(_w1s.min()), float(_w1s.max()), float(_w1s.mean()),
+            float((_w1s < 0).float().mean()) * 100,
+            topk_ids[:4].tolist(), topk_weights[:4].tolist(),
+            global_num_experts, E, str(quant_type),
+        )
+        logger.warning(
+            "[MARLIN-RUNTIME] w1_scale first4=%s",
+            w1_scale.flatten()[:4].tolist(),
+        )
 
     if global_num_experts == -1:
         global_num_experts = E
