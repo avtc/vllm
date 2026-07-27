@@ -569,7 +569,6 @@ def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
     # w13_qweight + w13_scales and report stats. Compare against the
     # standalone checkpoint dequant (verify_rtn_dequant.py) — a mismatch
     # means the loading corrupted the weights.
-    import numpy
     qw = getattr(layer, "w13_qweight", None)
     sc = getattr(layer, "w13_scales", None)
     if qw is not None and sc is not None:
@@ -579,13 +578,15 @@ def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
             kpack, n2 = e0_qw.shape
             pf = 8
             k = kpack * pf
-            q = e0_qw.to(torch.int32).cpu().numpy().astype("uint32")
-            out = numpy.zeros((k, n2), dtype=numpy.int32)
-            mask = 0xF
+            # Unpack int4 on the same device as the weights (avoid CPU/GPU mix).
+            q = e0_qw.to(torch.int32).to(torch.uint32).view(torch.int32)
+            nibs = []
             for i in range(pf):
-                out[i::pf] = q & mask
-                q >>= 4
-            q4 = torch.from_numpy(out).to(torch.float32)
+                nibs.append((q & 0xF).to(torch.float32))
+                q = q >> 4
+            # interleave: out[0]=nib0[0], out[1]=nib1[0], ..., out[7]=nib7[0],
+            #             out[8]=nib0[1], ...
+            q4 = torch.stack(nibs, dim=1).reshape(k, n2)
             gs = e0_sc.shape[0]
             scale_rep = e0_sc.to(torch.float32).repeat_interleave(k // gs, dim=0)
             dq = (q4 - 8.0) * scale_rep
