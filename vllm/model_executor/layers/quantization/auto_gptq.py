@@ -531,12 +531,16 @@ def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
             )
             continue
         f = d.detach().to(torch.float32).flatten()
+        # Sample to bound memory: torch.unique() on a full 67M-element qweight
+        # allocates a huge intermediate and can OOM. 65k samples is plenty for
+        # a diversity / negativity check.
+        fs = f[:: max(1, f.numel() // 65536)]
         logger.warning(
             "[GPTQ-MOE-DIAG] %s %s shape=%s dtype=%s "
             "min=%g max=%g mean=%g uniq=%d",
             prefix, name, tuple(d.shape), d.dtype,
             float(f.min()), float(f.max()), float(f.mean()),
-            int(f.unique().numel()),
+            int(fs.unique().numel()),
         )
         # scales-only: negativity probe + dtype-mismatch (fp16) probe
         if "scales" in name and d.dtype in (torch.bfloat16, torch.float16):
