@@ -744,6 +744,51 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 tp_size,
             ):
                 continue
+            # Fused UNQUANTIZED qkv_proj (bf16/fp16). The checkpoint's
+            # qkv_proj.weight is pre-sharded into NB=4 contiguous TP-4 blocks
+            # (block i = TP-4 rank i's [q-heads | k-heads | v-heads]); the
+            # default chunk()-based loader scrambles K/V at tp!=4. De-shard to
+            # all_q/all_k/all_v, then re-shard for the serving TP (split
+            # kv-heads if num_kv_heads>=tp else replicate).
+            if (
+                name.endswith(".qkv_proj.weight")
+                and name in params_dict
+                and loaded_weight.dtype != torch.float8_e4m3fn
+            ):
+                param = params_dict[name]
+                attn = self.get_submodule(name[: -len(".qkv_proj.weight")])
+                nh = attn.total_num_heads
+                nkv = attn.total_num_kv_heads
+                hd = attn.head_dim
+                vhd = attn.v_head_dim
+                hidden = loaded_weight.shape[-1]
+                nb = 4  # quant-time TP the fused qkv is pre-sharded for
+                bq = (nh // nb) * hd
+                bk = (nkv // nb) * hd
+                bv = (nkv // nb) * vhd
+                blocks = loaded_weight.view(nb, bq + bk + bv, hidden)
+                all_q = blocks[:, :bq, :].reshape(nh * hd, hidden)
+                all_k = blocks[:, bq : bq + bk, :].reshape(nkv * hd, hidden)
+                all_v = blocks[:, bq + bk :, :].reshape(nkv * vhd, hidden)
+                nhr = nh // tp_size
+                q = all_q[
+                    tp_rank * nhr * hd : (tp_rank + 1) * nhr * hd, :
+                ]
+                if nkv >= tp_size:
+                    kvr = nkv // tp_size
+                    k = all_k[
+                        tp_rank * kvr * hd : (tp_rank + 1) * kvr * hd, :
+                    ]
+                    v = all_v[
+                        tp_rank * kvr * vhd : (tp_rank + 1) * kvr * vhd, :
+                    ]
+                else:
+                    kvi = tp_rank // (tp_size // nkv)
+                    k = all_k[kvi * hd : (kvi + 1) * hd, :]
+                    v = all_v[kvi * vhd : (kvi + 1) * vhd, :]
+                default_weight_loader(param, torch.cat([q, k, v], dim=0))
+                loaded_params.add(name)
+                continue
             stacked_matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
