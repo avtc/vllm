@@ -593,7 +593,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             weight_key,
             quant_config=self.quant_config,
             may_have_zp=True,
-            may_have_bias=True,
+            may_have_bias=getattr(moe, "has_bias", False),
         )
 
     def create_weights(
