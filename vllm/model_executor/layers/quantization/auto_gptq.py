@@ -630,6 +630,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             may_have_zp=True,
             may_have_bias=getattr(moe, "has_bias", False),
         )
+        self.legacy_fused_experts = False
 
     def create_weights(
         self,
@@ -840,6 +841,17 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         if envs.VLLM_DEBUG_GPTQ_MOE:
             _moe_diag_log(layer, self)
 
+        # Legacy bypass: route GPTQ MoE experts through the old fused_experts()
+        # path (same path CompressedTensorsWNA16MoEMethod uses) instead of the
+        # modular Marlin/Triton experts. Workaround for models where the
+        # modular experts produce wrong output on otherwise-correct GPTQ
+        # weights. Weights are transposed to N-first + viewed as uint8
+        # (matching CompressedTensorsWNA16MoEMethod.process_weights), and an
+        # int4_w4a16 quant config with block_shape=[0, gs] is built.
+        if envs.VLLM_GPTQ_MOE_LEGACY_FUSED_EXPERTS:
+            self._setup_legacy_fused_experts(layer)
+            return
+
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_moe_backend,
             layer=layer,
@@ -899,6 +911,58 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         layer.w2_weight = layer.w2_qweight
 
         self._setup_kernel(layer)
+
+    def _setup_legacy_fused_experts(self, layer: RoutedExperts) -> None:
+        """Prepare GPTQ MoE weights for the legacy fused_experts() path.
+
+        Mirrors CompressedTensorsWNA16MoEMethod.process_weights: transpose the
+        packed weights to N-first and view as uint8, transpose scales to
+        N-first, and build an int4/int8 w4a16 quant config with
+        block_shape=[0, group_size] and no zero points (symmetric).
+        """
+        import torch
+
+        from vllm.model_executor.layers.fused_moe.config import (
+            int4_w4a16_moe_quant_config,
+            int8_w8a16_moe_quant_config,
+        )
+
+        w13_packed = layer.w13_qweight.transpose(1, 2).contiguous().view(
+            torch.uint8
+        )
+        w2_packed = layer.w2_qweight.transpose(1, 2).contiguous().view(
+            torch.uint8
+        )
+        w13_scale = layer.w13_scales.transpose(1, 2).contiguous()
+        w2_scale = layer.w2_scales.transpose(1, 2).contiguous()
+
+        layer.register_parameter(
+            "w13_weight_packed",
+            torch.nn.Parameter(w13_packed, requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight_packed",
+            torch.nn.Parameter(w2_packed, requires_grad=False),
+        )
+        replace_parameter(layer, "w13_scales", w13_scale)
+        replace_parameter(layer, "w2_scales", w2_scale)
+
+        gs = self.quant_config.group_size
+        cfg_cls = (
+            int4_w4a16_moe_quant_config
+            if self.quant_config.weight_bits == 4
+            else int8_w8a16_moe_quant_config
+        )
+        self.moe_quant_config = cfg_cls(
+            w1_scale=layer.w13_scales,
+            w2_scale=layer.w2_scales,
+            w1_zp=None,
+            w2_zp=None,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            block_shape=[0, gs] if gs != -1 else None,
+        )
+        self.legacy_fused_experts = True
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         """Build the FusedMoEKernel for this layer."""
@@ -983,6 +1047,16 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             "initialization logic. This function should not be called."
         )
 
+    @property
+    def supports_internal_mk(self) -> bool:
+        # Legacy fused_experts bypass: moe_kernel is None, but we must still
+        # report True so MoERunner.maybe_init_modular_kernel() skips wrapping
+        # us in FusedMoEModularMethod (which would call select_gemm_impl and
+        # raise). Our apply() handles the legacy fused_experts() dispatch.
+        if self.legacy_fused_experts:
+            return True
+        return super().supports_internal_mk
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -993,6 +1067,21 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
+        if self.legacy_fused_experts:
+            from vllm.model_executor.layers.fused_moe import fused_experts
+
+            return fused_experts(
+                x,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                quant_config=self.moe_quant_config,
+            )
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             hidden_states=x,
