@@ -516,7 +516,8 @@ def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
         getattr(layer, "hidden_size", "?"),
         getattr(layer, "global_num_experts", "?"),
     )
-    for name in ("w13_qweight", "w2_qweight", "w13_scales", "w2_scales"):
+    for name in ("w13_qweight", "w2_qweight", "w13_scales", "w2_scales",
+                 "w13_qzeros", "w2_qzeros"):
         t = getattr(layer, name, None)
         if t is None:
             logger.warning("[GPTQ-MOE-DIAG] %s %s = MISSING", prefix, name)
@@ -537,6 +538,32 @@ def _moe_diag_log(layer: RoutedExperts, method: "AutoGPTQMoEMethod") -> None:
             float(f.min()), float(f.max()), float(f.mean()),
             int(f.unique().numel()),
         )
+        # scales-only: negativity probe + dtype-mismatch (fp16) probe
+        if "scales" in name and d.dtype in (torch.bfloat16, torch.float16):
+            neg_pct = float((f < 0).float().mean()) * 100.0
+            logger.warning(
+                "[GPTQ-MOE-DIAG] %s %s NEG=%.1f%%", prefix, name, neg_pct,
+            )
+            # If the raw bytes are actually fp16 but were copied into a
+            # bf16 param, viewing as fp16 should reveal all-positive scales.
+            if d.dtype == torch.bfloat16:
+                f16v = (
+                    d.detach()
+                    .view(torch.int16)
+                    .view(torch.float16)
+                    .to(torch.float32)
+                    .flatten()
+                )
+                logger.warning(
+                    "[GPTQ-MOE-DIAG] %s %s AS-FP16 min=%g max=%g mean=%g "
+                    "NEG=%.1f%%",
+                    prefix, name,
+                    float(f16v.min()), float(f16v.max()), float(f16v.mean()),
+                    float((f16v < 0).float().mean()) * 100.0,
+                )
+            # first 8 values of expert 0
+            e0 = d.detach().reshape(-1)[:8].to(torch.float32).tolist()
+            logger.warning("[GPTQ-MOE-DIAG] %s %s e0[:8]=%s", prefix, name, e0)
 
 
 class AutoGPTQMoEMethod(FusedMoEMethodBase):
