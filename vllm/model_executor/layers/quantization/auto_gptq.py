@@ -931,23 +931,46 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             int8_w8a16_moe_quant_config,
         )
 
-        w13_packed = layer.w13_qweight.transpose(1, 2).contiguous().view(
-            torch.uint8
-        )
-        w2_packed = layer.w2_qweight.transpose(1, 2).contiguous().view(
-            torch.uint8
-        )
+        device = layer.w13_qweight.device
+
+        # Free params that the legacy path does not need (qzeros, g_idx,
+        # sort_indices, bias) to reclaim GPU memory before the transpose.
+        for _name in (
+            "w13_qzeros", "w2_qzeros",
+            "w13_g_idx", "w2_g_idx",
+            "w13_g_idx_sort_indices", "w2_g_idx_sort_indices",
+        ):
+            if hasattr(layer, _name):
+                layer.register_parameter(_name, None)
+        torch.cuda.empty_cache()
+
+        # transpose(1,2).contiguous() creates a full copy; on a nearly-full
+        # GPU this OOMs. Do the transpose on CPU (abundant RAM), free the
+        # original GPU tensor, then move the result back so the GPU never
+        # holds both copies at once.
+        def _to_nfirst_uint8(qweight_param):
+            t = (
+                qweight_param.data.cpu()
+                .transpose(1, 2)
+                .contiguous()
+                .view(torch.uint8)
+            )
+            return torch.nn.Parameter(t.to(device), requires_grad=False)
+
+        w13_packed = _to_nfirst_uint8(layer.w13_qweight)
+        layer.register_parameter("w13_qweight", None)
+        torch.cuda.empty_cache()
+
+        w2_packed = _to_nfirst_uint8(layer.w2_qweight)
+        layer.register_parameter("w2_qweight", None)
+        torch.cuda.empty_cache()
+
+        # Scales are small; transpose on GPU.
         w13_scale = layer.w13_scales.transpose(1, 2).contiguous()
         w2_scale = layer.w2_scales.transpose(1, 2).contiguous()
 
-        layer.register_parameter(
-            "w13_weight_packed",
-            torch.nn.Parameter(w13_packed, requires_grad=False),
-        )
-        layer.register_parameter(
-            "w2_weight_packed",
-            torch.nn.Parameter(w2_packed, requires_grad=False),
-        )
+        layer.register_parameter("w13_weight_packed", w13_packed)
+        layer.register_parameter("w2_weight_packed", w2_packed)
         replace_parameter(layer, "w13_scales", w13_scale)
         replace_parameter(layer, "w2_scales", w2_scale)
 
