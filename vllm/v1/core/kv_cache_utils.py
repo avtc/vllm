@@ -1819,9 +1819,45 @@ def get_kv_cache_groups(
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
+    # [DIAG] dump the real per-layer KV-cache specs so heterogeneous-page-size
+    # failures (e.g. KVarN full-attn + fp16 sliding draft) can be diagnosed from
+    # runtime facts instead of hand calculation.
+    if os.environ.get("VLLM_DIAG_KV_SPECS"):
+        import collections
+
+        _diag = collections.defaultdict(list)
+        for _n, _s in filtered_spec.items():
+            _tq = getattr(_s, "tq_slot_size", 0)
+            _sw = getattr(_s, "sliding_window", None)
+            _diag[
+                (
+                    type(_s).__name__,
+                    _s.block_size,
+                    getattr(_s, "num_kv_heads", None),
+                    getattr(_s, "head_size", None),
+                    _tq,
+                    _sw,
+                )
+            ].append(_s.page_size_bytes)
+        logger.warning(
+            "[DIAG] filtered KV specs (%d layers): %s",
+            len(filtered_spec),
+            {
+                f"{t}|bs={bs}|kvh={kvh}|hd={hd}|tq={tq}|sw={sw}": sorted(set(pages))
+                for (t, bs, kvh, hd, tq, sw), pages in _diag.items()
+            },
+        )
     try:
         filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    except NotImplementedError:
+    except NotImplementedError as _e:
+        # [DIAG] surface the exact page sizes that failed to unify.
+        if os.environ.get("VLLM_DIAG_KV_SPECS"):
+            _pages = {
+                _n: _s.page_size_bytes for _n, _s in filtered_spec.items()
+            }
+            logger.warning(
+                "[DIAG] unify failed (max=%d): %s", max(_pages.values()), _pages
+            )
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
             raise
