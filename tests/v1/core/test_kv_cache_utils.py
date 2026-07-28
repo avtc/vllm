@@ -56,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
@@ -2677,6 +2678,77 @@ def test_unify_kv_cache_page_size_padding_requires_backend_support():
     with pytest.raises(NotImplementedError):
         kv_cache_utils.unify_kv_cache_spec_page_size(specs)
 
+
+def test_unify_kv_cache_page_size_pads_tq_non_divisible():
+    """KVarN/TQ layers pad even when their page does not divide the max.
+
+    Reproduces a Qwen3.6-27B (hybrid) + DFlash-draft + KVarN failure: the
+    target full-attention layers use head_dim=256 (TQ slot 256) while a
+    head_dim=128 KVarN draft layer uses TQ slot 108, and the hybrid
+    linear-attention layers carry a larger page. The draft's page does not
+    divide the maximum, but TQ specs are group-locked (block_size == tile)
+    and must be padded via page_size_padded rather than raising — matching the
+    divisible-TQ path.
+    """
+    target = TQFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        tq_slot_size=256,
+    )
+    draft = TQFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.uint8,
+        tq_slot_size=108,  # 16*108 = 1728, does not divide 16*256 = 4096
+    )
+    specs = {"target": target, "draft": draft}
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(specs)
+
+    assert unified["target"] == target  # max page, unchanged
+    assert unified["draft"].block_size == draft.block_size  # group-locked
+    assert unified["draft"].real_page_size_bytes == draft.real_page_size_bytes
+    assert unified["draft"].page_size_padded == target.page_size_bytes
+    assert unified["draft"].page_size_bytes == target.page_size_bytes
+
+
+def test_unify_kv_cache_page_size_pads_tq_non_divisible_with_larger_max():
+    """A TQ layer padded up to an unrelated (non-multiple) maximum page.
+
+    Mirrors the runtime case where a hybrid linear-attention layer (MambaSpec)
+    or an fp16 sliding layer defines the max page and a head_dim=128 KVarN
+    full-attention layer must be padded to it despite no divisibility.
+    """
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((2048,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )  # page = 2048 * 2 = 4096
+    kvarn = TQFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.uint8,
+        tq_slot_size=108,
+    )  # page = 16 * 108 = 1728
+    assert mamba.page_size_bytes > kvarn.page_size_bytes
+    assert mamba.page_size_bytes % kvarn.page_size_bytes != 0
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"mamba": mamba, "kvarn": kvarn}
+    )
+
+    assert unified["mamba"] == mamba  # max page
+    assert unified["kvarn"].block_size == kvarn.block_size
+    assert unified["kvarn"].page_size_padded == mamba.page_size_bytes
+    assert unified["kvarn"].page_size_bytes == mamba.page_size_bytes
 
 def test_unpadded_page_size_without_quant_matches_real_page():
     # Without quantization the offload transfer width is just the raw page.
