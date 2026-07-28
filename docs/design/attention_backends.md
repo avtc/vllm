@@ -94,6 +94,8 @@ Priority is **1 = highest** (tried first).
 
 --8<-- "gen:priority-standard"
 
+| 6 | `KVARN` |
+| 6 | `KVARN` |
 ### MLA Attention (DeepSeek-style)
 
 --8<-- "gen:priority-mla"
@@ -123,6 +125,7 @@ Priority is **1 = highest** (tried first).
 ## Standard Attention (MHA, MQA, GQA) Backends
 
 --8<-- "gen:table-standard"
+| `KVARN` | | fp16, bf16 | `kvarn_k4v4_g128`, `kvarn_k4v2_g128`, `kvarn_k4v4_g64`, `kvarn_k4v2_g64` | Any | Any | ❌ | ✅ | ✅ | ❌ | Decoder | Any |
 
 > **†** FlashInfer Native is the regular FlashInfer path. XQA is the SM90 decode path exposed through FlashInfer's TRTLLM decode API. trtllm-gen is used on SM100 and supports sinks. Disable XQA/trtllm-gen via `--attention-config.use_trtllm_attention=0`.
 >
