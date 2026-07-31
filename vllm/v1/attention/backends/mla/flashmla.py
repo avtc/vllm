@@ -18,6 +18,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -175,13 +176,26 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         if self.dcp_world_size > 1:
             num_q_heads *= self.dcp_world_size
         num_q_tokens_per_head_k = max_query_len * num_q_heads // 1
-        scheduler_metadata, _ = get_mla_metadata(
-            seq_lens_device,
-            num_q_tokens_per_head_k,
-            1,  # MQA for the decode path
-            is_fp8_kvcache=self.is_fp8_kvcache,
-        )
-        if self.is_fp8_kvcache:
+        # FlashMLA (_flashmla_C) is Hopper/Blackwell-only. On Ampere (cap < 9)
+        # the sparse-MLA decode runs ampere_sparse_decode_fp8 (Triton/BF16),
+        # which only reads block_table/block_size/c128a_* from this metadata and
+        # never touches the FlashMLA scheduler_metadata/num_splits. So skip the
+        # FlashMLA planner on Ampere and leave scheduler_metadata=None.
+        scheduler_metadata = None
+        if (
+            not current_platform.is_cuda()
+            or current_platform.get_device_capability()[0] >= 9
+        ):
+            scheduler_metadata, _ = get_mla_metadata(
+                seq_lens_device,
+                num_q_tokens_per_head_k,
+                1,  # MQA for the decode path
+                is_fp8_kvcache=self.is_fp8_kvcache,
+            )
+        if (
+            self.is_fp8_kvcache
+            and scheduler_metadata is not None
+        ):
             tile_scheduler_metadata, num_splits = get_mla_metadata_dense_fp8(
                 seq_lens_device,
                 num_q_tokens_per_head_k,
