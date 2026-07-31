@@ -902,7 +902,16 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        if current_platform.is_cuda() and not has_deep_gemm():
+        # DeepGEMM (the Hopper+ MQA-logits kernel) is the default CUDA indexer
+        # backend, but SM8x (Ampere) runs the capture-safe Triton/pyref kernels in
+        # ampere/ampere_indexer_logits.py instead (see the `cap[0] < 9` branches in
+        # forward). So the DeepGEMM requirement only applies to Hopper+ (cap >= 9);
+        # on Ampere it must NOT fire, or the indexer cannot even be constructed.
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and current_platform.get_device_capability()[0] >= 9
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
