@@ -530,11 +530,21 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
+        # FlashMLA (_flashmla_C) is Hopper/Blackwell-only; on Ampere (cap < 9)
+        # the sparse-MLA decode runs ampere_sparse_decode_fp8 (Triton/BF16), which
+        # derives everything from swa_metadata's index fields and never reads the
+        # tile_sched holders returned here. So return the all-None sentinel on
+        # Ampere too (same as ROCm/XPU/SM120) -- calling get_mla_metadata() would
+        # raise "vllm._flashmla_C is not available".
         if (
             num_decode_tokens == 0
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            or (
+                current_platform.is_cuda()
+                and current_platform.get_device_capability()[0] < 9
+            )
         ):
             return out
         for layer_type in self._layer_types:
