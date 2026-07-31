@@ -19,9 +19,18 @@ import torch
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+    _fp32_to_fp8_e4m3fn_byte,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.v1.worker.cp_utils import (
+    DEFAULT_CP_LAYOUT,
+    ContextParallelLayout,
+    cp_global_to_local_pos,
+    cp_is_local_pos,
+)
 
 
 @triton.jit
@@ -44,6 +53,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    use_manual_e4m3: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -121,11 +131,15 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+            # SM8x Triton cannot emit fp8e4nv casts; encode e4m3fn manually.
             if use_fnuz:
                 x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            elif use_manual_e4m3:
+                x_uint8 = _fp32_to_fp8_e4m3fn_byte(x_clamped.to(tl.float32))
             else:
                 x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -148,6 +162,90 @@ def quantize_and_insert_k_kernel(
         chunk_offsets = i * 16 + tl.arange(0, 16)
         bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+
+
+def _quantize_and_insert_k_cache_sm86_pyref(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """SM8x reference: batched UE8M0 quant + scatter (torch fp8 cast).
+
+    Ampere Triton cannot emit ``fp8e4nv``; this does the E8M0-scaled quant in
+    torch (``.to(float8_e4m3fn)`` is emulated) and scatters into the paged
+    fp8_ds_mla cache. Ported from the c2fb0133 SM86 build. OCP e4m3fn only.
+    """
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2  # 576
+    N_QUANT_BLOCKS = TOKEN_FP8_DIM // QUANT_BLOCK_SIZE  # 7
+
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+    device = k.device
+    valid_idx = (slot_mapping >= 0).nonzero(as_tuple=True)[0]
+    if valid_idx.numel() == 0:
+        return
+
+    k_v = k[valid_idx]
+    slot_v = slot_mapping[valid_idx].long()
+    block_idx = slot_v // block_size
+    pos_in_block = slot_v % block_size
+    Nv = valid_idx.numel()
+
+    fp8_part = (
+        k_v[:, :TOKEN_FP8_DIM]
+        .to(torch.float32)
+        .view(Nv, N_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
+    )
+    absmax = fp8_part.abs().amax(dim=-1).clamp_min(1e-4)
+    exponent = torch.ceil(torch.log2(absmax / FP8_MAX))
+    scale = torch.pow(2.0, exponent)
+    x_quant = torch.clamp(fp8_part / scale.unsqueeze(-1), -FP8_MAX, FP8_MAX).to(
+        torch.float8_e4m3fn
+    )
+    x_quant_bytes = x_quant.view(torch.uint8).reshape(Nv, TOKEN_FP8_DIM)
+
+    bf16_bytes = k_v[:, TOKEN_FP8_DIM:].contiguous().view(torch.uint8)
+    data_payload = torch.cat([x_quant_bytes, bf16_bytes], dim=1)
+
+    scale_encoded = (exponent + 127.0).clamp(0.0, 255.0).to(torch.uint8)
+    scale_payload = torch.zeros(Nv, TOKEN_SCALE_DIM, dtype=torch.uint8, device=device)
+    scale_payload[:, :N_QUANT_BLOCKS] = scale_encoded
+
+    # Scatter through the ORIGINAL (possibly non-contiguous / row-padded) view.
+    # A reshape(-1) here silently copies when stride(0) > row bytes, discarding
+    # every write; the Triton path never hits this because it uses raw pointers
+    # with k_cache.stride(0). Advanced indexing on the 2D view writes through
+    # to the base storage regardless of stride(0) padding.
+    cache_2d = k_cache if k_cache.dim() == 2 else k_cache.reshape(k_cache.shape[0], -1)
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") == "1" and not globals().get(
+        "_KINS_DBG"
+    ):
+        globals()["_KINS_DBG"] = True
+        print(
+            f"[KINS_DBG] k_cache shape={tuple(k_cache.shape)} "
+            f"stride={k_cache.stride()} contig={k_cache.is_contiguous()} "
+            f"2d_aliases={cache_2d.data_ptr() == k_cache.data_ptr()}",
+            flush=True,
+        )
+    arange_data = torch.arange(TOKEN_DATA_SIZE, device=device)
+    arange_scale = torch.arange(TOKEN_SCALE_DIM, device=device)
+
+    data_cols = (pos_in_block * TOKEN_DATA_SIZE).unsqueeze(-1) + arange_data
+    cache_2d[block_idx.unsqueeze(-1), data_cols] = data_payload
+
+    scale_cols = (
+        block_size * TOKEN_DATA_SIZE + pos_in_block * TOKEN_SCALE_DIM
+    ).unsqueeze(-1) + arange_scale
+    cache_2d[block_idx.unsqueeze(-1), scale_cols] = scale_payload
 
 
 def quantize_and_insert_k_cache(
@@ -177,6 +275,17 @@ def quantize_and_insert_k_cache(
     )
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
+
+    # SM8x (Ampere): the Triton kernel works but must encode e4m3fn manually
+    # (no fp8e4nv casts). Capture-safe, unlike the torch pyref (.nonzero()).
+    use_manual_e4m3 = current_platform.is_cuda() and (
+        current_platform.get_device_capability()[0] < 9
+    )
+    import os
+
+    if use_manual_e4m3 and os.environ.get("VLLM_SM86_KINS_TORCH") == "1":
+        _quantize_and_insert_k_cache_sm86_pyref(k, k_cache, slot_mapping, block_size)
+        return
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -213,6 +322,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        use_manual_e4m3=use_manual_e4m3,
     )
 
 
@@ -239,6 +349,9 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr = 1,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -251,18 +364,52 @@ def _dequantize_and_gather_k_kernel(
         # Gather all tokens
         gather_len = seq_len
     start_pos = seq_len - gather_len
+    local_start_pos = start_pos
+    if DCP_WORLD_SIZE > 1:
+        local_start_pos = cp_global_to_local_pos(
+            start_pos,
+            DCP_WORLD_SIZE,
+            DCP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
 
     for i in range(worker_id, gather_len, num_workers):
         # Calculate the actual token index in the sequence
         pos = start_pos + i
 
         # Calculate which block and position within block
-        block_in_seq = pos // cache_block_size
-        pos_in_block = pos % cache_block_size
+        if DCP_WORLD_SIZE > 1:
+            local_pos = cp_global_to_local_pos(
+                pos,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            block_in_seq = local_pos // cache_block_size
+            pos_in_block = local_pos % cache_block_size
+            is_local = cp_is_local_pos(
+                pos,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            local_i = local_pos - local_start_pos
+        else:
+            block_in_seq = pos // cache_block_size
+            pos_in_block = pos % cache_block_size
+            is_local = True
+            local_i = i
 
         # Get physical block index from block table
         block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
-        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
+        if DCP_WORLD_SIZE > 1:
+            physical_block_idx = tl.load(
+                block_table_row_ptr + block_in_seq,
+                mask=is_local,
+                other=0,
+            )  # int32
+        else:
+            physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
 
         # int64: physical_block_idx * block_stride can exceed 2^31 with many
         # KV-cache blocks (e.g. >= 57K at block_stride ~37K).
@@ -283,7 +430,9 @@ def _dequantize_and_gather_k_kernel(
         token_bf16_ptr = token_data_ptr + fp8_dim
 
         # Output pointer for this token (flattened)
-        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+        output_row_ptr = (
+            out_ptr + batch_idx * out_stride0 + (offset + local_i) * out_stride1
+        )
 
         # ========== Dequantize FP8 portion using UE8M0 ==========
         for qblock_idx in tl.static_range(n_quant_blocks):
@@ -298,12 +447,19 @@ def _dequantize_and_gather_k_kernel(
 
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                 if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    # SM8x: Triton cannot bitcast fp8e4nv; decode e4m3fn manually
+                    # (sign.4-bit exp bias7.3-bit mant).
+                    xi = x_uint8.to(tl.int32)
+                    sign = (xi >> 7) & 1
+                    exp = (xi >> 3) & 0xF
+                    mant = (xi & 0x7).to(tl.float32)
+                    normal = (1.0 + mant * 0.125) * tl.exp2(exp.to(tl.float32) - 7.0)
+                    subnorm = mant * 0.125 * tl.exp2(-6.0)
+                    x_float = tl.where(exp == 0, subnorm, normal) * (
+                        1.0 - 2.0 * sign.to(tl.float32)
+                    )
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -315,7 +471,11 @@ def _dequantize_and_gather_k_kernel(
                 x_dequant = x_float * scale
 
                 # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                tl.store(
+                    output_row_ptr + offsets,
+                    x_dequant.to(tl.bfloat16),
+                    mask=mask & is_local,
+                )
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -327,7 +487,11 @@ def _dequantize_and_gather_k_kernel(
         for j in tl.static_range(bf16_dim // 16):
             chunk_offsets = j * 16 + tl.arange(0, 16)
             bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+            tl.store(
+                output_row_ptr + bf16_output_offset + chunk_offsets,
+                bf16_vals,
+                mask=(chunk_offsets < bf16_dim) & is_local,
+            )
 
 
 def dequantize_and_gather_k_cache_triton(
@@ -344,6 +508,7 @@ def dequantize_and_gather_k_cache_triton(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    cp_layout: ContextParallelLayout = DEFAULT_CP_LAYOUT,
 ) -> None:
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
@@ -375,6 +540,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        **cp_layout.triton_kwargs(),
     )
 
 
@@ -392,6 +558,7 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    cp_layout: ContextParallelLayout = DEFAULT_CP_LAYOUT,
 ) -> None:
     """Dequantize and gather a paged DSv4 K cache.
 
@@ -400,7 +567,13 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    # cutedsl (CUTLASS DSL) is Hopper/Blackwell-only; SM8x -> Triton. The
+    # cutedsl gather also has no CP-layout support, so DCP uses Triton too.
+    if (
+        not cp_layout.enabled
+        and has_cutedsl()
+        and current_platform.get_device_capability()[0] >= 9
+    ):
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
@@ -420,6 +593,7 @@ def dequantize_and_gather_k_cache(
         block_size,
         offset,
         use_fnuz=use_fnuz,
+        cp_layout=cp_layout,
     )
 
 
@@ -526,6 +700,7 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    cp_layout: ContextParallelLayout = DEFAULT_CP_LAYOUT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -560,6 +735,7 @@ def combine_topk_swa_indices(
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
         PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        **cp_layout.triton_kwargs(),
     )
     return combined_indices, combined_lens
 
@@ -580,6 +756,9 @@ def _combine_topk_swa_indices_kernel(
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -598,6 +777,14 @@ def _combine_topk_swa_indices_kernel(
     # (seq_len - gather_len), not position 0. We need this offset
     # to correctly index into the gathered buffer.
     gather_start = seq_len - gather_len
+    local_gather_start = gather_start
+    if DCP_WORLD_SIZE > 1:
+        local_gather_start = cp_global_to_local_pos(
+            gather_start,
+            DCP_WORLD_SIZE,
+            DCP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         # topk_len is fully determined by the query token's absolute position:
@@ -609,31 +796,107 @@ def _combine_topk_swa_indices_kernel(
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
-        offset = tl.arange(0, PADDED_TOP_K)
-        mask = offset < topk_len
-        topk_indices = tl.load(
-            topk_indices_ptr + token_idx * topk_indices_stride + offset,
-            mask=mask,
-        )
-        tl.store(
-            combined_indices_ptr + token_idx * combined_indices_stride + offset,
-            topk_indices + M * batch_idx,
-            mask=mask,
-        )
-        offset = tl.arange(0, WINDOW_SIZE)
-        # Index into gathered buffer: N + (position - gather_start)
-        # For positions [pos - swa_len + 1, pos], the buffer indices are:
-        # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
-        tl.store(
-            combined_indices_ptr
-            + token_idx * combined_indices_stride
-            + topk_len
-            + offset,
-            M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
-            mask=offset < swa_len,
-        )
+        if DCP_WORLD_SIZE > 1:
+            offset = tl.arange(0, PADDED_TOP_K)
+            mask = offset < topk_len
+            global_topk_indices = tl.load(
+                topk_indices_ptr + token_idx * topk_indices_stride + offset,
+                mask=mask,
+                other=-1,
+            )
+            safe_topk_indices = tl.maximum(global_topk_indices, 0)
+            is_local_topk = cp_is_local_pos(
+                safe_topk_indices,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            valid_topk = mask & (global_topk_indices >= 0) & is_local_topk
 
-        combined_len = topk_len + swa_len
+            local_topk_indices = cp_global_to_local_pos(
+                safe_topk_indices,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            local_topk_offsets = tl.cumsum(valid_topk.to(tl.int32), 0) - 1
+            tl.store(
+                combined_indices_ptr
+                + token_idx * combined_indices_stride
+                + local_topk_offsets,
+                local_topk_indices + M * batch_idx,
+                mask=valid_topk,
+            )
+            local_topk_len = tl.sum(valid_topk.to(tl.int32), axis=0)
+
+            swa_start = pos - swa_len + 1
+            swa_end = pos + 1
+            local_swa_start = cp_global_to_local_pos(
+                swa_start,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+
+            local_swa_end = cp_global_to_local_pos(
+                swa_end,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            local_swa_len = local_swa_end - local_swa_start
+
+            offset = tl.arange(0, WINDOW_SIZE)
+            swa_pos = swa_start + offset
+            safe_swa_pos = tl.maximum(swa_pos, 0)
+            is_local_swa = cp_is_local_pos(
+                safe_swa_pos,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            local_swa_pos = cp_global_to_local_pos(
+                safe_swa_pos,
+                DCP_WORLD_SIZE,
+                DCP_RANK,
+                CP_KV_CACHE_INTERLEAVE_SIZE,
+            )
+            local_swa_offsets = local_swa_pos - local_swa_start
+            local_swa_indices = N + local_swa_pos - local_gather_start
+            tl.store(
+                combined_indices_ptr
+                + token_idx * combined_indices_stride
+                + local_topk_len
+                + local_swa_offsets,
+                M * batch_idx + local_swa_indices,
+                mask=(offset < swa_len) & is_local_swa,
+            )
+            combined_len = local_topk_len + local_swa_len
+        else:
+            offset = tl.arange(0, PADDED_TOP_K)
+            mask = offset < topk_len
+            topk_indices = tl.load(
+                topk_indices_ptr + token_idx * topk_indices_stride + offset,
+                mask=mask,
+            )
+            tl.store(
+                combined_indices_ptr + token_idx * combined_indices_stride + offset,
+                topk_indices + M * batch_idx,
+                mask=mask,
+            )
+            offset = tl.arange(0, WINDOW_SIZE)
+            # Index into gathered buffer: N + (position - gather_start)
+            # For positions [pos - swa_len + 1, pos], the buffer indices are:
+            # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
+            tl.store(
+                combined_indices_ptr
+                + token_idx * combined_indices_stride
+                + topk_len
+                + offset,
+                M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
+                mask=offset < swa_len,
+            )
+            combined_len = topk_len + swa_len
         tl.store(combined_lens_ptr + token_idx, combined_len)
 
 

@@ -11,7 +11,7 @@ from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.worker.cp_utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import CPTritonContext, correct_attn_out
 
 

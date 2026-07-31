@@ -73,7 +73,12 @@ def _bf16_mla_sparse_kernel(
             q_buffer + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
         )
 
-    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    # Finite sentinel instead of -inf: a BLOCK_N tile whose indices are all
+    # masked would otherwise give n_e_max == e_max == -inf and
+    # exp2(-inf - -inf) == NaN in the online-softmax rescale. With -1e30 the
+    # arithmetic stays finite (exp2 underflows to exactly 0), so index rows
+    # may contain leading/interior -1 holes (fixed-width layouts).
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - 1e30
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
@@ -122,7 +127,7 @@ def _bf16_mla_sparse_kernel(
 
         # apply scaling
         qk *= sm_scale
-        qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, -float("inf"))
+        qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, -1e30)
 
         # load v
         mask_v_d = offs_dv < dim_v
