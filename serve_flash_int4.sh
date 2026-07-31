@@ -16,8 +16,10 @@
 # (wo_a, compressor/indexer weights) are kept bf16 by the checkpoint's
 # extra_config, so no DeepseekV4-specific quant handling is required.
 #
-# PREREQ (in addition to the main build):  pip install auto_round_kernel
-# (vLLM's INC AutoRound scheme imports it.)
+# PREREQ: NONE beyond the main build. On NVIDIA/CUDA the W4A16 checkpoint runs
+# entirely on Marlin (AutoGPTQ linear + MoE methods); the INC scheme only touches
+# auto_round_kernel on XPU/CPU. Do NOT `pip install auto_round_kernel` — it pins
+# torch==2.9.1 and will downgrade your torch 2.11.0, breaking vLLM. See DSV4_AMPERE.md §3.
 #
 # KNOWN RISK (unverified): the model's fp4 weight-name mapper is selected because
 # the W4A16 config still declares expert_dtype="fp4". The checkpoint's GPTQ keys

@@ -43,28 +43,49 @@ git checkout feat/patched-vllm-0.25-dsv4-ampere
 # Option B: from the Windows checkout, push to a remote the server can reach,
 #           then checkout on the server. (This branch is NOT on upstream.)
 
-# Create the venv and build. VLLM_USE_PRECOMPILED skips C++/CUDA compilation
-# (the ampere backend is pure Python + Triton, so no custom .cu to build).
-uv venv --python 3.12
+# This branch pins torch == 2.11.0 (verified in pyproject.toml build-system and
+# CMakeLists.txt TORCH_SUPPORTED_VERSION_CUDA). For a FIXED-DRIVER / CUDA-12.8 box,
+# do a SOURCE build (below) rather than VLLM_USE_PRECOMPILED=1: the prebuilt
+# binaries are pinned to the CI's torch/driver and can mismatch yours. The ampere
+# backend is pure Python + Triton, so this only compiles the vLLM *core* C++/CUDA
+# extension (fast).
+python3.12 -m venv .venv
 source .venv/bin/activate
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+
+# 1. torch 2.11.0 from the CUDA 12.8 index (matches CUDA 12.8 toolkit/driver)
+pip install --force-reinstall --no-deps \
+     torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+     --index-url https://download.pytorch.org/whl/cu128
+
+# 2. build tools (versions required by vLLM's pyproject)
+pip install "cmake>=3.26" ninja "setuptools>=77,<81" setuptools-scm setuptools-rust
+
+# 3. build the core extension for SM 8.6 ONLY (3090) to cut build time
+export CUDA_HOME=/usr/local/cuda
+export TORCH_CUDA_ARCH_LIST="8.6"
+export MAX_JOBS=8          # raise if you have >128 GB RAM
+pip install -e . --no-build-isolation
 ```
 
 Because vLLM is installed **editable** and the ampere files are committed into
 the tree, they are live — no rebuild is needed when you switch checkpoints.
 
-> If `VLLM_USE_PRECOMPILED=1` can't fetch a prebuilt wheel for your torch/CUDA,
-> drop it and do a full source build (`uv pip install -e . --torch-backend=auto`);
-> that compiles the C++/CUDA extension (~20-40 min) but is otherwise identical.
+> Need a different torch/CUDA? This commit supports `torch == 2.11.0` exactly.
+> `VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto` is a faster
+> alternative (no compile) but uses CI-pinned torch/driver binaries — avoid it on
+> a fixed-driver box.
 
-## 3. (INT4 only) install the AutoRound kernel
+## 3. INT4 note: you do NOT need `auto_round_kernel` on NVIDIA
 
-```bash
-source .venv/bin/activate
-pip install auto_round_kernel
-```
-vLLM's INC scheme (which claims `quant_method: "auto-round"`) imports this at
-load time. Skip this step if you only serve the FP4+FP8 checkpoint.
+The W4A16 checkpoint declares `quant_method: "auto-round"`, which vLLM's
+`INCConfig` claims. But on **CUDA/NVIDIA**, the INC scheme routes every
+quantized layer straight to **Marlin** (`AutoGPTQLinearMethod` for linears,
+`AutoGPTQMoEMethod` for experts) — verified in
+`vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_scheme.py`
+(the ARK/`auto_round_kernel` path is gated behind `is_xpu()`/`is_cpu()` only).
+So **do not** `pip install auto_round_kernel`: it pins `torch==2.9.1` and will
+**downgrade your torch 2.11.0 → 2.9.1, breaking vLLM**. No extra install is
+needed for INT4 on this branch.
 
 ---
 
@@ -91,7 +112,7 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 ## 5. Serve the **INT4 (W4A16 AutoRound)** checkpoint
 
 ```bash
-bash serve_flash_int4.sh        # remember: pip install auto_round_kernel first
+bash serve_flash_int4.sh        # no extra install needed (Marlin on NVIDIA; see §3)
 ```
 Same shape as the FP4 script but targets `Intel/DeepSeek-V4-Flash-W4A16-AutoRound`.
 
