@@ -144,8 +144,18 @@ class INCConfigParser:
 
         quantized = not isinstance(layer, ParallelLMHead)
         if self._config.block_name_to_quantize:
+            # AutoRound emits bare block names ("layers", "mtp") while the
+            # layer_name here is the vLLM module prefix ("model.layers.0...").
+            # Match against both `name` and `model.{name}`, with a trailing-dot
+            # guard so "layers" doesn't match an unrelated "layers_extra".
+            def _in_block(ln: str, name: str) -> bool:
+                return (
+                    ln == name
+                    or ln.startswith(name + ".")
+                    or ln.startswith("model." + name + ".")
+                )
             quantized = any(
-                layer_name.startswith(name)
+                _in_block(layer_name, name)
                 for name in self._config.block_name_to_quantize
             )
 

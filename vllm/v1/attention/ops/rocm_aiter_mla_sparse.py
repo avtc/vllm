@@ -985,22 +985,48 @@ def _get_cached_wo_a_bf16(
     cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
     if cached is not None:
         return cached
-    if hasattr(wo_a, "weight_scale_inv"):
-        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.float32
-        )
-        wo_a_scale = _expand_2d_block_scales(
-            wo_a.weight_scale_inv.view(
-                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
-            ),
-            o_lora_rank,
-            hidden_dim,
-        )
-        cached = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+    if hasattr(wo_a, "weight"):
+        # Unquantized (bf16) or fp8-block-scaled wo_a: read the raw weight.
+        if hasattr(wo_a, "weight_scale_inv"):
+            wo_a_weight = wo_a.weight.view(
+                n_local_groups, o_lora_rank, hidden_dim).to(torch.float32)
+            wo_a_scale = _expand_2d_block_scales(
+                wo_a.weight_scale_inv.view(
+                    n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
+                ),
+                o_lora_rank,
+                hidden_dim,
+            )
+            cached = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+        else:
+            cached = wo_a.weight.view(
+                n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
     else:
-        cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.bfloat16
-        )
+        # wo_a is weight-quantized (e.g. int4 GPTQ/Marlin via AutoRound). The
+        # o-proj is a custom inverse-RoPE einsum that needs the raw [g, r, d]
+        # weight, so recover the dequantized weight ONCE via the quant method's
+        # own apply on an identity input (guaranteed bit-correct for whatever
+        # packing/kernel the method uses) and cache it. This mirrors how the
+        # fp8 branch dequantizes once.
+        quant_method = getattr(wo_a, "quant_method", None)
+        if quant_method is None:
+            raise AttributeError(
+                "wo_a has no .weight and no quant_method; cannot build the "
+                "inverse-RoPE o-proj weight. Re-quantize with wo_a kept bf16 "
+                "(--layer_config {'wo_a':{'bits':16}}).")
+        # Pick a packed weight param to learn device/dtype for the identity.
+        packed = None
+        for attr in ("weight_packed", "qweight", "weight_qweight"):
+            p = getattr(wo_a, attr, None)
+            if isinstance(p, torch.Tensor):
+                packed = p
+                break
+        dev = packed.device if packed is not None else torch.device("cuda")
+        eye = torch.eye(hidden_dim, device=dev, dtype=torch.bfloat16)
+        # quant_method.apply(layer, x) -> x @ W^T ; with x=I this yields W^T.
+        w_t = quant_method.apply(wo_a, eye)
+        cached = w_t.t().contiguous().view(
+            n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
     wo_a._dsv4_wo_a_bf16 = cached
     return cached
 
