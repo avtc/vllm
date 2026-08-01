@@ -465,6 +465,22 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            # [DSv4-ampere debug] baseline (post NCCL/custom-allreduce/cuBLAS/model-load,
+            # pre forward): isolates distributed + context overhead from forward allocations.
+            try:
+                _G = format_gib
+                _alloc0 = torch.accelerator.memory_allocated(self.device)
+                _res0 = torch.accelerator.memory_reserved(self.device)
+                _free0 = torch.accelerator.get_memory_info(self.device)[0]
+                _tot = torch.accelerator.get_memory_info(self.device)[1]
+                _nt0 = (_tot - _free0) - _res0
+                logger.info(
+                    "[VRAM][baseline] pre-profile: torch_alloc=%s reserved=%s | "
+                    "non_torch(CUDActx+NCCL+cuBLAS)=%s GiB",
+                    _G(_alloc0), _G(_res0), _G(_nt0),
+                )
+            except Exception:
+                pass
             self.model_runner.profile_run()
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(

@@ -6293,9 +6293,33 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        def _nt():
+            try:
+                tot = torch.cuda.mem_get_info(self.device)[1] - torch.cuda.mem_get_info(self.device)[0]
+            except Exception:
+                tot = torch.accelerator.memory_reserved(self.device) + 0
+            alloc = torch.accelerator.memory_allocated(self.device)
+            return tot - alloc  # non-torch CUDA bytes
+        _nt0 = _nt()
+        _a0 = torch.accelerator.memory_allocated(self.device)
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        self._sync_device()
+        try:
+            from vllm.logger import init_logger as _il
+            _lg = _il(__name__)
+            _G = lambda b: round(b / (1024**3), 3)
+            _nt1 = _nt()
+            _a1 = torch.accelerator.memory_allocated(self.device)
+            _lg.info(
+                "[VRAM][profile] dummy_run(max_tokens=%d): non_torch %s->%s GiB (+%s); "
+                "torch_alloc %s->%s GiB (+%s peak)",
+                self.max_num_tokens, _G(_nt0), _G(_nt1), _G(_nt1 - _nt0),
+                _G(_a0), _G(_a1), _G(max(0, _a1 - _a0)),
+            )
+        except Exception:
+            pass
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
