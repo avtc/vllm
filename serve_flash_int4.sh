@@ -43,7 +43,13 @@ EAGER_FLAG=""; [ "${EAGER:-0}" = "1" ] && EAGER_FLAG="--enforce-eager"
 CC_FLAG=""
 if [ "${CG_MODE:-FULL}" = "FULL" ]; then
   export VLLM_USE_BREAKABLE_CUDAGRAPH=0
-  CC_FLAG='--compilation-config={"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+  # With --max-num-seqs 1, decode is always batch=1, so capture ONLY that size.
+  # The vLLM default ([1,2,4,8,16,...,248] ~= 33 graphs) wastes 2-3 GiB/GPU of
+  # cudagraph memory on batch sizes that never run -- memory better spent on KV.
+  # Override via CG_CAPTURE_SIZES (JSON array) + matching CG_MAX_CAPTURE_SIZE.
+  CCS="${CG_CAPTURE_SIZES:-[1]}"
+  MCS="${CG_MAX_CAPTURE_SIZE:-1}"
+  CC_FLAG="--compilation-config={"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":${CCS},"max_cudagraph_capture_size":${MCS}}"
 fi
 
 MODEL="${MODEL_PATH:-Intel/DeepSeek-V4-Flash-W4A16-AutoRound}"
