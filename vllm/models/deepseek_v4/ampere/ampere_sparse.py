@@ -9,6 +9,8 @@ Triton kernels for decode (FP8 dequant + BF16 attention) and prefill
 
 from typing import TYPE_CHECKING, cast
 
+import os
+
 import torch
 
 from vllm.config import get_current_vllm_config
@@ -259,6 +261,45 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
 
         assert swa_indices is not None and swa_lens is not None
         q, num_real_heads, dcp_group, use_dcp = _maybe_gather_dcp_q(self, q)
+
+        # Optional: route decode through the fused vLLM-Moet Triton sparse-MLA
+        # port (reads fp8_ds_mla pages + dequants in-register, no flat bf16
+        # workspace) for before/after comparison against the default ampere
+        # two-stage (gather-dequant -> bf16 attention) decode kernel.
+        # The fused kernel applies softmax + attention sink internally and
+        # writes `output` directly, so the (out, lse) + apply_attn_sink /
+        # dcp LSE-merge post-processing is skipped.
+        # NOTE: DCP > 1 is NOT supported on this path (no lse to merge across
+        # ranks); it auto-falls back to the default kernel.
+        if (
+            os.environ.get("VLLM_SM86_TRITON_SPARSE_MLA", "0") == "1"
+            and not use_dcp
+        ):
+            from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
+                triton_sparse_mla_dsv4)
+
+            swa_cache = self.swa_cache_layer.kv_cache
+            extra_cache = kv_cache if not swa_only else None
+            # Fused kernel does softmax + sink internally; returns output only.
+            triton_sparse_mla_dsv4(
+                query=q,
+                swa_kv_cache=swa_cache,
+                sparse_indices=swa_indices.to(torch.int32),
+                compressed_kv_cache=extra_cache,
+                out=output,
+                bmm1_scale=self.scale,
+                sinks=self.attn_sink,
+                kv_layout="NHD",
+                swa_topk_lens=swa_lens.to(torch.int32),
+                extra_sparse_indices=(
+                    topk_indices.to(torch.int32)
+                    if topk_indices is not None else None),
+                extra_sparse_topk_lens=(
+                    topk_lens.to(torch.int32)
+                    if topk_lens is not None else None),
+            )
+            return
+
         out_attn, lse = ampere_sparse_decode_fp8(
             q=q,
             kv_cache=kv_cache,
