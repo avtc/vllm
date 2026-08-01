@@ -26,13 +26,12 @@ EAGER_FLAG=""; [ "${EAGER:-0}" = "1" ] && EAGER_FLAG="--enforce-eager"
 CC_FLAG=""
 if [ "${CG_MODE:-FULL}" = "FULL" ]; then
   export VLLM_USE_BREAKABLE_CUDAGRAPH=0
-  # With --max-num-seqs 1, decode is always batch=1, so capture ONLY that size.
-  # The vLLM default ([1,2,4,8,16,...,248] ~= 33 graphs) wastes 2-3 GiB/GPU of
-  # cudagraph memory on batch sizes that never run -- memory better spent on KV.
-  # Override via CG_CAPTURE_SIZES (JSON array) + matching CG_MAX_CAPTURE_SIZE.
-  CCS="${CG_CAPTURE_SIZES:-[1]}"
-  MCS="${CG_MAX_CAPTURE_SIZE:-1}"
-  CC_FLAG="--compilation-config={"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":${CCS},"max_cudagraph_capture_size":${MCS}}"
+  # No cudagraph_capture_sizes override: vLLM already bounds the capture set to
+  # the actual max decode batch. For --max-num-seqs 1 that is just [1, 2]
+  # (max_cudagraph_capture_size = min(max_num_seqs*2, 512) = 2); the docstring's
+  # "[1,2,4,8,...,248]" is outdated -- the real code filters every step by
+  # max_cudagraph_capture_size. So nothing to trim here.
+  CC_FLAG='--compilation-config={"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
 fi
 
 MODEL="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
@@ -47,7 +46,7 @@ exec .venv/bin/vllm serve "$MODEL" --trust-remote-code \
   --gpu-memory-utilization "$GMU" --cpu-offload-gb "$OFFLOAD" \
   --max-num-seqs 1 \
   --max-model-len "${MAXLEN:-32768}" \
-  --max-num-batched-tokens 4096 \
+  --max-num-batched-tokens "${MAXBATCH:-1024}" \
   --enable-chunked-prefill \
   $EAGER_FLAG $CC_FLAG \
   --host 0.0.0.0 --port "${PORT:-8001}"
