@@ -38,6 +38,22 @@ MODEL="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
 OFFLOAD="${CPU_OFFLOAD_GB:-0}"
 GMU="${GPU_MEM_UTIL:-0.93}"
 
+# --- Optional: fused Triton sparse-MLA decode (vLLM-Moet port) ---------------
+# Set TRITON_SPARSE_MLA=1 to route decode attention through the fused Triton
+# sparse-MLA kernel (reads fp8_ds_mla pages, dequants in-register, no flat bf16
+# workspace) instead of the default two-stage ampere kernel. Same output,
+# different speed/VRAM profile -- compare before/after with a fixed prompt.
+[ "${TRITON_SPARSE_MLA:-0}" = "1" ] && export VLLM_SM86_TRITON_SPARSE_MLA=1
+
+# --- Optional: NCCL/cuBLAS buffer trimming (small VRAM reclaim, ~0.05-0.10 GiB)
+if [ "${ENABLE_NCCL_TUNE:-0}" = "1" ]; then
+  export NCCL_BUFFSIZE=2097152        # 2 MB (default 4 MB)
+  export NCCL_MIN_NCHANNELS=1
+  export NCCL_MAX_NCHANNELS=1
+  export NCCL_NTHREADS=64
+  export NCCL_NET_SOCK_FORCESEND=0
+fi
+
 exec .venv/bin/vllm serve "$MODEL" --trust-remote-code \
   --served-model-name DeepSeek-V4-Flash \
   --tokenizer-mode deepseek_v4 \

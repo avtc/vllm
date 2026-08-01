@@ -128,11 +128,30 @@ Same shape as the FP4 script but targets `Intel/DeepSeek-V4-Flash-W4A16-AutoRoun
 | `CG_MODE` | `FULL` | `FULL` = whole decode step as one cudagraph (fastest). `BREAKABLE` = upstream piecewise (safer). |
 | `EAGER` | `0` | `1` = `--enforce-eager` (no cudagraphs). Bisect first if output looks wrong. |
 | `EAGER=1` then `CG_MODE=BREAKABLE` then `CG_MODE=FULL` | — | Order to bisect cudagraph-capture problems. |
+| `MAXBATCH` | `1024` (int4 script) | `--max-num-batched-tokens`. **Biggest KV lever.** The activation peak reserved during profiling scales ~linearly with this. On 8x3090 INT4, 512 -> ~49K KV tokens; **256 -> ~150K**, 128 -> ~220K. Trade: slower prefill (smaller chunks); decode speed unchanged. |
+| `TRITON_SPARSE_MLA` | `0` | `1` = route **decode** attention through the fused vLLM-Moet Triton sparse-MLA port (reads fp8_ds_mla pages, dequants in-register, no flat bf16 workspace) instead of the default two-stage ampere kernel. Same output, different speed/VRAM profile - A/B compare with a fixed prompt. |
+| `ENABLE_NCCL_TUNE` | `0` | `1` = trim NCCL/cuBLAS buffers (`NCCL_BUFFSIZE=2MB`, 1 channel). Reclaims ~0.05-0.10 GiB/GPU -> ~6-12K extra KV tokens. Most non_torch (~0.45 GiB) is Triton CUmodules + CUDA context (irreducible). |
 | `DCP` | `1` | `>1` enables decode-context-parallel (`--decode-context-parallel-size N --dcp-comm-backend a2a`) for long context. Experimental. |
 
 **OOM during profiling:** the first step is to raise `CPU_OFFLOAD_GB` in steps of
 4-8. On 8x3090 you have ~20-34 GB (FP4+FP8) / ~47 GB (INT4) of headroom after
 weights, so offload=0 should hold for 32k; longer context may need a few GB offload.
+
+### Measured on 8x RTX 3090 (INT4, block-size 256, GMU 0.965, FULL capture, MAXBATCH 512)
+- Weights ~19.1 GiB/GPU; cudagraph ACTUAL = **0.07 GiB** (the 1.44 GiB estimate is wildly off;
+  this branch's `[VRAM]` logging reads the real capture cost). KV pool budget ~0.40 GiB ->
+  **~49K KV tokens**.
+- The packed KV block is ~1 MiB (79% main MLA, 17% indexer/compressor, 3% SWA) - near-optimal
+  for DSv4's multi-cache architecture; cannot improve without dropping layer types.
+- **`non_torch` ~1.4 GiB is mostly irreducible**: 0.43 GiB CUDA context + ~0.45 GiB Triton
+  CUmodules + ~0.56 GiB NCCL/cuBLAS/JIT during forward. NCCL tuning reclaims only ~0.05-0.10 GiB.
+- **The dominant lever is `MAXBATCH`** (the activation peak, ~1.86 GiB at 512): 512->256 halves
+  it and ~3x's the KV pool. Do this before anything else.
+- **vLLM-Moet Triton sparse-MLA port** (`TRITON_SPARSE_MLA=1`): fused decode kernel, may be
+  faster and lower-VRAM than the default two-stage ampere decode. Layout-compatible (same
+  fp8_ds_mla 584-byte packed cache). A/B compare on a fixed prompt - measure tok/s and check
+  the `[VRAM]` available_kv line for a KV difference too.
+
 
 ## 7. Expected performance (honest, unvalidated on 8x3090)
 
