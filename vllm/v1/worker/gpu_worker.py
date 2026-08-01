@@ -522,6 +522,48 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        # [DSv4-ampere debug] Always-visible VRAM breakdown so the KV squeeze
+        # can be attributed to weights / activation / non-torch / cudagraph.
+        _G = format_gib
+        logger.info(
+            "[VRAM] GPU budget(requested)=%s | weights=%s | activation(peak)=%s "
+            "| non_torch=%s | cudagraph(est)=%s | => available_kv=%s",
+            _G(self.requested_memory),
+            _G(profile_result.weights_memory),
+            _G(profile_result.torch_peak_increase),
+            _G(profile_result.non_torch_increase),
+            _G(cudagraph_memory_estimate),
+            _G(self.available_kv_cache_memory_bytes),
+        )
+        # Also dump current torch-allocated vs reserved (catches fragmentation /
+        # caching-allocator overhead that reserved_memory hides).
+        try:
+            _alloc = torch.accelerator.memory_allocated(self.device)
+            _reserved = torch.accelerator.memory_reserved(self.device)
+            logger.info(
+                "[VRAM] torch allocated=%s reserved=%s (reserved-allocated=%s "
+                "is allocator fragmentation/holding).",
+                _G(_alloc), _G(_reserved), _G(_reserved - _alloc),
+            )
+        except Exception:
+            pass
+
+        # [DSv4-ampere debug] Split out construction overhead (buffers allocated
+        # during model build but not counted as weights, e.g. RoPE/indexer/SWA
+        # persistent tensors) vs the actual forward activation peak.
+        try:
+            _con_overhead = (
+                profile_result.before_profile.non_torch_memory
+                - profile_result.before_create.non_torch_memory
+            )
+            logger.info(
+                "[VRAM] model-construction non-torch overhead=%s GiB "
+                "(persistent buffers built during __init__).",
+                _G(_con_overhead),
+            )
+        except Exception:
+            pass
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",

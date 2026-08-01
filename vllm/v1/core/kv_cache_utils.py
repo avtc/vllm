@@ -1300,6 +1300,27 @@ def _get_kv_cache_config_packed(
     num_blocks = available_memory // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
+    # [DSv4-ampere debug] Show how the packed per-block budget is consumed.
+    # DSv4 packs MAIN MLA + INDEXER + COMPRESSOR + SWA caches into one block,
+    # so each block costs the SUM of every layer-type page size -- this is why
+    # num_blocks (and thus KV token capacity) is far lower than a single-pool
+    # model (e.g. HY3/Mimo) with the same available_memory.
+    _GIB = lambda b: round(b / (1024 ** 3), 3)
+    logger.info(
+        "[VRAM][KV-packed] available_memory=%s GiB; total_bytes_per_block=%s "
+        "(%.3f KiB); => num_blocks=%d",
+        f"{_GIB(available_memory)}", total_num_bytes_per_block,
+        total_num_bytes_per_block / 1024.0, num_blocks,
+    )
+    for _ps in sorted(buckets):
+        _nslots = len(buckets[_ps])
+        _nlayers = sum(len(s) for s in buckets[_ps])
+        logger.info(
+            "[VRAM][KV-packed]   page_size=%d bytes: %d slot-col(s), %d layer(s) "
+            "-> %d bytes/block of the packed block",
+            _ps, _nslots, _nlayers, _ps * _nslots,
+        )
+
     total_size = total_num_bytes_per_block * num_blocks
 
     kv_cache_tensors: list[KVCacheTensor] = []
