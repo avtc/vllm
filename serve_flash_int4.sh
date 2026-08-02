@@ -40,17 +40,10 @@ EP_FLAG="--enable-expert-parallel"; [ "${EXPERT_PARALLEL:-1}" = "0" ] && EP_FLAG
 PC_FLAG="";  [ "${PREFIX_CACHE:-1}" = "0" ] && PC_FLAG="--no-enable-prefix-caching"
 ASYNC_FLAG=""; [ "${ASYNC_SCHED:-1}" = "0" ] && ASYNC_FLAG="--no-async-scheduling"
 EAGER_FLAG=""; [ "${EAGER:-0}" = "1" ] && EAGER_FLAG="--enforce-eager"
-# In eager mode there is no cudagraph capture, so vLLM's KV-cache budget never
-# gets shrunk by the capture-retry loop that FULL mode uses. The budget then
-# over-allocates KV (leaves too little headroom) and the first prefill OOMs on
-# the compressor-kernel JIT transient (compress_norm_rope_store_triton). Reserve
-# the headroom FULL mode's cudagraph would have provided by lowering GMU when
-# eager -- unless the caller set GPU_MEM_UTIL explicitly.
-if [ "${EAGER:-0}" = "1" ] && [ -z "${GPU_MEM_UTIL+x}" ]; then
-  EAGER_GMU_FALLBACK=1
-else
-  EAGER_GMU_FALLBACK=0
-fi
+# NOTE: in eager mode the KV-cache budget over-allocates (no cudagraph capture
+# to force it down), so the first prefill can OOM at high GMU. If that happens,
+# lower GPU_MEM_UTIL (e.g. 0.90) to leave headroom for the non_torch (Triton
+# CUmodules + CUDA ctx) the budget under-counts. Not auto-applied -- you set GMU.
 CC_FLAG=""
 if [ "${CG_MODE:-FULL}" = "FULL" ]; then
   export VLLM_USE_BREAKABLE_CUDAGRAPH=0
@@ -64,12 +57,7 @@ fi
 
 MODEL="${MODEL_PATH:-Intel/DeepSeek-V4-Flash-W4A16-AutoRound}"
 OFFLOAD="${CPU_OFFLOAD_GB:-0}"
-if [ "$EAGER_GMU_FALLBACK" = "1" ]; then
-  GMU="0.90"   # eager: reserve ~1.5 GiB extra headroom for prefill JIT transient
-  echo "[serve] EAGER=1 and GPU_MEM_UTIL unset: using GMU=$GMU (lower than the 0.93 FULL default)"
-else
-  GMU="${GPU_MEM_UTIL:-0.93}"
-fi
+GMU="${GPU_MEM_UTIL:-0.93}"
 
 # --- Optional: fused Triton sparse-MLA decode (vLLM-Moet port) ---------------
 # Set TRITON_SPARSE_MLA=1 to route decode attention through the fused Triton
