@@ -324,6 +324,9 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             )
         else:
             output.copy_(apply_attn_sink(out_attn, lse, self.attn_sink))
+        from vllm.models.deepseek_v4.ampere.ampere_sparse_decode_fp8 import (
+            _decode_probe)
+        _decode_probe("decode_output_after_sink", output)
 
     def _forward_prefill(
         self,

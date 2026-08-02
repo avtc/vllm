@@ -22,6 +22,41 @@ QUANT_BLOCK_SIZE = 64  # Elements per quant block
 OUTPUT_DIM = 512  # = TOKEN_FP8_DIM + TOKEN_BF16_DIM after dequant
 TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2  # 576 bytes per token
 
+# [DSv4-ampere debug] One-shot non-finite probe for the decode kernel internals.
+# Logs (once per process PER PROBE NAME) the first step at which a tensor inside
+# the decode path becomes non-finite, so the divergence point (dequant overflow
+# vs softmax overflow vs apply_attn_sink) is visible. Gated by
+# VLLM_SM86_NAN_PROBE=1.
+_DECODE_PROBE_FIRED = {}
+
+
+def _decode_probe(name: str, t) -> None:
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if t is None:
+        return
+    tf = t.detach().float()
+    if not tf.numel():
+        return
+    has_nonfinite = bool(
+        torch.isnan(tf).any().item() or torch.isinf(tf).any().item()
+    )
+    if not has_nonfinite:
+        return
+    if _DECODE_PROBE_FIRED.get(name):
+        return
+    _DECODE_PROBE_FIRED[name] = True
+    n_nan = int(torch.isnan(tf).sum().item())
+    n_inf = int(torch.isinf(tf).sum().item())
+    amax = float(tf.abs().amax().item())
+    print(
+        f"[DECODE_PROBE ### {name} ###] nan={n_nan} inf={n_inf} "
+        f"absmax={amax:.6e} shape={tuple(t.shape)}",
+        flush=True,
+    )
+
 
 @triton.jit
 def _dequant_gather_slots_kernel(
@@ -231,6 +266,12 @@ def ampere_sparse_decode_fp8(
         compressed_block_size = kv_cache.shape[1]
         dequant_gather_slots(topk_buf, kv_cache, topk_flat, compressed_block_size)
         ws_3d[:, :max_topk, :] = topk_buf.view(num_tokens, max_topk, OUTPUT_DIM)
+        _decode_probe("topk_dequant", topk_buf)
+        # Also surface the raw slot indices that were selected: out-of-range or
+        # uninitialized slots are the prime suspect for a garbage UE8M0 scale.
+        if topk_idx_2d is not None:
+            _decode_probe("topk_indices", topk_idx_2d.to(torch.float32))
+            _decode_probe("topk_lens", topk_lens.to(torch.float32) if topk_lens is not None else None)
 
     # Dequant+gather SWA slots
     swa_flat = swa_idx_2d.reshape(-1).to(torch.int32)
@@ -241,6 +282,7 @@ def ampere_sparse_decode_fp8(
     dequant_gather_slots(swa_buf, swa_kv_cache, swa_flat, swa_block_size)
 
     ws_3d[:, max_topk:, :] = swa_buf.view(num_tokens, max_swa, OUTPUT_DIM)
+    _decode_probe("swa_dequant", swa_buf)
 
     # Build combined indices into the flat workspace, FIXED-WIDTH layout:
     # token t's row = [topk slots 0..max_topk) | swa slots 0..max_swa) | pad],
@@ -303,4 +345,6 @@ def ampere_sparse_decode_fp8(
             d_v=q.shape[-1],
             block_dpe=0,
         )
+    _decode_probe("kernel_out_attn", out_attn)
+    _decode_probe("kernel_lse", lse)
     return out_attn, lse
