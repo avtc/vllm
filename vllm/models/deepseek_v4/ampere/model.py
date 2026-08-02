@@ -63,6 +63,18 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 _NAN_PASS = [0]
 _LOGIT_PROBE_N = [0]
+# Pass number (value of _NAN_PASS[0]) at which the first non-finite tensor was
+# observed. -1 = none yet. Used to capture the *first* divergent forward in
+# full (every probe in that pass logs) while suppressing the unbounded flood
+# that follows once the residual is permanently NaN.
+_NAN_DIVERGE_PASS = [-1]
+
+
+def _probe_layers() -> bool:
+    """True when the per-layer sub-probes (attn_out/ffn_out) should fire."""
+    import os
+
+    return os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
 
 
 def _nan_probe_logits(hidden, logits, lm_head) -> None:
@@ -74,8 +86,9 @@ def _nan_probe_logits(hidden, logits, lm_head) -> None:
     """
     import os
 
-    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1" or _LOGIT_PROBE_N[0] >= 60:
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
         return
+    verbose = _LOGIT_PROBE_N[0] < 60
     call = _LOGIT_PROBE_N[0]
     _LOGIT_PROBE_N[0] += 1
 
@@ -93,8 +106,30 @@ def _nan_probe_logits(hidden, logits, lm_head) -> None:
         w = getattr(lm_head, "weight", None)
         print(f"[LOGIT_PROBE] lm_head.weight: {_stat(w)} "
               f"type={type(lm_head).__name__}", flush=True)
+    # Always detect non-finite so divergence at step ~2053 is caught.
+    lf = logits.detach().float() if logits is not None else None
+    nonfinite = (
+        bool(torch.isnan(lf).any().item()) or bool(torch.isinf(lf).any().item())
+        if lf is not None else False
+    )
+    if nonfinite:
+        # Flood control: only log non-finite logits for the first divergent
+        # pass (captured by the residual probes inside the forward).
+        if _NAN_DIVERGE_PASS[0] == -1:
+            _NAN_DIVERGE_PASS[0] = _NAN_PASS[0]
+        if _NAN_PASS[0] != _NAN_DIVERGE_PASS[0]:
+            return
+        n_nan = int(torch.isnan(lf).sum().item()) if lf is not None else 0
+        n_inf = int(torch.isinf(lf).sum().item()) if lf is not None else 0
+        print(
+            f"[LOGIT_PROBE *** NON-FINITE *** call{call} "
+            f"pass{_NAN_PASS[0]}] logits nan={n_nan} inf={n_inf}",
+            flush=True,
+        )
+        return
+    if not verbose:
+        return
     # last-row logits -> top-6 token ids the sampler will pick from
-    lf = logits.detach().float()
     row = lf[-1] if lf.dim() == 2 else lf
     finite = torch.nan_to_num(row, nan=-1e30, posinf=-1e30, neginf=-1e30)
     top = torch.topk(finite, 6)
@@ -107,15 +142,47 @@ def _nan_probe_logits(hidden, logits, lm_head) -> None:
 def _nan_probe(name: str, x: torch.Tensor) -> None:
     """Env-gated residual-stream inf/nan probe (VLLM_SM86_NAN_PROBE=1).
 
-    Logs per-module absmax on the FIRST forward pass so the point where
-    magnitude blows up (before it becomes NaN via inf-inf) is visible. Does
-    not raise; the first non-finite module in execution order is the root.
+    Two modes:
+    - Early passes (<40): log per-module absmax/sum so the magnitude buildup
+      before divergence is visible.
+    - ALL passes: if non-finite (inf/nan) is detected, log it loudly with the
+      pass number and module name. This catches divergence at step ~2053 which
+      is far beyond the 40-pass early-logging window.
     """
     import os
 
-    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1" or _NAN_PASS[0] >= 40:
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if x is None:
         return
     xf = x.detach().float()
+    has_nonfinite = bool(
+        torch.isnan(xf).any().item() or torch.isinf(xf).any().item()
+    ) if xf.numel() else False
+    if has_nonfinite:
+        # Record the pass in which divergence first happened.
+        if _NAN_DIVERGE_PASS[0] == -1:
+            _NAN_DIVERGE_PASS[0] = _NAN_PASS[0]
+            print(
+                f"[NAN_PROBE ### FIRST DIVERGENCE at pass "
+                f"{_NAN_PASS[0]} ###]",
+                flush=True,
+            )
+        # Flood control: only log non-finite for the first divergent pass so
+        # the full flow of NaN through one forward is visible once, then stop.
+        if _NAN_PASS[0] != _NAN_DIVERGE_PASS[0]:
+            return
+        n_nan = int(torch.isnan(xf).sum().item()) if xf.numel() else 0
+        n_inf = int(torch.isinf(xf).sum().item()) if xf.numel() else 0
+        amax = float(xf.abs().amax().item()) if xf.numel() else 0.0
+        print(
+            f"[NAN_PROBE *** NON-FINITE *** p{_NAN_PASS[0]} n{x.shape[0]}] "
+            f"{name}: nan={n_nan} inf={n_inf} absmax={amax:.4e}",
+            flush=True,
+        )
+        return
+    if _NAN_PASS[0] >= 40:
+        return
     amax = float(xf.abs().amax().item()) if xf.numel() else 0.0
     csum = float(xf.sum().item()) if xf.numel() else 0.0
     print(
@@ -890,6 +957,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self._probe_l0 = prefix.endswith("layers.0")
+        # Layer index for the residual NaN probe (so the per-layer sub-probes
+        # like attn_out / ffn_out are labelled with their layer number).
+        try:
+            self._li = int(prefix.rsplit("layers.", 1)[1].split(".")[0])
+        except (IndexError, ValueError):
+            self._li = -1
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4AmpereAttention(
@@ -1018,10 +1091,14 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if self._probe_l0:
             _nan_probe("L0.pre_attn", x)
+        elif _probe_layers():
+            _nan_probe(f"L{self._li}.pre_attn", x)
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
         if self._probe_l0:
             _nan_probe("L0.attn_out", x)
+        elif _probe_layers():
+            _nan_probe(f"L{self._li}.attn_out", x)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -1039,10 +1116,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if self._probe_l0:
             _nan_probe("L0.post_mhc", x)
+        elif _probe_layers():
+            _nan_probe(f"L{self._li}.post_mhc", x)
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         if self._probe_l0:
             _nan_probe("L0.ffn_out", x)
+        elif _probe_layers():
+            _nan_probe(f"L{self._li}.ffn_out", x)
         return x, residual, post_mix, res_mix
 
 
