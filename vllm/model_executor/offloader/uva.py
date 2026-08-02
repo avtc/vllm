@@ -18,6 +18,90 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 
+def _gib(num_bytes: int) -> float:
+    return num_bytes / (1024**3)
+
+
+def _mib(num_bytes: int) -> float:
+    return num_bytes / (1024**2)
+
+
+def _is_rank0() -> bool:
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+        return get_world_group().rank_in_group == 0
+    except Exception:
+        return True
+
+
+def _probe_sticky_cuda_error(
+    name: str, t: torch.Tensor, offloaded_so_far: int
+) -> str | None:
+    """Surface a sticky CUDA error *before* pin_memory().
+
+    cudaHostAlloc raising "invalid argument" is almost always a *sticky* CUDA
+    error left behind by an earlier failed op (e.g. an allocation that tripped
+    during tight-VRAM weight loading), not a problem with this tensor. A tiny
+    no-op CUDA op will re-raise the sticky error, exposing the real cause.
+    Returns a warning string if a sticky error is found, else None.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        torch.cuda.synchronize()
+        torch.zeros(1, device="cuda")  # no-op to surface a sticky error
+    except Exception as probe_err:
+        return (
+            "[UVA-OFFLOAD] sticky CUDA error detected BEFORE pinning "
+            f"param {name!r} (shape={tuple(t.shape)}, dtype={t.dtype}, "
+            f"size={_mib(t.numel() * t.element_size()):.2f} MiB, offloaded so "
+            f"far={_gib(offloaded_so_far):.2f} GiB): {probe_err!r}. "
+            "=> the pin_memory() failure below is a symptom of this earlier "
+            "error, not the param itself. Investigate the FIRST CUDA error "
+            "earlier in the log."
+        )
+    return None
+
+
+def _maybe_log_pin(name: str, t: torch.Tensor, offloaded_so_far: int) -> None:
+    """Throttled progress log (rank0 only) of which tensors are being pinned."""
+    if not _is_rank0():
+        return
+    this = t.numel() * t.element_size()
+    # Log first 8 GiB worth plus an entry every 8 GiB thereafter.
+    if offloaded_so_far < 8 * (1024**3) or (
+        offloaded_so_far % (8 * (1024**3)) < this
+    ):
+        logger.info(
+            "[UVA-OFFLOAD] pinning param %r (shape=%s, dtype=%s, %.2f MiB); "
+            "total offloaded so far=%.2f GiB",
+            name, tuple(t.shape), t.dtype, _mib(this), _gib(offloaded_so_far),
+        )
+
+
+def _format_pin_failure(
+    name: str, t: torch.Tensor, offloaded_so_far: int, pin_err: BaseException
+) -> str:
+    """Detailed diagnostics for a pin_memory() failure."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        memlock = f"soft={soft} hard={hard}"
+    except Exception:
+        memlock = "n/a"
+    return (
+        "[UVA-OFFLOAD] pin_memory() FAILED on param "
+        f"{name!r} (shape={tuple(t.shape)}, dtype={t.dtype}, "
+        f"{_mib(t.numel() * t.element_size()):.2f} MiB); offloaded so far="
+        f"{_gib(offloaded_so_far):.2f} GiB. error: {pin_err!r}. "
+        f"RLIMIT_MEMLOCK (locked memory; needs 'unlimited' or >= offload "
+        f"size): {memlock}. Hint: a prior sticky CUDA error usually causes "
+        "'invalid argument' here -- scan up for the first CUDA error. Set "
+        "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1 to bypass pinning (slower "
+        "transfers) and isolate whether pinning itself is at fault."
+    )
+
+
 class UVAOffloader(BaseOffloader):
     """Offloader using Unified Virtual Addressing (UVA) for zero-copy access.
 
@@ -96,7 +180,15 @@ class UVAOffloader(BaseOffloader):
 
             cpu_data = p.data.to(device="cpu")
             if self.pin_memory:
-                cpu_data = cpu_data.pin_memory()
+                _probe = _probe_sticky_cuda_error(name, p.data, self.cpu_offload_bytes)
+                if _probe is not None:
+                    logger.warning(_probe)
+                _maybe_log_pin(name, p.data, self.cpu_offload_bytes)
+                try:
+                    cpu_data = cpu_data.pin_memory()
+                except Exception as pin_err:
+                    logger.error(_format_pin_failure(name, p.data, self.cpu_offload_bytes, pin_err))
+                    raise
 
             if not self.uva_offloading:
                 p.data = cpu_data

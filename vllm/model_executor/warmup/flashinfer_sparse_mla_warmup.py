@@ -225,6 +225,26 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
         return
 
+    # FlashInfer sparse MLA autotune is a Hopper+ (SM >= 9.0) / SM120 feature.
+    # On Ampere (SM < 9.0) the DSv4 ampere Triton backend is used instead, so
+    # this FlashInfer warmup carries no value there. Worse, its fallback
+    # ``_dummy_run(create_mixed_batch=True)`` competes for the tiny headroom
+    # left after KV-cache allocation: in eager mode the KV budget reserves no
+    # cudagraph memory, so almost all free VRAM is handed to the KV pool and
+    # the warmup transient (Triton JIT workspace + mixed-batch activations)
+    # OOMs during load (Triton Error [CUDA]: out of memory in
+    # compress_norm_rope_store_triton). The ampere Triton kernels are JIT'd
+    # during profile_run / on first request instead. Skip on Ampere.
+    if (
+        current_platform.is_cuda()
+        and not current_platform.has_device_capability(90)
+    ):
+        logger.info(
+            "Skipping FlashInfer DSv4 sparse MLA warmup on Ampere (SM < 9.0); "
+            "ampere Triton backend is JIT'd lazily."
+        )
+        return
+
     max_tokens = worker.scheduler_config.max_num_batched_tokens
     mixed_tokens = _clamp_warmup_tokens(_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens)
     if mixed_tokens <= 0:
@@ -236,20 +256,29 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     )
     mixed_warmup_done = _deepseek_v4_sparse_mla_decode_autotune(worker, mixed_tokens)
     if not mixed_warmup_done:
-        if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-            v2_runner = cast("V2GPUModelRunner", runner)
-            run_mixed_prefill_decode_warmup(
-                v2_runner,
-                worker.execute_model,
-                worker.sample_tokens,
-                mixed_tokens,
-                req_id_prefix="_sparse_mla_v2_warmup",
-            )
-        else:
-            runner._dummy_run(
-                num_tokens=mixed_tokens,
-                skip_eplb=True,
-                is_profile=True,
-                force_attention=True,
-                create_mixed_batch=True,
+        try:
+            if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
+                v2_runner = cast("V2GPUModelRunner", runner)
+                run_mixed_prefill_decode_warmup(
+                    v2_runner,
+                    worker.execute_model,
+                    worker.sample_tokens,
+                    mixed_tokens,
+                    req_id_prefix="_sparse_mla_v2_warmup",
+                )
+            else:
+                runner._dummy_run(
+                    num_tokens=mixed_tokens,
+                    skip_eplb=True,
+                    is_profile=True,
+                    force_attention=True,
+                    create_mixed_batch=True,
+                )
+        except torch.cuda.OutOfMemoryError:
+            # Defensive: this warmup is best-effort JIT prefetching. If the
+            # transient OOMs on a tight-memory box, log and continue rather
+            # than aborting load -- kernels JIT lazily on first request.
+            logger.warning(
+                "Skipping DSv4 sparse MLA mixed-batch warmup due to OOM "
+                "(transient headroom too small); kernels will JIT lazily."
             )
