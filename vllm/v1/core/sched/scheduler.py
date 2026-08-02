@@ -1701,6 +1701,19 @@ class Scheduler(SchedulerInterface):
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
+                # [DSv4-ampere debug] Surface NaN/Inf corruption of the logits.
+                # If this fires as the model's output goes empty/garbage, the
+                # emulated FP8/FP4 attention/indexer has diverged numerically.
+                _nan = request.num_nans_in_logits
+                if _nan and getattr(request, "num_computed_tokens", 0) > 0:
+                    logger.error(
+                        "[NaN-LOGITS] req=%s has %d NaN/Inf logits at "
+                        "computed_tokens=%d (num_output=%d). Ampere emulated "
+                        "FP8/FP4 attention/indexer likely diverged.",
+                        req_id, _nan,
+                        getattr(request, "num_computed_tokens", -1),
+                        len(new_token_ids),
+                    )
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
