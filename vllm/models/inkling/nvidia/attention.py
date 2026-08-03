@@ -338,5 +338,6 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             rel_extent=self.rel_extent,
             rel_logits=rel_logits[:nt],
             num_splits=num_splits,
+            max_kv_len=self._max_kv_len,
             out=output[:nt],
         )

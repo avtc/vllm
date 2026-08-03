@@ -125,6 +125,7 @@ def inkling_fa4_rel_attention(
     rel_extent: int,
     rel_logits: torch.Tensor,
     num_splits: int = 32,
+    max_kv_len: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged varlen FA4 over the bound K/V cache with the Inkling relative bias.
@@ -143,7 +144,8 @@ def inkling_fa4_rel_attention(
 
     rel_logits = rel_logits.contiguous()
 
-    # Use FA4 for SM9+, Triton fallback for SM8x.
+    # Sheared bias on Blackwell, score-mod FA4 on Hopper, else the general
+    # Triton backend (SM8x and below, or wherever FA4 is unavailable).
     if _use_sheared_bias():
         from vllm.third_party.tml_fa4 import flash_attn_varlen_func
 
@@ -171,6 +173,7 @@ def inkling_fa4_rel_attention(
             window_size=window_size,
             rel_extent=rel_extent,
             rel_logits=rel_logits,
+            max_kv_len=max_kv_len,
             out=out,
         )
 

@@ -426,3 +426,92 @@ def test_sliding_window(seq_lens, num_heads, local_extent):
 def test_decode(seq_lens, num_heads, rel_extent):
     # q_len=1 with kv_len>q_len: the score-mod's seqlen_k - seqlen_q offset path.
     _run_case(seq_lens, num_heads[0], num_heads[1], rel_extent, window_left=None)
+
+
+# ---------------------------------------------------------------------------
+# Triton fallback (SM8x) path. These force the relative-attention op onto the
+# Triton kernel regardless of the host GPU so the fallback is covered on any
+# CUDA box -- including the SM9+ CI/dev machines where the FA4 tests above run.
+# The same pure-PyTorch ``_ref_rel_attn`` reference is the oracle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def force_triton_fallback(monkeypatch):
+    module = importlib.import_module("vllm.models.inkling.nvidia.ops.fa4_rel_attention")
+    monkeypatch.setattr(module, "_use_sheared_bias", lambda: False)
+    monkeypatch.setattr(module, "_is_fa4_available", lambda: False)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 50)],
+        [(1, 50), (1, 7), (1, 200)],
+        [(1, 512), (1, 333)],  # kv_len >> rel_extent (clamp-to-zero path)
+    ],
+)
+@pytest.mark.parametrize("rel_extent", GLOBAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_decode(force_triton_fallback, seq_lens, num_heads, rel_extent):
+    # Split-KV decode: q_len=1 with kv_len>>q_len exercises the seqlen_k-1 offset.
+    _run_case(seq_lens, num_heads[0], num_heads[1], rel_extent, window_left=None)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(64, 64)],  # single full prefill
+        [(64, 64), (33, 33), (17, 17)],  # ragged prefill batch
+        [(512, 512)],  # seq_len >> rel_extent
+        [(300, 300), (512, 512), (129, 129)],
+    ],
+)
+@pytest.mark.parametrize("rel_extent", GLOBAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_full_attention(force_triton_fallback, seq_lens, num_heads, rel_extent):
+    _run_case(seq_lens, num_heads[0], num_heads[1], rel_extent, window_left=None)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(200, 512)],  # chunked prefill: q_len=200, 312 cached
+        [(200, 512), (50, 300), (1, 400)],  # mixed chunked + decode
+    ],
+)
+@pytest.mark.parametrize("rel_extent", GLOBAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_chunked_prefill(force_triton_fallback, seq_lens, num_heads, rel_extent):
+    # q_len < kv_len: exercises the kv_len - q_len position offset.
+    _run_case(seq_lens, num_heads[0], num_heads[1], rel_extent, window_left=None)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(64, 64), (40, 40)],
+        [(512, 512), (300, 300)],
+        [(1, 512)],  # decode with kv_len >> window
+    ],
+)
+@pytest.mark.parametrize("local_extent", LOCAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_sliding_window(
+    force_triton_fallback, seq_lens, num_heads, local_extent
+):
+    _run_case(
+        seq_lens,
+        num_heads[0],
+        num_heads[1],
+        rel_extent=local_extent,
+        window_left=local_extent - 1,
+    )
