@@ -52,6 +52,7 @@ def _inkling_rel_attn_decode(
     SW_LEFT: tl.constexpr,
     SW_RIGHT: tl.constexpr,
     USE_SW: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     """Decode kernel: single query token per program, iterates all KV blocks."""
     req_idx = tl.program_id(0)
@@ -61,7 +62,7 @@ def _inkling_rel_attn_decode(
     kv_len = tl.load(CACHE_SEQLENS + req_idx).to(tl.int64)
 
     offs_d = tl.arange(0, HEAD_DIM)
-    offs_n = tl.arange(0, _BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N)
 
     # Load single query token
     q = tl.load(
@@ -195,6 +196,8 @@ def _inkling_rel_attn_prefill(
     SW_LEFT: tl.constexpr,
     SW_RIGHT: tl.constexpr,
     USE_SW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     """Prefill kernel: one program per (request, head, q_block)."""
     req_idx = tl.program_id(0)
@@ -209,13 +212,13 @@ def _inkling_rel_attn_prefill(
     kv_len = tl.load(CACHE_SEQLENS + req_idx)
 
     offs_d = tl.arange(0, HEAD_DIM)
-    offs_m = m_block * _BLOCK_M + tl.arange(0, _BLOCK_M)
-    offs_n = tl.arange(0, _BLOCK_N)
+    offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
 
     q_mask = offs_m < q_len
     d_mask = offs_d < HEAD_DIM
 
-    # Load Q: (_BLOCK_M, HEAD_DIM)
+    # Load Q: (BLOCK_M, HEAD_DIM)
     q = tl.load(
         Q
         + (q_start + offs_m[:, None]) * stride_qt
@@ -226,9 +229,9 @@ def _inkling_rel_attn_prefill(
     ).to(tl.float32)
 
     # Init softmax state
-    m_i = tl.full([_BLOCK_M], -float("inf"), dtype=tl.float32)
-    l_i = tl.full([_BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([_BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     block_table_offset = req_idx * stride_bts
     num_blocks = tl.cdiv(kv_len, kv_block_size)
@@ -413,6 +416,7 @@ def inkling_triton_rel_attention(
             SW_LEFT=sw_left,
             SW_RIGHT=sw_right,
             USE_SW=use_sw,
+            BLOCK_N=_BLOCK_N,
         )
     else:
         num_m_blocks = (num_tokens + _BLOCK_M - 1) // _BLOCK_M
@@ -453,6 +457,8 @@ def inkling_triton_rel_attention(
             SW_LEFT=sw_left,
             SW_RIGHT=sw_right,
             USE_SW=use_sw,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
         )
 
     return out
