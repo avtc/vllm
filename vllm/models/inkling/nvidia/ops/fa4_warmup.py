@@ -16,6 +16,7 @@ from vllm.model_executor.warmup.cutedsl_warmup import (
 )
 
 from .fa4_rel_attention import (
+    _is_fa4_available,
     bucket_max_seqlen_q,
     inkling_fa4_num_splits,
     inkling_fa4_rel_attention,
@@ -141,6 +142,9 @@ class _WarmupProvider:
         self.configs: set[InklingFA4WarmupConfig] = set()
 
     def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
+        # Skip FA4 warmup on SM8x — Triton fallback is used at runtime.
+        if not _is_fa4_available():
+            return ()
         return tuple(
             unit for config in self.configs for unit in _iter_compile_units(config)
         )

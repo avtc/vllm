@@ -23,6 +23,18 @@ def _use_sheared_bias() -> bool:
 
 
 @cache
+def _is_fa4_available() -> bool:
+    """Check if FA4 with score_mod is available on this device.
+
+    FA4 requires SM9+ and score_mod is not supported on SM8x.
+    """
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return False
+    return capability.major >= 9
+
+
+@cache
 def _get_score_mod(rel_extent: int) -> Callable:
     """Return the score modification that adds Inkling relative bias."""
     import cutlass.cute as cute
@@ -130,17 +142,37 @@ def inkling_fa4_rel_attention(
     cute_window = (None, None) if window_size == (-1, -1) else window_size
 
     rel_logits = rel_logits.contiguous()
+
+    # Use FA4 for SM9+, Triton fallback for SM8x.
     if _use_sheared_bias():
         from vllm.third_party.tml_fa4 import flash_attn_varlen_func
 
         bias_kwargs: dict[str, Any] = {"rel_bias": rel_logits}
-    else:
+    elif _is_fa4_available():
         from vllm.vllm_flash_attn.cute import flash_attn_varlen_func
 
         bias_kwargs = {
             "score_mod": _get_score_mod(rel_extent),
             "aux_tensors": [rel_logits],
         }
+    else:
+        from .triton_rel_attention import inkling_triton_rel_attention
+
+        return inkling_triton_rel_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            rel_extent=rel_extent,
+            rel_logits=rel_logits,
+            out=out,
+        )
 
     ret = flash_attn_varlen_func(
         q=q,
