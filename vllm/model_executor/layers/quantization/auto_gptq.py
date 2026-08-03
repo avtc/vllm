@@ -770,6 +770,10 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             w2_zp=getattr(layer, "w2_qzeros", None) if use_zp else None,
             w1_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
+            # Propagate the model's SwiGLU clamp (DeepSeek-V4 swiglu_limit) to
+            # the Marlin MoE kernel. Without it the activation runs unclamped,
+            # exceeding the trained range and exploding the MoE output.
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def select_gemm_impl(

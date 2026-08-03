@@ -666,9 +666,17 @@ def gptq_marlin_moe_quant_config(
     w2_zp: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
 ):
     """
     Construct a quant config for gptq marlin quantization.
+
+    gemm1_clamp_limit: Optional SwiGLU activation clamp limit (swiglu_limit).
+      DeepSeek-V4 was trained with a SwiGLU clamp (swiglu_limit=10); if the
+      clamp is not propagated here the Marlin MoE kernel runs unclamped and
+      the activation can exceed the trained range, causing MoE output
+      explosion / residual divergence / NaN. Callers that have the model's
+      swiglu_limit MUST pass it as gemm1_clamp_limit.
     """
     from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 
@@ -690,6 +698,7 @@ def gptq_marlin_moe_quant_config(
         _a2=FusedMoEQuantDesc(dtype=None, shape=a_shape),
         _w1=FusedMoEQuantDesc(weight_dtype, w_shape, w1_scale, None, w1_zp, w1_bias),
         _w2=FusedMoEQuantDesc(weight_dtype, w_shape, w2_scale, None, w2_zp, w2_bias),
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
