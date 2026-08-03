@@ -500,7 +500,9 @@ def test_triton_chunked_prefill(force_triton_fallback, seq_lens, num_heads, rel_
     [
         [(64, 64), (40, 40)],
         [(512, 512), (300, 300)],
-        [(1, 512)],  # decode with kv_len >> window
+        [(1, 512)],  # decode with kv_len == window
+        [(1, 4000)],  # decode kv_len >> window: exercises window block-skip
+        [(1, 4000), (1, 1500)],  # ragged long-context decode, both >> window
     ],
 )
 @pytest.mark.parametrize("local_extent", LOCAL_REL_EXTENTS)

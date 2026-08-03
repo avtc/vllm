@@ -162,12 +162,17 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         self.window_size: tuple[int, int] = (
             (local_extent - 1, 0) if is_local else (-1, -1)
         )
-        # Static per-layer-type KV length bound for the split heuristic: local
-        # layers never see more than the sliding window.
         vllm_config = get_current_vllm_config()
+        # Note: md.seq_lens is the *full* sequence length for every layer
+        # (sliding window is applied via window_size at attention time, not by
+        # capping seq_lens), so the only capture-safe upper bound on the KV
+        # range is max_model_len. self._max_kv_len (window-sized for local
+        # layers) is only a hint for the FA4 split heuristic, which tolerates
+        # an underestimate.
         self._max_kv_len = (
             local_extent if is_local else vllm_config.model_config.max_model_len
         )
+        self._max_model_len = vllm_config.model_config.max_model_len
 
         # ---- KV-cache wiring (reuse FlashAttentionBackend for metadata) ----
         cache_config = vllm_config.cache_config
@@ -338,6 +343,6 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             rel_extent=self.rel_extent,
             rel_logits=rel_logits[:nt],
             num_splits=num_splits,
-            max_kv_len=self._max_kv_len,
+            max_kv_len=self._max_model_len,
             out=output[:nt],
         )

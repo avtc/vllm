@@ -120,6 +120,10 @@ def _inkling_rel_attn_decode_partial(
     for blk in range(blk_lo, blk_hi):
         phys = tl.load(BLOCK_TABLE + bt_base + blk).to(tl.int64)
         blk_start = blk * kv_block_size
+        # Local layers: skip physical blocks entirely before the sliding window.
+        # The window for the decode query (at q_seq) is [q_seq - SW_LEFT, q_seq].
+        if USE_SW and SW_LEFT > 0 and (blk_start + kv_block_size - 1 < q_seq - SW_LEFT):
+            continue
         remaining = kv_len - blk_start
         n_mask = offs_n < remaining
 
@@ -339,11 +343,18 @@ def _inkling_rel_attn_prefill(
     num_phys_blocks = tl.cdiv(kv_len, kv_block_size)
     q_max_seq = tl.max(tl.where(q_mask, q_seq, 0), axis=0)
     last_blk = tl.minimum(num_phys_blocks, tl.cdiv(q_max_seq + 1, kv_block_size))
+    # Local layers: earliest relevant key is min(query) - SW_LEFT; blocks fully
+    # before that are outside every query's window and can be skipped.
+    if USE_SW and SW_LEFT > 0:
+        q_min_seq = tl.min(tl.where(q_mask, q_seq, 1 << 30), axis=0)
+        first_blk = tl.maximum(0, (q_min_seq - SW_LEFT) // kv_block_size)
+    else:
+        first_blk = 0
 
     bt_base = req_idx * stride_bts
     q_tok = q_start + offs_m  # global token index for rel_logits: (BLOCK_M,)
 
-    for blk in range(0, last_blk):
+    for blk in range(first_blk, last_blk):
         phys = tl.load(BLOCK_TABLE + bt_base + blk).to(tl.int64)
         blk_start = blk * kv_block_size
         remaining = kv_len - blk_start
