@@ -77,6 +77,56 @@ def _probe_layers() -> bool:
     return os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
 
 
+# [DSv4-ampere debug] One-shot MoE internal probe. Logs the FIRST time a MoE
+# tensor (input/router_logits/topk_weights/topk_ids/output) is non-finite OR
+# has a suspicious magnitude (per-name, once per process). Helps localize the
+# L26+ MoE output explosion: routing vs expert dequant. Gated by
+# VLLM_SM86_NAN_PROBE=1.
+_MOE_PROBE_FIRED = {}
+
+
+def _moe_probe(name: str, t) -> None:
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if t is None or not hasattr(t, "numel"):
+        return
+    tf = t.detach().float()
+    if not tf.numel():
+        return
+    has_nonfinite = bool(
+        torch.isnan(tf).any().item() or torch.isinf(tf).any().item()
+    )
+    # Fire on first non-finite, OR once per name for the first real decode so
+    # we also see the magnitude at a healthy step (to compare with L26+).
+    fire = has_nonfinite
+    if not fire and name in ("topk_weights", "topk_ids") and \
+            _MOE_PROBE_FIRED.get(name) is None:
+        # always log topk once (to verify normalization / expert ids)
+        fire = True
+    if not fire:
+        return
+    if _MOE_PROBE_FIRED.get(name):
+        return
+    _MOE_PROBE_FIRED[name] = True
+    n_nan = int(torch.isnan(tf).sum().item())
+    n_inf = int(torch.isinf(tf).sum().item())
+    amax = float(tf.abs().amax().item())
+    extra = ""
+    if name == "topk_weights" and not has_nonfinite:
+        # report sum per token (should be ~1 if renormalize=True) and max
+        if tf.dim() >= 2:
+            row_sum = tf.sum(dim=-1)
+            extra = (f" per_tok_sum[min={row_sum.min():.4f} "
+                     f"max={row_sum.max():.4f}]")
+    print(
+        f"[MOE_PROBE {name}] nan={n_nan} inf={n_inf} "
+        f"absmax={amax:.6e} shape={tuple(t.shape)}{extra}",
+        flush=True,
+    )
+
+
 def _nan_probe_logits(hidden, logits, lm_head) -> None:
     """Probe the lm_head/logits path across passes (VLLM_SM86_NAN_PROBE=1).
 
@@ -920,6 +970,7 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
+            router_logits = hidden_states
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
@@ -932,6 +983,38 @@ class DeepseekV4MoE(nn.Module):
                 router_logits=router_logits,
                 input_ids=input_ids,
             )
+
+        # [DSv4-ampere debug] MoE internal probes (VLLM_SM86_NAN_PROBE=1).
+        # The MoE FFN output explodes at L26+ (residual explosion). These
+        # discriminate routing vs expert-dequant: if router_logits / topk_weights
+        # are bounded but final_hidden_states explodes, the expert dequant is
+        # the cause; if topk_weights are huge/un-normalized, routing is broken.
+        _moe_probe("moe_input", hidden_states)
+        _moe_probe("router_logits", router_logits)
+        # Replicate the model's own topk to inspect the routing weights.
+        try:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                fused_topk_bias)
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=(
+                    self.gate.e_score_correction_bias.data
+                    if self.gate.e_score_correction_bias is not None else None),
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=torch.int32,
+                input_tokens=input_ids,
+                hash_indices_table=(
+                    self.gate.tid2eid if self.gate.tid2eid is not None else None),
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            _moe_probe("topk_weights", topk_weights)
+            _moe_probe("topk_ids", topk_ids.to(torch.float32))
+        except Exception:
+            pass
+        _moe_probe("moe_output", final_hidden_states)
 
         return final_hidden_states.view(org_shape)
 
