@@ -77,54 +77,63 @@ def _probe_layers() -> bool:
     return os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
 
 
-# [DSv4-ampere debug] One-shot MoE internal probe. Logs the FIRST time a MoE
-# tensor (input/router_logits/topk_weights/topk_ids/output) is non-finite OR
-# has a suspicious magnitude (per-name, once per process). Helps localize the
-# L26+ MoE output explosion: routing vs expert dequant. Gated by
-# VLLM_SM86_NAN_PROBE=1.
-_MOE_PROBE_FIRED = {}
+# [DSv4-ampere debug] Coordinated one-shot MoE probe. The MoE output explodes
+# at L26+ (absmax 1-131 for L0-25, then 1744-19840 for L26-42) while attn is
+# fine. To localize routing vs expert-dequant we need input + router_logits +
+# topk_weights + output at the SAME exploding call (a per-name first-non-finite
+# probe only fires once the whole residual is already NaN, too late). So this
+# logs ALL MoE tensors together when the call is "interesting": either the
+# output absmax exceeds OUT_THRESH (catches the L26+ explosion while still
+# finite) or any tensor is non-finite, plus once at the first real decode for a
+# healthy baseline. Gated by VLLM_SM86_NAN_PROBE=1.
+_MOE_PROBE_FIRED = {"baseline": False, "spike": False}
+_MOE_OUT_THRESH = 200.0
 
 
-def _moe_probe(name: str, t) -> None:
+def _moe_probe_call(prefix: str, tensors: dict) -> None:
     import os
 
     if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
         return
-    if t is None or not hasattr(t, "numel"):
+    out = tensors.get("moe_output")
+    if out is None or not hasattr(out, "numel") or not out.numel():
         return
-    tf = t.detach().float()
-    if not tf.numel():
+    of = out.detach().float()
+    out_amax = float(of.abs().amax().item())
+    nonfinite = bool(torch.isnan(of).any().item() or torch.isinf(of).any().item())
+    is_baseline = not _MOE_PROBE_FIRED["baseline"]
+    is_spike = (out_amax > _MOE_OUT_THRESH or nonfinite) and not _MOE_PROBE_FIRED["spike"]
+    if not (is_baseline or is_spike):
         return
-    has_nonfinite = bool(
-        torch.isnan(tf).any().item() or torch.isinf(tf).any().item()
-    )
-    # Fire on first non-finite, OR once per name for the first real decode so
-    # we also see the magnitude at a healthy step (to compare with L26+).
-    fire = has_nonfinite
-    if not fire and name in ("topk_weights", "topk_ids") and \
-            _MOE_PROBE_FIRED.get(name) is None:
-        # always log topk once (to verify normalization / expert ids)
-        fire = True
-    if not fire:
-        return
-    if _MOE_PROBE_FIRED.get(name):
-        return
-    _MOE_PROBE_FIRED[name] = True
-    n_nan = int(torch.isnan(tf).sum().item())
-    n_inf = int(torch.isinf(tf).sum().item())
-    amax = float(tf.abs().amax().item())
-    extra = ""
-    if name == "topk_weights" and not has_nonfinite:
-        # report sum per token (should be ~1 if renormalize=True) and max
-        if tf.dim() >= 2:
+    if is_baseline:
+        _MOE_PROBE_FIRED["baseline"] = True
+        tag = "BASELINE"
+    if is_spike:
+        _MOE_PROBE_FIRED["spike"] = True
+        tag = "SPIKE"
+    lines = [f"[MOE_PROBE ### {tag} ### prefix={prefix} out_absmax={out_amax:.4e}]"]
+    for name, t in tensors.items():
+        if t is None or not hasattr(t, "numel") or not t.numel():
+            lines.append(f"  {name}: None")
+            continue
+        tf = t.detach().float()
+        n_nan = int(torch.isnan(tf).sum().item())
+        n_inf = int(torch.isinf(tf).sum().item())
+        amax = float(tf.abs().amax().item())
+        amin = float(tf.abs().amin().item())
+        extra = ""
+        if name == "topk_weights" and tf.dim() >= 2:
             row_sum = tf.sum(dim=-1)
             extra = (f" per_tok_sum[min={row_sum.min():.4f} "
                      f"max={row_sum.max():.4f}]")
-    print(
-        f"[MOE_PROBE {name}] nan={n_nan} inf={n_inf} "
-        f"absmax={amax:.6e} shape={tuple(t.shape)}{extra}",
-        flush=True,
-    )
+        if name == "topk_ids" and tf.dim() >= 2:
+            extra = f" ids={tf.to(torch.int64).flatten().tolist()[:12]}..."
+        lines.append(
+            f"  {name}: nan={n_nan} inf={n_inf} "
+            f"absmax={amax:.4e} min_abs={amin:.4e} "
+            f"shape={tuple(t.shape)}{extra}"
+        )
+    print("\n".join(lines), flush=True)
 
 
 def _nan_probe_logits(hidden, logits, lm_head) -> None:
@@ -984,14 +993,11 @@ class DeepseekV4MoE(nn.Module):
                 input_ids=input_ids,
             )
 
-        # [DSv4-ampere debug] MoE internal probes (VLLM_SM86_NAN_PROBE=1).
-        # The MoE FFN output explodes at L26+ (residual explosion). These
-        # discriminate routing vs expert-dequant: if router_logits / topk_weights
-        # are bounded but final_hidden_states explodes, the expert dequant is
-        # the cause; if topk_weights are huge/un-normalized, routing is broken.
-        _moe_probe("moe_input", hidden_states)
-        _moe_probe("router_logits", router_logits)
-        # Replicate the model's own topk to inspect the routing weights.
+        # [DSv4-ampere debug] Coordinated MoE probe: log input + router_logits +
+        # topk_weights + topk_ids + output TOGETHER at the first real decode
+        # (baseline) and at the first call where the output spikes (L26+).
+        tensors = {"moe_input": hidden_states, "router_logits": router_logits,
+                   "moe_output": final_hidden_states}
         try:
             from vllm.model_executor.layers.fused_moe.fused_moe import (
                 fused_topk_bias)
@@ -1010,11 +1016,11 @@ class DeepseekV4MoE(nn.Module):
                     self.gate.tid2eid if self.gate.tid2eid is not None else None),
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-            _moe_probe("topk_weights", topk_weights)
-            _moe_probe("topk_ids", topk_ids.to(torch.float32))
+            tensors["topk_weights"] = topk_weights
+            tensors["topk_ids"] = topk_ids
         except Exception:
             pass
-        _moe_probe("moe_output", final_hidden_states)
+        _moe_probe_call(self.prefix, tensors)
 
         return final_hidden_states.view(org_shape)
 
