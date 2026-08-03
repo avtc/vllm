@@ -117,13 +117,19 @@ def _inkling_rel_attn_decode_partial(
     q_seq = kv_len - 1  # decode query sits at the latest cached position
     bt_base = req_idx * stride_bts
 
-    for blk in range(blk_lo, blk_hi):
+    # Local layers: the window is [q_seq - SW_LEFT, q_seq]. Skip physical blocks
+    # entirely before it by raising the split's lower bound (Triton has no
+    # `continue`, so adjust the loop start instead). Splits that fall wholly
+    # before the window iterate nothing and store the identity.
+    if USE_SW and SW_LEFT > 0:
+        window_first = tl.maximum(0, (q_seq - SW_LEFT) // kv_block_size)
+    else:
+        window_first = 0
+    eff_lo = tl.maximum(blk_lo, window_first)
+
+    for blk in range(eff_lo, blk_hi):
         phys = tl.load(BLOCK_TABLE + bt_base + blk).to(tl.int64)
         blk_start = blk * kv_block_size
-        # Local layers: skip physical blocks entirely before the sliding window.
-        # The window for the decode query (at q_seq) is [q_seq - SW_LEFT, q_seq].
-        if USE_SW and SW_LEFT > 0 and (blk_start + kv_block_size - 1 < q_seq - SW_LEFT):
-            continue
         remaining = kv_len - blk_start
         n_mask = offs_n < remaining
 
