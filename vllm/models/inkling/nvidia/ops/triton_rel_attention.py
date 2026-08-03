@@ -401,7 +401,7 @@ def _inkling_rel_attn_prefill(
             + q_tok[:, None] * stride_rlt
             + head_idx * stride_rlhn
             + rel_idx * stride_rle,
-            mask=in_range,
+            mask=q_mask[:, None] & in_range,
             other=0.0,
         ).to(tl.float32)
 
