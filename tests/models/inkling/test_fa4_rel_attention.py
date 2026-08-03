@@ -226,7 +226,15 @@ def _ref_rel_attn(
     return out
 
 
-def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0):
+def _run_case(
+    seq_lens,
+    num_heads,
+    num_kv_heads,
+    rel_extent,
+    window_left,
+    seed=0,
+    fp8=False,
+):
     torch.manual_seed(seed)
     device = "cuda"
     q_lens = [s[0] for s in seq_lens]
@@ -251,6 +259,28 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
     value_cache = torch.randn(
         num_blocks, BLOCK_SIZE, num_kv_heads, HEAD_DIM, device=device, dtype=DTYPE
     )
+
+    # fp8 KV cache: round-trip K/V through float8_e4m3fn with a per-tensor
+    # scale (max(|x|) -> 448). The kernel sees the fp8 cache (logical dtype);
+    # the PyTorch reference sees the dequantized float cache so both share the
+    # same fp8-rounded values.
+    ref_key_cache = key_cache
+    ref_value_cache = value_cache
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    if fp8:
+        k_scale = (key_cache.float().abs().max() / 448.0).clamp(min=1e-12)
+        v_scale = (value_cache.float().abs().max() / 448.0).clamp(min=1e-12)
+        k_fp8 = (
+            (key_cache.float() / k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        )
+        v_fp8 = (
+            (value_cache.float() / v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        )
+        key_cache = k_fp8
+        value_cache = v_fp8
+        ref_key_cache = k_fp8.float() * k_scale
+        ref_value_cache = v_fp8.float() * v_scale
 
     # Distinct blocks per sequence (block 0 left as a never-referenced pad).
     block_table = torch.zeros(num_seqs, max_blocks, dtype=torch.int32, device=device)
@@ -294,14 +324,16 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
         rel_logits=rel_logits,
         num_splits=num_splits,
         out=preallocated_out,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
     assert out.data_ptr() == preallocated_out.data_ptr()
     out = out.view(total_q, num_heads, HEAD_DIM)
 
     ref = _ref_rel_attn(
         q,
-        key_cache,
-        value_cache,
+        ref_key_cache,
+        ref_value_cache,
         rel_logits,
         q_lens=q_lens,
         kv_lens=kv_lens,
@@ -311,7 +343,9 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
         window_left=window_left,
     )
 
-    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    # fp8 round-trip introduces quantization error; allow more slack.
+    atol, rtol = (8e-2, 8e-2) if fp8 else (2e-2, 2e-2)
+    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
@@ -516,4 +550,107 @@ def test_triton_sliding_window(
         num_heads[1],
         rel_extent=local_extent,
         window_left=local_extent - 1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# fp8 KV cache (SM8x+). These force the Triton fallback and round-trip the
+# paged KV cache through float8_e4m3fn with a per-tensor scale, exercising
+# both the read dequant (triton_rel_attention) and verifying the scale math
+# against a PyTorch reference that sees the same dequantized values.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 50)],
+        [(1, 50), (1, 7), (1, 200)],
+    ],
+)
+@pytest.mark.parametrize("rel_extent", GLOBAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_fp8_decode(force_triton_fallback, seq_lens, num_heads, rel_extent):
+    _run_case(
+        seq_lens,
+        num_heads[0],
+        num_heads[1],
+        rel_extent,
+        window_left=None,
+        fp8=True,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(64, 64)],
+        [(64, 64), (33, 33), (17, 17)],
+    ],
+)
+@pytest.mark.parametrize("rel_extent", GLOBAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_fp8_full_attention(
+    force_triton_fallback, seq_lens, num_heads, rel_extent
+):
+    _run_case(
+        seq_lens,
+        num_heads[0],
+        num_heads[1],
+        rel_extent,
+        window_left=None,
+        fp8=True,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(200, 512)],
+        [(200, 512), (50, 300), (1, 400)],
+    ],
+)
+@pytest.mark.parametrize("rel_extent", GLOBAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_fp8_chunked_prefill(
+    force_triton_fallback, seq_lens, num_heads, rel_extent
+):
+    _run_case(
+        seq_lens,
+        num_heads[0],
+        num_heads[1],
+        rel_extent,
+        window_left=None,
+        fp8=True,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(64, 64), (40, 40)],
+        [(1, 512)],  # decode with kv_len == window
+        [(1, 4000)],  # decode kv_len >> window
+    ],
+)
+@pytest.mark.parametrize("local_extent", LOCAL_REL_EXTENTS)
+@torch.inference_mode()
+def test_triton_fp8_sliding_window(
+    force_triton_fallback, seq_lens, num_heads, local_extent
+):
+    _run_case(
+        seq_lens,
+        num_heads[0],
+        num_heads[1],
+        rel_extent=local_extent,
+        window_left=local_extent - 1,
+        fp8=True,
     )

@@ -20,6 +20,12 @@ Q_NUM_WARPS = 2
 KV_BLOCK_ROWS = 4
 KV_NUM_WARPS = 2
 
+# Dummy scalar pointer used only when no fp8 scale is supplied: the fp8
+# quantize branch is pruned at compile time for non-fp8 caches, so this tensor
+# is never dereferenced by the kernels. (Module-level default for a kernel
+# *argument*, not referenced inside any @triton.jit body.)
+_DUMMY_SCALE = torch.zeros(1, dtype=torch.float32)
+
 
 @triton.jit(do_not_specialize=["rows"])
 def _rel_proj_low_latency_kernel(
@@ -200,6 +206,8 @@ def _qkvr_qkv_kernel(
     conv_cache_ptr,
     key_cache_ptr,
     value_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     positions_ptr,
     seq_idx_ptr,
     conv_slot_mapping_ptr,
@@ -382,22 +390,32 @@ def _qkvr_qkv_kernel(
             safe_attention_slot = tl.maximum(attention_slot, 0)
             attention_block = safe_attention_slot // attention_page_size
             attention_offset = safe_attention_slot % attention_page_size
+            # fp8 KV cache: quantize K/V by the per-tensor scale before storing
+            # (tl.store then implicit-casts to the cache dtype from the pointer).
+            if key_cache_ptr.dtype.element_ty.is_fp8():
+                k_store = k_normalized.to(tl.float32) / tl.load(k_scale_ptr)
+            else:
+                k_store = k_normalized
             tl.store(
                 key_cache_ptr
                 + attention_block * stride_kc_block
                 + attention_offset * stride_kc_token
                 + head * stride_kc_head
                 + dims,
-                k_normalized,
+                k_store,
                 mask=attention_slot >= 0,
             )
+            if value_cache_ptr.dtype.element_ty.is_fp8():
+                v_store = v_rounded.to(tl.float32) / tl.load(v_scale_ptr)
+            else:
+                v_store = v_rounded
             tl.store(
                 value_cache_ptr
                 + attention_block * stride_vc_block
                 + attention_offset * stride_vc_token
                 + head * stride_vc_head
                 + dims,
-                v_rounded,
+                v_store,
                 mask=attention_slot >= 0,
             )
 
@@ -452,6 +470,8 @@ def _kv_kernel(
     conv_cache_ptr,
     key_cache_ptr,
     value_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     positions_ptr,
     seq_idx_ptr,
     conv_slot_mapping_ptr,
@@ -592,22 +612,32 @@ def _kv_kernel(
     attention_block = safe_attention_slot // attention_page_size
     attention_offset = safe_attention_slot % attention_page_size
     attention_mask = row_mask & (attention_slot >= 0)
+    # fp8 KV cache: quantize K/V by the per-tensor scale before storing
+    # (tl.store then implicit-casts to the cache dtype from the pointer).
+    if key_cache_ptr.dtype.element_ty.is_fp8():
+        k_store = k_normalized.to(tl.float32) / tl.load(k_scale_ptr)
+    else:
+        k_store = k_normalized
     tl.store(
         key_cache_ptr
         + attention_block[:, None] * stride_kc_block
         + attention_offset[:, None] * stride_kc_token
         + head[:, None] * stride_kc_head
         + dims[None, :],
-        k_normalized,
+        k_store,
         mask=attention_mask[:, None],
     )
+    if value_cache_ptr.dtype.element_ty.is_fp8():
+        v_store = v_rounded.to(tl.float32) / tl.load(v_scale_ptr)
+    else:
+        v_store = v_rounded
     tl.store(
         value_cache_ptr
         + attention_block[:, None] * stride_vc_block
         + attention_offset[:, None] * stride_vc_token
         + head[:, None] * stride_vc_head
         + dims[None, :],
-        v_rounded,
+        v_store,
         mask=attention_mask[:, None],
     )
 
@@ -662,6 +692,8 @@ def _run_tiled_kv(
     off_k: int,
     off_v: int,
     conv_block_size: int,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
 ) -> None:
     tokens = qkvr.shape[0]
     _kv_kernel[(triton.cdiv(tokens, KV_BLOCK_ROWS), num_kv_heads)](
@@ -672,6 +704,8 @@ def _run_tiled_kv(
         conv_cache,
         key_cache,
         value_cache,
+        k_scale,
+        v_scale,
         positions,
         seq_idx,
         conv_slot_mapping,
@@ -734,6 +768,8 @@ def _run_fused_small(
     off_v: int,
     conv_block_size: int,
     log_scaling: torch.Tensor | None,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
 ) -> None:
     tokens = qkvr.shape[0]
 
@@ -751,6 +787,8 @@ def _run_fused_small(
         conv_cache,
         key_cache,
         value_cache,
+        k_scale,
+        v_scale,
         positions,
         seq_idx,
         conv_slot_mapping,
@@ -816,6 +854,8 @@ def fused_qkvr_prep(
     off_v: int,
     conv_block_size: int,
     log_scaling: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert d_rel == 16 and rel_proj.shape[0] == 16
     assert head_dim == 128
@@ -836,6 +876,11 @@ def fused_qkvr_prep(
     )
     if tokens == 0:
         return q_out, rel_out
+
+    # fp8 KV cache per-tensor scales (device scalars); default to a 1.0 dummy
+    # when the cache is not fp8 — the is_fp8() branch is pruned at compile time.
+    scale_k = k_scale if k_scale is not None else _DUMMY_SCALE
+    scale_v = v_scale if v_scale is not None else _DUMMY_SCALE
 
     if tokens < SMALL_TOKEN_THRESHOLD:
         _run_fused_small(
@@ -864,6 +909,8 @@ def fused_qkvr_prep(
             off_v=off_v,
             conv_block_size=conv_block_size,
             log_scaling=log_scaling,
+            k_scale=scale_k,
+            v_scale=scale_v,
         )
         return q_out, rel_out
 
@@ -893,6 +940,8 @@ def fused_qkvr_prep(
             off_k=off_k,
             off_v=off_v,
             conv_block_size=conv_block_size,
+            k_scale=scale_k,
+            v_scale=scale_v,
         )
     _run_tiled_q(
         qkvr,

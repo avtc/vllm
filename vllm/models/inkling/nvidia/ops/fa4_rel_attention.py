@@ -127,6 +127,8 @@ def inkling_fa4_rel_attention(
     num_splits: int = 32,
     max_kv_len: int | None = None,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged varlen FA4 over the bound K/V cache with the Inkling relative bias.
 
@@ -135,6 +137,10 @@ def inkling_fa4_rel_attention(
     ``block_table`` is the per-request page table and ``cache_seqlens`` the
     per-request KV lengths (``seqused_k``). ``rel_logits`` is
     ``(num_tokens, num_heads, rel_extent)``.
+
+    ``k_scale`` / ``v_scale`` are per-tensor scalar device tensors used when the
+    KV cache is fp8 (the cache is stored as uint8 / float8_e4m3fn bytes); they
+    are ignored for non-fp8 caches.
 
     Hopper uses standard FA4's score-mod gather. Blackwell uses tml-fa4's
     sheared relative-bias layout.
@@ -175,6 +181,8 @@ def inkling_fa4_rel_attention(
             rel_logits=rel_logits,
             max_kv_len=max_kv_len,
             out=out,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     ret = flash_attn_varlen_func(

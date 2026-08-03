@@ -232,9 +232,12 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         )
 
     def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
-            self.head_dim, dim=-1
-        )
+        # vLLM stores fp8 KV caches as uint8 bytes; view them with the logical
+        # float8_e4m3fn dtype so the backends/kernels dequantize correctly.
+        cache = self.kv_cache
+        if cache.dtype == torch.uint8 and self.kv_cache_dtype.startswith("fp8"):
+            cache = cache.view(torch.float8_e4m3fn)
+        key_cache, value_cache = cache.transpose(1, 2).split(self.head_dim, dim=-1)
         return (
             canonicalize_singleton_dim_strides(key_cache),
             canonicalize_singleton_dim_strides(value_cache),
@@ -299,6 +302,8 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                 off_v,
                 self.conv_owner.block_size,
                 log_scaling if not self.is_local else None,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
             )
             q = q.view(num_tokens, self.num_heads, self.head_dim)
             self._attention(q, rel_logits, attn_output)
@@ -345,4 +350,6 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             num_splits=num_splits,
             max_kv_len=self._max_model_len,
             out=output[:nt],
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
         )

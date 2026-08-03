@@ -30,6 +30,12 @@ from vllm.triton_utils import tl, triton
 
 _BLOCK_M = 64
 
+# Dummy scalar pointer used only when no fp8 scale is supplied: the fp8
+# dequant branch is pruned at compile time for non-fp8 caches, so this tensor
+# is never dereferenced by the kernels. (Module-level default for a kernel
+# *argument*, not referenced inside any @triton.jit body.)
+_DUMMY_SCALE = torch.zeros(1, dtype=torch.float32)
+
 
 def _next_pow2(n: int) -> int:
     return 1 << max(0, (max(1, n) - 1).bit_length())
@@ -52,6 +58,8 @@ def _inkling_rel_attn_decode_partial(
     PARTIAL_M,
     PARTIAL_L,
     PARTIAL_O,
+    K_SCALE,
+    V_SCALE,
     stride_qt,
     stride_qh,
     stride_kbt,
@@ -133,8 +141,10 @@ def _inkling_rel_attn_decode_partial(
         remaining = kv_len - blk_start
         n_mask = offs_n < remaining
 
-        # K, V: (BLOCK_N, HEAD_DIM)
-        k = tl.load(
+        # K, V: (BLOCK_N, HEAD_DIM). fp8 caches are dequantized to fp32 and
+        # multiplied by the per-tensor scale (the is_fp8() branch is pruned at
+        # compile time for bf16/fp16 caches).
+        k_load = tl.load(
             K_CACHE
             + phys * stride_kbt
             + kv_head_idx * stride_kh
@@ -142,8 +152,8 @@ def _inkling_rel_attn_decode_partial(
             + offs_d[None, :] * stride_kd,
             mask=n_mask[:, None] & dmask[None, :],
             other=0.0,
-        ).to(tl.float32)
-        v = tl.load(
+        )
+        v_load = tl.load(
             V_CACHE
             + phys * stride_vbt
             + kv_head_idx * stride_vh
@@ -152,6 +162,14 @@ def _inkling_rel_attn_decode_partial(
             mask=n_mask[:, None] & dmask[None, :],
             other=0.0,
         )
+        if k_load.dtype.is_fp8():
+            k = k_load.to(tl.float32) * tl.load(K_SCALE)
+        else:
+            k = k_load.to(tl.float32)
+        if v_load.dtype.is_fp8():
+            v = v_load.to(tl.float32) * tl.load(V_SCALE)
+        else:
+            v = v_load.to(tl.float32)
 
         # QK^T for a single query: (BLOCK_N,)
         qk = tl.sum(k * q[None, :], axis=1) * sm_scale
@@ -277,6 +295,8 @@ def _inkling_rel_attn_prefill(
     BLOCK_TABLE,
     CACHE_SEQLENS,
     CU_SEQLENS_Q,
+    K_SCALE,
+    V_SCALE,
     stride_qt,
     stride_qh,
     stride_qd,
@@ -366,8 +386,10 @@ def _inkling_rel_attn_prefill(
         remaining = kv_len - blk_start
         n_mask = offs_n < remaining
 
-        # K: (HEAD_DIM, BLOCK_N), V: (BLOCK_N, HEAD_DIM)
-        k = tl.load(
+        # K: (HEAD_DIM, BLOCK_N), V: (BLOCK_N, HEAD_DIM). fp8 caches are
+        # dequantized to fp32 and multiplied by the per-tensor scale (the
+        # is_fp8() branch is pruned at compile time for bf16/fp16 caches).
+        k_load = tl.load(
             K_CACHE
             + phys * stride_kbt
             + kv_head_idx * stride_kh
@@ -375,8 +397,8 @@ def _inkling_rel_attn_prefill(
             + offs_n[None, :] * stride_kbs,
             mask=dmask[:, None] & n_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
-        v = tl.load(
+        )
+        v_load = tl.load(
             V_CACHE
             + phys * stride_vbt
             + kv_head_idx * stride_vh
@@ -385,6 +407,14 @@ def _inkling_rel_attn_prefill(
             mask=n_mask[:, None] & dmask[None, :],
             other=0.0,
         )
+        if k_load.dtype.is_fp8():
+            k = k_load.to(tl.float32) * tl.load(K_SCALE)
+        else:
+            k = k_load.to(tl.float32)
+        if v_load.dtype.is_fp8():
+            v = v_load.to(tl.float32) * tl.load(V_SCALE)
+        else:
+            v = v_load.to(tl.float32)
 
         # QK^T: (BLOCK_M, BLOCK_N)
         qk = tl.dot(q, k) * sm_scale
@@ -420,7 +450,7 @@ def _inkling_rel_attn_prefill(
         l_ij = tl.sum(p, axis=1)
         alpha = tl.exp(m_i - m_new)
         l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * alpha[:, None] + tl.dot(p, v)
         m_i = m_new
 
     out = tl.where(l_i[:, None] > 0, acc / l_i[:, None], 0.0)
@@ -450,6 +480,8 @@ def inkling_triton_rel_attention(
     rel_logits: torch.Tensor,
     max_kv_len: int | None = None,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton paged attention with the Inkling relative bias (device-agnostic).
 
@@ -489,6 +521,15 @@ def inkling_triton_rel_attention(
     use_sw = window_size != (-1, -1)
     sw_left = window_size[0] if (use_sw and window_size[0] >= 0) else 0
     sw_right = window_size[1] if (use_sw and window_size[1] >= 0) else 0
+
+    # fp8 KV caches are stored as uint8 bytes and viewed as float8_e4m3fn by
+    # the caller (the logical dtype). The kernels dequant via ``is_fp8()``
+    # and apply the per-tensor scale, loaded inside the kernel from the device
+    # scalar tensors (capture-safe: no host sync). For non-fp8 caches the
+    # ``is_fp8()`` branch is pruned at compile time, so the (1.0) scales are
+    # never read.
+    scale_k = k_scale if k_scale is not None else _DUMMY_SCALE
+    scale_v = v_scale if v_scale is not None else _DUMMY_SCALE
 
     is_decode = max_seqlen_q <= 1
 
@@ -530,6 +571,8 @@ def inkling_triton_rel_attention(
             partial_m,
             partial_l,
             partial_o,
+            scale_k,
+            scale_v,
             q.stride(0),
             q.stride(1),
             key_cache.stride(0),
@@ -592,6 +635,8 @@ def inkling_triton_rel_attention(
             block_table,
             cache_seqlens,
             cu_seqlens_q,
+            scale_k,
+            scale_v,
             q.stride(0),
             q.stride(1),
             q.stride(2),
