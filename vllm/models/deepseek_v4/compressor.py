@@ -33,6 +33,100 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+
+
+# [DSv4-ampere debug] One-shot probe for the compressor KV-cache WRITE.
+# The NaN-at-~2053 has been localized to ONE KV slot's bf16 RoPE portion being
+# NaN on read. The cache is zero-initialized and the fp8 NoPE quant saturates
+# (cannot emit Inf/NaN), so the NaN must be WRITTEN by the compressor when its
+# input (kv_score / compressed_kv) is already NaN. This probe checks both the
+# GEMM input (kv_score) and reads back the freshly-written bf16 RoPE slots to
+# catch the exact token/position at which the first NaN is written. Gated by
+# VLLM_SM86_NAN_PROBE=1; one-shot per (rank, compressor-prefix); rank0 only.
+_COMPRESSOR_NAN_PROBE_FIRED: dict[str, bool] = {}
+
+
+def _compressor_nan_probe(
+    prefix: str,
+    kv_score: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_metadata: Any,
+    positions: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+) -> None:
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    if _COMPRESSOR_NAN_PROBE_FIRED.get(prefix):
+        return
+
+    # --- input-side: is the GEMM output (kv_score) feeding the compressor NaN? ---
+    ks = kv_score.detach()
+    if ks.numel():
+        ks_f = ks.float()
+        n_nan = int(torch.isnan(ks_f).sum().item())
+        n_inf = int(torch.isinf(ks_f).sum().item())
+        if n_nan or n_inf:
+            _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
+            amax = float(ks_f.abs().amax().item()) if ks_f.numel() else 0.0
+            print(
+                f"[COMPRESSOR_WRITE ### {prefix} ###] INPUT kv_score NaN! "
+                f"nan={n_nan} inf={n_inf} absmax={amax:.4e} "
+                f"shape={tuple(ks.shape)}",
+                flush=True,
+            )
+            return
+
+    # --- output-side: read back the bf16 RoPE portion of the just-written slots ---
+    # fp8_ds_mla paged layout: kv_cache is [num_blocks, block_size, head_bytes]
+    # (viewed as uint8). Each block holds block_size tokens each of token_stride
+    # (576) bytes [448 fp8 NoPE + 128 bf16 RoPE], THEN block_size*scale_dim scale
+    # bytes. So token t's RoPE bf16 area is at:
+    #   block_base = block_idx * block_stride
+    #   token_off = pos_in_block * token_stride + fp8_dim   (fp8_dim=448)
+    # where block_idx,pos_in_block come from the flat slot id.
+    try:
+        kv_slot_mapping = k_cache_metadata.slot_mapping
+        block_stride = kv_cache.stride(0)
+        kv_block_size = kv_cache.shape[1]
+        token_stride = 576  # TOKEN_DATA_SIZE for head=512 fp8_ds_mla
+        fp8_dim = 448       # bf16 RoPE area starts at byte 448
+        rope_bytes = 128    # 64 bf16 RoPE values = 128 bytes
+        slots = kv_slot_mapping.detach()
+        valid = slots >= 0
+        if not bool(valid.any().item()):
+            return
+        sv = slots[valid]
+        block_idx = (sv // kv_block_size).to(torch.int64)
+        pos_in_block = (sv % kv_block_size).to(torch.int64)
+        flat_uint = kv_cache.view(torch.uint8).view(-1)  # 1D uint8
+        row_ptrs = block_idx * block_stride + pos_in_block * token_stride + fp8_dim
+        offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
+        # gather 128 bytes/slot, reinterpret as 64 bf16
+        gathered = flat_uint[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
+        g = gathered.float()
+        n_nan = int(torch.isnan(g).sum().item())
+        n_inf = int(torch.isinf(g).sum().item())
+        if n_nan or n_inf:
+            _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
+            bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
+            bad_slot = int(sv[bad_rows[0]].item()) if bad_rows.numel() else -1
+            print(
+                f"[COMPRESSOR_WRITE ### {prefix} ###] WROTE NaN to KV bf16-RoPE! "
+                f"nan={n_nan} inf={n_inf} first_bad_slot={bad_slot} "
+                f"n_valid_slots={int(sv.numel())}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        # Layout/format mismatch (e.g. non-fp8_ds_mla cache) -> skip silently;
+        # this probe targets the fp8_ds_mla head=512 path only.
+        if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
+            print(f"[COMPRESSOR_WRITE {prefix}] probe skipped: {e}", flush=True)
+
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -445,6 +539,16 @@ class DeepseekCompressor(nn.Module):
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
             **extra_kwargs,
+        )
+
+        # [DSv4-ampere debug] one-shot NaN probe on the compressor KV-cache write.
+        _compressor_nan_probe(
+            prefix=self.prefix,
+            kv_score=kv_score,
+            kv_cache=kv_cache,
+            k_cache_metadata=k_cache_metadata,
+            positions=positions,
+            token_to_req_indices=token_to_req_indices,
         )
 
     def _dcp_compress_and_insert(

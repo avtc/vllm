@@ -77,6 +77,43 @@ def _probe_layers() -> bool:
     return os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
 
 
+# [DSv4-ampere debug] Probe 0: confirm whether the residual grows across layers
+# (normal accumulation ~43*50) or explodes (a real bug). One-shot: logs pre_attn
+# absmax for layers {0,3,26,42} at the FIRST real prefill pass only, rank0.
+# Disambiguates "clamp fixed the explosion" from "still exploding".
+_RESIDUAL_PROBE_DONE = [False]
+
+
+def _probe_residual_baseline(layer_idx: int, x: torch.Tensor) -> None:
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if layer_idx not in (0, 3, 26, 42):
+        return
+    if _RESIDUAL_PROBE_DONE[0]:
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    # Only log at the first real prefill (pass 2); pass 0/1 are warmup/profile.
+    if _NAN_PASS[0] != 2:
+        return
+    xf = x.detach().float()
+    amax = float(xf.abs().amax().item()) if xf.numel() else 0.0
+    has_nf = bool(torch.isnan(xf).any().item() or torch.isinf(xf).any().item())
+    print(
+        f"[RESIDUAL_PROBE p{_NAN_PASS[0]}] pre_attn L{layer_idx}: "
+        f"absmax={amax:.4e} nonfinite={has_nf}",
+        flush=True,
+    )
+    if layer_idx == 42:
+        _RESIDUAL_PROBE_DONE[0] = True
+
+
 # [DSv4-ampere debug] Coordinated one-shot MoE probe. The MoE output explodes
 # at L26+ (absmax 1-131 for L0-25, then 1744-19840 for L26-42) while attn is
 # fine. To localize routing vs expert-dequant we need input + router_logits +
@@ -1189,6 +1226,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             _nan_probe("L0.pre_attn", x)
         elif _probe_layers():
             _nan_probe(f"L{self._li}.pre_attn", x)
+        _probe_residual_baseline(self._li, x)
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
         if self._probe_l0:
