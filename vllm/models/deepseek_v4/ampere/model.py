@@ -201,12 +201,11 @@ def _nan_probe_logits(hidden, logits, lm_head) -> None:
 def _nan_probe(name: str, x: torch.Tensor) -> None:
     """Env-gated residual-stream inf/nan probe (VLLM_SM86_NAN_PROBE=1).
 
-    Two modes:
-    - Early passes (<40): log per-module absmax/sum so the magnitude buildup
-      before divergence is visible.
-    - ALL passes: if non-finite (inf/nan) is detected, log it loudly with the
-      pass number and module name. This catches divergence at step ~2053 which
-      is far beyond the 40-pass early-logging window.
+    Default (minimal): ONLY detect non-finite and log the FIRST divergent
+    forward in full (one block of lines, flood-controlled). Console stays
+    empty until divergence — so an eager run can reach token ~2053 cleanly.
+    Set VLLM_SM86_NAN_VERBOSE=1 to additionally log per-module absmax/sum for
+    the first 40 passes (the magnitude-buildup baseline; floods the console).
     """
     import os
 
@@ -239,6 +238,10 @@ def _nan_probe(name: str, x: torch.Tensor) -> None:
             f"{name}: nan={n_nan} inf={n_inf} absmax={amax:.4e}",
             flush=True,
         )
+        return
+    # Finite path: only log magnitude buildup if VERBOSE (else stay quiet so
+    # the console is clean and eager can reach the divergence point fast).
+    if os.environ.get("VLLM_SM86_NAN_VERBOSE") != "1":
         return
     if _NAN_PASS[0] >= 40:
         return
