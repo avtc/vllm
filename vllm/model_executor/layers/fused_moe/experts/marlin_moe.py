@@ -168,6 +168,20 @@ def _fused_marlin_moe(
         alpha=gemm1_alpha,
         beta=gemm1_beta,
     )
+    # [DSv4-ampere debug] decisive MoE localization probe: log post-activation
+    # intermediate (should be bounded by clamp) vs the gemm1 output (pre-clamp).
+    # If post-act is bounded (~<=clamp*up) but the final MoE output explodes,
+    # the bug is in gemm2 (w2 down-projection dequant), NOT the SwiGLU clamp.
+    import os as _os_probe
+    if _os_probe.environ.get("VLLM_SM86_NAN_PROBE") == "1":
+        from vllm.logger import init_logger as _il_probe
+        _lg = _il_probe(__name__)
+        _g1 = intermediate_cache1.float()
+        _i2 = intermediate_cache2.float()
+        _lg.info(
+            "[MOE_GEMM] clamp=%r gemm1(gate,up)_absmax=%.4e "
+            "post_act_intermediate_absmax=%.4e",
+            clamp_limit, _g1.abs().max().item(), _i2.abs().max().item())
 
     if output is None:
         output = intermediate_cache3
@@ -215,6 +229,14 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
+
+    # [DSv4-ampere debug] log gemm2 (w2 down-proj) output magnitude.
+    import os as _os_probe2
+    if _os_probe2.environ.get("VLLM_SM86_NAN_PROBE") == "1":
+        from vllm.logger import init_logger as _il_probe2
+        _lg2 = _il_probe2(__name__)
+        _o = output.float()
+        _lg2.info("[MOE_GEMM] gemm2(w2)_output_absmax=%.4e", _o.abs().max().item())
 
     return output
 
