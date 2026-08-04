@@ -66,12 +66,13 @@ def _compressor_nan_probe(
 
     # --- input-side: is the GEMM output (kv_score) feeding the compressor NaN? ---
     ks = kv_score.detach()
+    input_nan = False
     if ks.numel():
         ks_f = ks.float()
         n_nan = int(torch.isnan(ks_f).sum().item())
         n_inf = int(torch.isinf(ks_f).sum().item())
         if n_nan or n_inf:
-            _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
+            input_nan = True
             amax = float(ks_f.abs().amax().item()) if ks_f.numel() else 0.0
             print(
                 f"[COMPRESSOR_WRITE ### {prefix} ###] INPUT kv_score NaN! "
@@ -79,9 +80,11 @@ def _compressor_nan_probe(
                 f"shape={tuple(ks.shape)}",
                 flush=True,
             )
-            return
 
-    # --- output-side: read back the bf16 RoPE portion of the just-written slots ---
+    # --- output-side: ALWAYS read back the bf16 RoPE portion of the just-written
+    # slots (even when input was finite) — this catches a write that produces NaN
+    # from finite input, which is the prime suspect (input probe never fired before
+    # the decode read a poisoned slot). One-shot per prefix once a NaN is found. ---
     # fp8_ds_mla paged layout: kv_cache is [num_blocks, block_size, head_bytes]
     # (viewed as uint8). Each block holds block_size tokens each of token_stride
     # (576) bytes [448 fp8 NoPE + 128 bf16 RoPE], THEN block_size*scale_dim scale
@@ -115,9 +118,10 @@ def _compressor_nan_probe(
             _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
             bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
             bad_slot = int(sv[bad_rows[0]].item()) if bad_rows.numel() else -1
+            tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
-                f"[COMPRESSOR_WRITE ### {prefix} ###] WROTE NaN to KV bf16-RoPE! "
-                f"nan={n_nan} inf={n_inf} first_bad_slot={bad_slot} "
+                f"[COMPRESSOR_WRITE ### {prefix} ###] {tag}: WROTE NaN to KV "
+                f"bf16-RoPE! nan={n_nan} inf={n_inf} first_bad_slot={bad_slot} "
                 f"n_valid_slots={int(sv.numel())}",
                 flush=True,
             )

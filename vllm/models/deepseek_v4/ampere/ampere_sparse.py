@@ -38,6 +38,86 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+# [DSv4-ampere debug] One-shot probe for the SWA (sliding-window) KV-cache WRITE.
+# The SWA cache stores UN-NORMALIZED RoPE-applied KV; the bf16 RoPE portion is
+# copied verbatim by quantize_and_insert_k_kernel. swa_dequant showed nan=64
+# (a full RoPE row) at the divergence, so this catches whether the SWA write
+# received a NaN input (kv) or wrote NaN from finite input. Gated by
+# VLLM_SM86_NAN_PROBE=1; one-shot per prefix; rank0 only.
+_SWA_WRITE_PROBE_FIRED: dict[str, bool] = {}
+
+
+def _swa_write_nan_probe(
+    prefix: str,
+    kv: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if _SWA_WRITE_PROBE_FIRED.get(prefix):
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+
+    # input-side: is the KV feeding the SWA write NaN?
+    input_nan = False
+    kvf = kv.detach().float()
+    if kvf.numel():
+        n_nan = int(torch.isnan(kvf).sum().item())
+        n_inf = int(torch.isinf(kvf).sum().item())
+        if n_nan or n_inf:
+            input_nan = True
+            amax = float(kvf.abs().amax().item())
+            print(
+                f"[SWA_WRITE ### {prefix} ###] INPUT kv NaN! nan={n_nan} inf={n_inf} "
+                f"absmax={amax:.4e} shape={tuple(kv.shape)}",
+                flush=True,
+            )
+
+    # output-side: read back the bf16 RoPE portion of the just-written slots.
+    # fp8_ds_mla layout: token = 448 fp8 + 128 bf16 (64 RoPE values) bytes.
+    try:
+        block_stride = swa_kv_cache.stride(0)
+        kv_block_size = swa_kv_cache.shape[1]
+        token_stride = 576
+        fp8_dim = 448
+        rope_bytes = 128
+        slots = slot_mapping.detach()
+        valid = slots >= 0
+        if not bool(valid.any().item()):
+            return
+        sv = slots[valid]
+        block_idx = (sv // kv_block_size).to(torch.int64)
+        pos_in_block = (sv % kv_block_size).to(torch.int64)
+        flat_uint = swa_kv_cache.view(torch.uint8).view(-1)
+        row_ptrs = block_idx * block_stride + pos_in_block * token_stride + fp8_dim
+        offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
+        gathered = flat_uint[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
+        g = gathered.float()
+        n_nan = int(torch.isnan(g).sum().item())
+        n_inf = int(torch.isinf(g).sum().item())
+        if n_nan or n_inf:
+            _SWA_WRITE_PROBE_FIRED[prefix] = True
+            bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
+            bad_slot = int(sv[bad_rows[0]].item()) if bad_rows.numel() else -1
+            tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
+            print(
+                f"[SWA_WRITE ### {prefix} ###] {tag}: WROTE NaN to SWA bf16-RoPE! "
+                f"nan={n_nan} inf={n_inf} first_bad_slot={bad_slot} "
+                f"n_valid_slots={int(sv.numel())}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
+            print(f"[SWA_WRITE {prefix}] probe skipped: {e}", flush=True)
+
+
+
 class DeepseekV4AmpereSparseBackend(DeepseekV4FlashMLABackend):
     @staticmethod
     def get_name() -> str:
@@ -122,6 +202,14 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             self.rotary_emb.cos_sin_cache,
             self.eps,
             swa_metadata.block_size,
+        )
+
+        # [DSv4-ampere debug] one-shot NaN probe on the SWA KV-cache write.
+        _swa_write_nan_probe(
+            self.prefix,
+            kv,
+            self.swa_cache_layer.kv_cache,
+            swa_metadata.slot_mapping,
         )
         return q
 
