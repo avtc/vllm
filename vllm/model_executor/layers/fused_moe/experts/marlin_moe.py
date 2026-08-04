@@ -602,6 +602,15 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        # Gated-activation params (used by SWIGLUOAI_UNINTERLEAVE on packed w13).
+        # silu == swigluoai with alpha=1, beta=0; configs that don't set these
+        # (plain silu) fall back to the silu identity.
+        self.gemm1_alpha = (
+            quant_config.gemm1_alpha if quant_config.gemm1_alpha is not None else 1.0
+        )
+        self.gemm1_beta = (
+            quant_config.gemm1_beta if quant_config.gemm1_beta is not None else 0.0
+        )
         # [DSv4-ampere debug] log the clamp value reaching the Marlin kernel.
         # If gemm1_clamp_limit is None here, the SwiGLU clamp (swiglu_limit)
         # never reached the kernel -> unclamped activation -> MoE explosion.
@@ -619,15 +628,6 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
                 "[MARLIN_CLAMP] quant_scheme=%s clamp_limit=%r alpha=%r beta=%r",
                 _scheme, self.gemm1_clamp_limit, self.gemm1_alpha,
                 self.gemm1_beta)
-        # Gated-activation params (used by SWIGLUOAI_UNINTERLEAVE on packed w13).
-        # silu == swigluoai with alpha=1, beta=0; configs that don't set these
-        # (plain silu) fall back to the silu identity.
-        self.gemm1_alpha = (
-            quant_config.gemm1_alpha if quant_config.gemm1_alpha is not None else 1.0
-        )
-        self.gemm1_beta = (
-            quant_config.gemm1_beta if quant_config.gemm1_beta is not None else 0.0
-        )
 
         super().__init__(
             moe_config=moe_config,
