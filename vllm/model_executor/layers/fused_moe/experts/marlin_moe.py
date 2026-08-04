@@ -580,6 +580,23 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        # [DSv4-ampere debug] log the clamp value reaching the Marlin kernel.
+        # If gemm1_clamp_limit is None here, the SwiGLU clamp (swiglu_limit)
+        # never reached the kernel -> unclamped activation -> MoE explosion.
+        import os
+        if os.environ.get("VLLM_SM86_NAN_PROBE") == "1":
+            from vllm.logger import init_logger
+            _lg = init_logger(__name__)
+            _scheme = (
+                "mxfp4_w4a16" if getattr(quant_config, "use_mxfp4_w4a16", False)
+                else "int4_w4a16" if getattr(quant_config, "use_int4_w4a16", False)
+                else "fp8_w8a16" if getattr(quant_config, "use_fp8_w8a16", False)
+                else "int8_w8a16" if getattr(quant_config, "use_int8_w8a16", False)
+                else "?")
+            _lg.info(
+                "[MARLIN_CLAMP] quant_scheme=%s clamp_limit=%r alpha=%r beta=%r",
+                _scheme, self.gemm1_clamp_limit, self.gemm1_alpha,
+                self.gemm1_beta)
         # Gated-activation params (used by SWIGLUOAI_UNINTERLEAVE on packed w13).
         # silu == swigluoai with alpha=1, beta=0; configs that don't set these
         # (plain silu) fall back to the silu identity.
