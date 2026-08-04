@@ -996,31 +996,35 @@ class DeepseekV4MoE(nn.Module):
         # [DSv4-ampere debug] Coordinated MoE probe: log input + router_logits +
         # topk_weights + topk_ids + output TOGETHER at the first real decode
         # (baseline) and at the first call where the output spikes (L26+).
-        tensors = {"moe_input": hidden_states, "router_logits": router_logits,
-                   "moe_output": final_hidden_states}
-        try:
-            from vllm.model_executor.layers.fused_moe.fused_moe import (
-                fused_topk_bias)
-            topk_weights, topk_ids = fused_topk_bias(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                scoring_func=self.scoring_func,
-                e_score_correction_bias=(
-                    self.gate.e_score_correction_bias.data
-                    if self.gate.e_score_correction_bias is not None else None),
-                topk=self.n_activated_experts,
-                renormalize=self.renormalize,
-                indices_type=torch.int32,
-                input_tokens=input_ids,
-                hash_indices_table=(
-                    self.gate.tid2eid if self.gate.tid2eid is not None else None),
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            tensors["topk_weights"] = topk_weights
-            tensors["topk_ids"] = topk_ids
-        except Exception:
-            pass
-        _moe_probe_call(self.prefix, tensors)
+        # Gated by VLLM_SM86_NAN_PROBE so the (cudagraph-breaking) fused_topk_bias
+        # recomputation and tensor builds are skipped entirely in production.
+        import os as _os_moe_probe
+        if _os_moe_probe.environ.get("VLLM_SM86_NAN_PROBE") == "1":
+            tensors = {"moe_input": hidden_states, "router_logits": router_logits,
+                       "moe_output": final_hidden_states}
+            try:
+                from vllm.model_executor.layers.fused_moe.fused_moe import (
+                    fused_topk_bias)
+                topk_weights, topk_ids = fused_topk_bias(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    scoring_func=self.scoring_func,
+                    e_score_correction_bias=(
+                        self.gate.e_score_correction_bias.data
+                        if self.gate.e_score_correction_bias is not None else None),
+                    topk=self.n_activated_experts,
+                    renormalize=self.renormalize,
+                    indices_type=torch.int32,
+                    input_tokens=input_ids,
+                    hash_indices_table=(
+                        self.gate.tid2eid if self.gate.tid2eid is not None else None),
+                    routed_scaling_factor=self.routed_scaling_factor,
+                )
+                tensors["topk_weights"] = topk_weights
+                tensors["topk_ids"] = topk_ids
+            except Exception:
+                pass
+            _moe_probe_call(self.prefix, tensors)
 
         return final_hidden_states.view(org_shape)
 

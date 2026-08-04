@@ -270,8 +270,8 @@ def ampere_sparse_decode_fp8(
         # Also surface the raw slot indices that were selected: out-of-range or
         # uninitialized slots are the prime suspect for a garbage UE8M0 scale.
         if topk_idx_2d is not None:
-            _decode_probe("topk_indices", topk_idx_2d.to(torch.float32))
-            _decode_probe("topk_lens", topk_lens.to(torch.float32) if topk_lens is not None else None)
+            _decode_probe("topk_indices", topk_idx_2d)
+            _decode_probe("topk_lens", topk_lens)
 
     # Dequant+gather SWA slots
     swa_flat = swa_idx_2d.reshape(-1).to(torch.int32)
