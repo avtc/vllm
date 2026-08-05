@@ -117,6 +117,52 @@ def _swa_write_nan_probe(
             print(f"[SWA_WRITE {prefix}] probe skipped: {e}", flush=True)
 
 
+# [DSv4-ampere debug] Periodic FULL-CACHE NaN scan at decode time. The per-write
+# readback probes silently failed on the packed-cache view, so they never
+# confirmed whether a write produced NaN from finite input. This scan is
+# LAYOUT-ROBUST: it indexes each cache's bf16-RoPE byte region [448:576] and
+# views it as bf16, scanning ALL slots for NaN. Finds the exact decode step (and
+# which cache/slot) at which the FIRST NaN appears — independent of which write
+# path put it there. Gated by VLLM_SM86_NAN_PROBE=1; one-shot per (rank, name).
+_CACHE_SCAN_FIRED: dict[str, bool] = {}
+
+
+def _cache_nan_scan(name: str, cache, pass_no: int) -> None:
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if cache is None:
+        return
+    if _CACHE_SCAN_FIRED.get(name):
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    try:
+        # bf16-RoPE region is bytes [448:576] of each token's row.
+        rope = cache[..., 448:576]  # [..., 128] uint8/int8
+        rows = rope.reshape(-1, 128)  # [num_slots, 128]
+        rows_bf16 = rows.view(torch.bfloat16).float()  # [num_slots, 64]
+        n_nan = int(torch.isnan(rows_bf16).sum().item())
+        n_inf = int(torch.isinf(rows_bf16).sum().item())
+        if n_nan or n_inf:
+            _CACHE_SCAN_FIRED[name] = True
+            bad = torch.where(torch.isnan(rows_bf16).any(1))[0]
+            first_slot = int(bad[0].item()) if bad.numel() else -1
+            print(
+                f"[CACHE_SCAN ### {name} ### pass {pass_no}] NaN FOUND in cache! "
+                f"nan={n_nan} inf={n_inf} first_slot={first_slot} "
+                f"cache_shape={tuple(cache.shape)}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
+            print(f"[CACHE_SCAN {name}] scan skipped: {e}", flush=True)
+
 
 class DeepseekV4AmpereSparseBackend(DeepseekV4FlashMLABackend):
     @staticmethod
@@ -315,6 +361,21 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+
+        # [DSv4-ampere debug] one-shot full-cache NaN scan BEFORE the attention
+        # reads. Finds the exact decode step at which a NaN first appears in
+        # either cache (main MLA or SWA), independent of which write path put
+        # it there. Layout-robust: scans the bf16-RoPE region of every slot.
+        global _DECODE_PASS_COUNTER
+        try:
+            _DECODE_PASS_COUNTER += 1
+        except NameError:
+            _DECODE_PASS_COUNTER = 1
+        if kv_cache is not None:
+            _cache_nan_scan(f"{self.prefix}.main_mla", kv_cache, _DECODE_PASS_COUNTER)
+        _cache_nan_scan(
+            f"{self.prefix}.swa", self.swa_cache_layer.kv_cache, _DECODE_PASS_COUNTER
+        )
 
         topk_indices = None
         topk_lens = None
