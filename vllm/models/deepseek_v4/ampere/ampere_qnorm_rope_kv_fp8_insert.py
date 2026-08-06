@@ -147,6 +147,33 @@ def ampere_qnorm_rope_kv_fp8_insert(
         HALF_ROPE=HALF_ROPE,
     )
 
+    # [DSv4-ampere debug] BISECT: is the NaN in kv_roped (=> _xpu_qnorm_rope_kernel
+    # produced it) or introduced by quantize_and_insert_k_cache? kv_roped is
+    # torch.empty_like (UNINITIALIZED) — if the RoPE kernel skips/partially-writes
+    # any token, the stale garbage (incl. NaN bit patterns) flows to the cache.
+    import os as _os_bisect
+    if _os_bisect.environ.get("VLLM_SM86_NAN_PROBE") == "1":
+        try:
+            if not (torch.distributed.is_available() and torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() != 0):
+                rope_out = kv_roped[..., NOPE_DIM:].detach().float()  # [N, ROPE_DIM]
+                if rope_out.numel():
+                    bad = torch.where(torch.isnan(rope_out).any(1) | torch.isinf(rope_out).any(1))[0]
+                    if bad.numel():
+                        # also check the INPUT kv RoPE portion for comparison
+                        kv_in = kv[..., NOPE_DIM:].detach().float()
+                        in_bad = "yes" if (torch.isnan(kv_in).any().item() or torch.isinf(kv_in).any().item()) else "no"
+                        print(
+                            f"[ROPE_BISECT] kv_roped RoPE portion has non-finite! "
+                            f"n_bad_tokens={int(bad.numel())} first_tokens={bad[:8].tolist()} "
+                            f"input_kv_rope_nonfinite={in_bad} num_tokens={num_tokens} "
+                            f"num_heads={num_heads}",
+                            flush=True,
+                        )
+        except Exception as _e:  # noqa: BLE001
+            if _os_bisect.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
+                print(f"[ROPE_BISECT] skipped: {_e}", flush=True)
+
     # FP8 UE8M0 quant + paged insert (reuse existing Triton kernel)
     # swa_kv_cache may be [num_blocks, block_size, 584] or [num_blocks, flat]
     # quantize_and_insert_k_cache expects [num_blocks, block_bytes] uint8
