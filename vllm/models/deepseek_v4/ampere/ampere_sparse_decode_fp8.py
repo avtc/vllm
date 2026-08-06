@@ -61,12 +61,22 @@ def _decode_probe(name: str, t) -> None:
 
 
 def _nan_slot_diagnostic(topk_buf_3d, topk_idx_2d, topk_lens, kv_cache):
-    """When topk_dequant has NaN, identify WHICH gathered slot produced it and
-    whether that slot index is out of the valid written range.
+    """When topk_dequant has NaN, read the offending slot's ACTUAL stored bytes
+    directly from cache storage (fp8 NoPE + bf16 RoPE + UE8M0 scales) and report
+    whether storage genuinely holds NaN there.
 
-    topk_buf_3d: (num_tokens, max_topk, OUTPUT_DIM) dequantized gathered slots
+    This is the DECISIVE discriminator between the two remaining hypotheses:
+      (A) DATA-NaN: the slot's storage is actually NaN (corrupted between its
+          write ~token 2010 and this read ~token 2053 by an OOB write) -> the
+          per-write readback (which found 0 from-finite-input NaN) was correct;
+          the corruption is a different write touching this slot.
+      (B) GATHER-NaN: storage is CLEAN but the gather/dequant produced NaN
+          (wrong offset / bad scale / kernel bug) -> read-side bug.
+    Also pinpoints WHICH region (fp8 NoPE vs bf16 RoPE) and, for fp8, the stored
+    byte + its scale (to catch scale-overflow -> Inf, or fp8 NaN-encoding).
+
+    topk_buf_3d: (num_tokens, max_topk, OUTPUT_DIM=512) dequantized gathered
     topk_idx_2d: (num_tokens, max_topk) global slot IDs used for the gather
-    topk_lens:   (num_tokens,) number of VALID topk slots per token
     kv_cache:    (num_blocks, block_size, 584) the cache we gathered from
     """
     if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
@@ -79,26 +89,81 @@ def _nan_slot_diagnostic(topk_buf_3d, topk_idx_2d, topk_lens, kv_cache):
         if not bool(nan_mask.any().item()):
             return
         _DECODE_PROBE_FIRED["nan_slot_diag"] = True
-        nt, mt = topk_idx_2d.shape
         bad = torch.where(nan_mask)
         tok_i = int(bad[0][0].item())
         slot_j = int(bad[1][0].item())
         slot_id = int(topk_idx_2d[tok_i, slot_j].item())
-        # valid range: per-token topk_lens, and the cache capacity
-        valid_len = (int(topk_lens[tok_i].item())
-                     if topk_lens is not None else -1)
-        num_slots_total = kv_cache.shape[0] * kv_cache.shape[1]
-        # min/max slot ids actually selected this step
-        sel = topk_idx_2d[tok_i]
-        sel_min = int(sel.min().item())
-        sel_max = int(sel.max().item())
+        # Which OUTPUT dim is NaN? (0..447 = dequantized fp8 NoPE;
+        # 448..511 = bf16 RoPE)
+        row = topk_buf_3d[tok_i, slot_j].float()  # (512,)
+        row_nan = torch.isnan(row)
+        nan_cols = torch.where(row_nan)[0]
+        first_nan_col = int(nan_cols[0].item()) if nan_cols.numel() else -1
+        n_nan = int(row_nan.sum().item())
+        region = ("BF16_ROPE" if first_nan_col >= 448
+                  else "FP8_NoPE" if first_nan_col >= 0 else "?")
+
+        # ---- Read the slot's ACTUAL stored bytes from cache storage ----
+        # Matches the kernel layout EXACTLY:
+        #   block_idx = slot_id // 64; pos = slot_id % 64
+        #   token_data @ storage_offset + block*stride0 + pos*576
+        #     fp8 NoPE [+0:+448]; bf16 RoPE [+448:+576]
+        #   scales    @ storage_offset + block*stride0 + 64*576 + pos*8 (8 bytes)
+        block_size = kv_cache.shape[1]
+        s0 = kv_cache.stride(0)
+        st = kv_cache.untyped_storage()
+        n_elem = st.nbytes() // kv_cache.element_size()
+        flat = torch.empty(0, dtype=kv_cache.dtype, device=kv_cache.device)
+        flat.set_(st, 0, (n_elem,), (1,))
+        base = kv_cache.storage_offset()
+        block_idx = slot_id // block_size
+        pos = slot_id % block_size
+        tok_base = base + block_idx * s0 + pos * 576
+        scale_base = base + block_idx * s0 + block_size * 576 + pos * 8
+
+        # fp8 NoPE bytes (448) -> check for NaN/Inf encoding (e4m3fn: 0x7F,0xFF)
+        fp8_bytes = flat[tok_base:tok_base + 448].to(torch.uint8)
+        fp8_nan_bytes = int(((fp8_bytes == 0x7F) | (fp8_bytes == 0xFF)).sum().item())
+        # bf16 RoPE (64 values)
+        rope_vals = flat[tok_base + 448:tok_base + 576].view(torch.bfloat16).float()
+        rope_nf = bool((torch.isnan(rope_vals) | torch.isinf(rope_vals)).any().item())
+        rope_nan = int(torch.isnan(rope_vals).sum().item())
+        rope_inf = int(torch.isinf(rope_vals).sum().item())
+        # scales (8 bytes) -> flag overflow (byte 255 -> 2^128)
+        scale_bytes = flat[scale_base:scale_base + 8].to(torch.uint8)
+        scale_list = scale_bytes.tolist()
+        has_overflow_scale = any(b >= 250 for b in scale_list)
+
+        # If the NaN col is fp8 NoPE, report that exact stored byte + its scale
+        fp8_detail = ""
+        if 0 <= first_nan_col < 448:
+            sb = int(fp8_bytes[first_nan_col].item())
+            sc_idx = first_nan_col // 64
+            sc = int(scale_bytes[sc_idx].item()) if sc_idx < len(scale_list) else -1
+            fp8_detail = (f" stored_fp8_byte_at_col{first_nan_col}=0x{sb:02x} "
+                          f"scale[{sc_idx}]={sc}->2^{sc-127}")
+        rope_detail = ""
+        if first_nan_col >= 448:
+            ri = first_nan_col - 448
+            rv = float(rope_vals[ri].item()) if ri < rope_vals.numel() else None
+            rope_detail = f" stored_bf16_at_col{first_nan_col}[{ri}]={rv}"
+
+        storage_verdict = ("STORAGE_HAS_NaN" if (fp8_nan_bytes or rope_nan)
+                           else "STORAGE_CLEAN")
+        if storage_verdict == "STORAGE_HAS_NaN":
+            interp = ("(A) DATA-NaN: slot corrupted between write~2010 and "
+                      "read~2053 by an OOB write -> all-layers STEP_WATCH finds the planting step")
+        else:
+            interp = ("(B) GATHER-NaN: storage clean; gather/dequant kernel "
+                      "produced NaN from clean data -> read-side kernel bug")
         print(
-            f"[NAN_SLOT_DIAG] first-NaN gathered slot: token={tok_i} "
-            f"pos_in_topk={slot_j} selected_slot_id={slot_id} "
-            f"valid_topk_len(token)={valid_len} "
-            f"cache_num_slots={num_slots_total} "
-            f"selected_slot_range=[{sel_min},{sel_max}] "
-            f"OUT_OF_RANGE={slot_id >= valid_len}",
+            f"[NAN_SLOT_DIAG] slot_id={slot_id} (block={block_idx} pos={pos}) "
+            f"gathered_nNaN={n_nan} first_nan_col={first_nan_col} region={region}\n"
+            f"  -> STORAGE: {storage_verdict} | fp8_nan_bytes={fp8_nan_bytes} "
+            f"rope_nan={rope_nan} rope_inf={rope_inf} "
+            f"scales={scale_list} overflow_scale={has_overflow_scale}"
+            f"{fp8_detail}{rope_detail}\n"
+            f"  -> {interp}",
             flush=True,
         )
     except Exception as e:  # noqa: BLE001

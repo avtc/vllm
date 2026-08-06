@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 # received a NaN input (kv) or wrote NaN from finite input. Gated by
 # VLLM_SM86_NAN_PROBE=1; one-shot per prefix; rank0 only.
 _SWA_WRITE_PROBE_FIRED: dict[str, bool] = {}
-_WATCH_OWNER: list = [None]
+
 
 
 def _read_cache_rope_bytes(cache, slots):
@@ -104,13 +104,13 @@ def _read_cache_rope_bytes(cache, slots):
 # a WRITE bug (flipped slot == written slot) from an OOB/alias corruption
 # (flipped slot != written slot).
 _STEP_WATCH_FIRED: bool = False
-_STEP_WATCH_PREV: torch.Tensor | None = None
+_STEP_WATCH_PREV: dict = {}   # prefix -> {slot_id: bool} per-layer state
 _STEP_WATCH_STEP: int = 0
 _STEP_WATCH_ERR_LOGGED: bool = False
-_STEP_WATCH_BASELINE_DUMPED: bool = False
+_STEP_WATCH_BASELINE_DUMPED: dict = {}  # prefix -> bool
 
 
-def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> None:
+def _step_watch_cache_nan(cache, prefix="", decode_slot_mapping=None, block_table=None) -> None:
     global _STEP_WATCH_FIRED, _STEP_WATCH_PREV, _STEP_WATCH_STEP
     global _STEP_WATCH_ERR_LOGGED, _STEP_WATCH_BASELINE_DUMPED
     import os
@@ -159,35 +159,34 @@ def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> 
         slot_ids = (phys_blocks[:, None] * block_size
                     + pos_arange[None, :]).reshape(-1)  # (nblk*bs,)
         cur_nonfinite = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
-        if _STEP_WATCH_PREV is None:
-            # Baseline: record non-finite mask keyed by physical slot id in a dict.
-            _STEP_WATCH_PREV = {int(s.item()): bool(f.item())
-                                for s, f in zip(slot_ids, cur_nonfinite)}
+        prev = _STEP_WATCH_PREV.setdefault(prefix, {})
+        if not prev:
+            # Baseline for this layer: record non-finite mask keyed by slot id.
+            prev.update({int(s.item()): bool(f.item())
+                         for s, f in zip(slot_ids, cur_nonfinite)})
             n_base = int(cur_nonfinite.sum().item())
-            if not _STEP_WATCH_BASELINE_DUMPED:
-                _STEP_WATCH_BASELINE_DUMPED = True
+            if not _STEP_WATCH_BASELINE_DUMPED.get(prefix):
+                _STEP_WATCH_BASELINE_DUMPED[prefix] = True
                 base_bad = slot_ids[cur_nonfinite][:32].tolist()
                 print(
-                    f"[STEP_WATCH ### step 1 (baseline) ###] scanned {n_scanned} "
+                    f"[STEP_WATCH baseline ### {prefix} ###] scanned {n_scanned} "
                     f"slots across {phys_blocks.numel()} active blocks; "
                     f"{n_base} already non-finite; baseline_bad_slots={base_bad} "
                     f"phys_blocks={phys_blocks[:16].tolist()}",
                     flush=True,
                 )
             return
-        prev = _STEP_WATCH_PREV
-        newly_rows = []
-        for s, f in zip(slot_ids, cur_nonfinite):
-            sid = int(s.item())
-            now_nf = bool(f.item())
-            was_nf = prev.get(sid, False)  # treat unseen slots as finite(False)
-            if now_nf and not was_nf:
-                newly_rows.append(sid)
-            prev[sid] = now_nf  # update tracked state
-        n_new = len(newly_rows)
+
+        # Vectorized delta vs this layer's previous mask. Build a prev_nonfinite
+        # tensor aligned to the current slot_ids via dict lookup (single Python
+        # loop over n_scanned, no GPU sync inside).
+        prev_nf = torch.tensor([prev.get(int(s.item()), False)
+                                for s in slot_ids], device=cache.device)
+        newly = cur_nonfinite & (~prev_nf)
+        n_new = int(newly.sum().item())
         if n_new > 0:
             _STEP_WATCH_FIRED = True
-            bad = newly_rows[:16]
+            bad = slot_ids[newly][:16].tolist()
             n_baseline = sum(1 for v in prev.values() if v)
             written = ""
             try:
@@ -200,14 +199,16 @@ def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> 
             except Exception:
                 pass
             print(
-                f"[STEP_WATCH ### step {_STEP_WATCH_STEP} ###] FLIP in active KV! "
-                f"{n_new} slot(s) turned finite->NaN; newly_bad_slots={bad} "
-                f"baseline_nonfinite={n_baseline} n_scanned={n_scanned} "
-                f"n_active_blocks={phys_blocks.numel()}{written}",
+                f"[STEP_WATCH ### step {_STEP_WATCH_STEP} ### {prefix} ###] "
+                f"FLIP in active KV! {n_new} slot(s) turned finite->NaN; "
+                f"newly_bad_slots={bad} baseline_nonfinite={n_baseline} "
+                f"n_scanned={n_scanned} n_active_blocks={phys_blocks.numel()}"
+                f"{written}",
                 flush=True,
             )
-        # NOTE: per-slot state is updated in-place in the loop above (prev is
-        # _STEP_WATCH_PREV, a dict). Do NOT reassign to cur_nonfinite (Tensor).
+        # Update tracked state for next step (in-place; prev is _STEP_WATCH_PREV[prefix]).
+        for s, f in zip(slot_ids, cur_nonfinite):
+            prev[int(s.item())] = bool(f.item())
     except Exception as e:  # noqa: BLE001
         if not _STEP_WATCH_ERR_LOGGED:
             _STEP_WATCH_ERR_LOGGED = True
@@ -501,23 +502,23 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
-        # [DSv4-ampere debug] per-step NaN watch on the main-MLA cache. Run once
-        # per decode STEP (owned by whichever attention layer calls first), so it
-        # doesn't repeat across the 43 layers. Reports the exact step + slot at
-        # which a written slot's bf16-RoPE flips finite->NaN.
+        # [DSv4-ampere debug] per-step NaN watch on the main-MLA cache for
+        # EVERY MLA layer (state keyed by prefix). Scoped to the active
+        # requests' block_table blocks. If NAN_SLOT_DIAG later reports
+        # STORAGE_HAS_NaN, this watch (running every step on every layer) will
+        # have logged the exact step + layer where a slot flipped finite->NaN
+        # (the planting moment an OOB write would show). Cheap: scans only the
+        # active blocks' bf16-RoPE per layer.
         if not swa_only and kv_cache is not None:
-            if _WATCH_OWNER[0] is None:
-                _WATCH_OWNER[0] = self.prefix
-            if self.prefix == _WATCH_OWNER[0]:
-                _dslot = None
-                _bt = None
-                try:
-                    if attn_metadata is not None:
-                        _dslot = attn_metadata.slot_mapping
-                        _bt = attn_metadata.block_table
-                except Exception:
-                    pass
-                _step_watch_cache_nan(kv_cache, _dslot, _bt)
+            _dslot = None
+            _bt = None
+            try:
+                if attn_metadata is not None:
+                    _dslot = attn_metadata.slot_mapping
+                    _bt = attn_metadata.block_table
+            except Exception:
+                pass
+            _step_watch_cache_nan(kv_cache, self.prefix, _dslot, _bt)
 
         topk_indices = None
         topk_lens = None
