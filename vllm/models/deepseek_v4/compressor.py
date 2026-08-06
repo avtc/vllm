@@ -44,6 +44,9 @@ from vllm.v1.attention.backend import (
 # catch the exact token/position at which the first NaN is written. Gated by
 # VLLM_SM86_NAN_PROBE=1; one-shot per (rank, compressor-prefix); rank0 only.
 _COMPRESSOR_NAN_PROBE_FIRED: dict[str, bool] = {}
+# One-shot per-prefix confirmation that the output readback actually executed
+# (so an absence of OUTPUT-NaN lines is trustworthy, not a silent exception).
+_COMPRESSOR_READBACK_CONFIRMED: dict[str, bool] = {}
 
 
 def _compressor_nan_probe(
@@ -104,6 +107,17 @@ def _compressor_nan_probe(
         if not bool(valid.any().item()):
             return
         sv = slots[valid].to(torch.int64)
+        # One-shot confirmation that the readback ACTUALLY RAN (so a later
+        # 'no OUTPUT-NaN' line is trustworthy, not a silent except). Logs the
+        # cache shape + strides + n_slots checked once per prefix.
+        if not _COMPRESSOR_READBACK_CONFIRMED.get(prefix):
+            _COMPRESSOR_READBACK_CONFIRMED[prefix] = True
+            print(
+                f"[COMPRESSOR_READBACK_OK] {prefix} head_dim={head_dim} "
+                f"cache_shape={tuple(kv_cache.shape)} strides={kv_cache.stride()} "
+                f"is_contig={kv_cache.is_contiguous()} n_slots={int(sv.numel())}",
+                flush=True,
+            )
         flat = kv_cache.reshape(-1)  # 1D (reshape copies if non-contiguous)
         block_size = kv_cache.shape[1]
         block_stride = block_size * 584  # bytes per block
@@ -139,10 +153,9 @@ def _compressor_nan_probe(
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001
-        # Layout/format mismatch (e.g. non-fp8_ds_mla cache) -> skip silently;
-        # this probe targets the fp8_ds_mla head=512 path only.
-        if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
-            print(f"[COMPRESSOR_WRITE {prefix}] probe skipped: {e}", flush=True)
+        # ALWAYS surface readback failures — a silent except would make 'no
+        # OUTPUT-NaN' falsely imply the compressor is clean.
+        print(f"[COMPRESSOR_WRITE {prefix}] readback FAILED: {e}", flush=True)
 
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,

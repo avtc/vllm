@@ -136,7 +136,7 @@ def _swa_write_nan_probe(
             )
     except Exception as e:  # noqa: BLE001
         if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
-            print(f"[SWA_WRITE {prefix}] probe skipped: {e}", flush=True)
+            print(f"[SWA_WRITE {prefix}] readback FAILED: {e}", flush=True)
 
 
 # [DSv4-ampere debug] Periodic FULL-CACHE NaN scan at decode time. The per-write
@@ -199,7 +199,7 @@ def _cache_nan_scan(name: str, cache, pass_no: int) -> None:
             )
     except Exception as e:  # noqa: BLE001
         if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
-            print(f"[CACHE_SCAN {name}] scan skipped: {e}", flush=True)
+            print(f"[CACHE_SCAN {name}] scan FAILED: {e}", flush=True)
 
 
 class DeepseekV4AmpereSparseBackend(DeepseekV4FlashMLABackend):
