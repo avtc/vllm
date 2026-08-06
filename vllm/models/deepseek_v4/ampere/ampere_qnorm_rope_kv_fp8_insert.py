@@ -16,6 +16,46 @@ NOPE_DIM = HEAD_DIM - ROPE_DIM
 HALF_ROPE = ROPE_DIM // 2
 
 
+# [DSv4-ampere debug] BEFORE-quantize snapshot of the SWA cache target slots.
+# Reads the bf16-RoPE region [448:576] of each slot to be written, logging any
+# pre-existing non-finite. Compared with the AFTER read (SWA_WRITE probe), this
+# shows whether quantize INTRODUCES the NaN or it pre-existed (stale block /
+# partial prior write). Gated by VLLM_SM86_NAN_PROBE=1, rank0, one-shot.
+_SWA_BEFORE_FIRED = False
+
+
+def _swa_before_snapshot(swa_kv_cache, slot_mapping):
+    import os
+
+    global _SWA_BEFORE_FIRED
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if _SWA_BEFORE_FIRED:
+        return
+    slots = slot_mapping.detach()
+    valid = slots >= 0
+    if not bool(valid.any().item()):
+        return
+    sv = slots[valid].to(torch.int64)
+    head_bytes = swa_kv_cache.shape[-1]  # 584
+    flat = swa_kv_cache.reshape(-1)
+    row_ptrs = sv * head_bytes + 448
+    offs = torch.arange(128, device=sv.device, dtype=torch.int64)
+    gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16).float()
+    n_nan = int(torch.isnan(gathered).sum().item())
+    n_inf = int(torch.isinf(gathered).sum().item())
+    if n_nan or n_inf:
+        _SWA_BEFORE_FIRED = True
+        bad_rows = torch.where(torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1))[0]
+        bad_slots = sv[bad_rows][:8].tolist()
+        print(
+            f"[SWA_BEFORE quantize] target slots ALREADY have non-finite! "
+            f"nan={n_nan} inf={n_inf} bad_slots={bad_slots} "
+            f"n_target_slots={int(sv.numel())} head_bytes={head_bytes}",
+            flush=True,
+        )
+
+
 @triton.jit
 def _xpu_qnorm_rope_kernel(
     q_ptr,  # [num_tokens, num_heads, HEAD_DIM]
@@ -178,6 +218,19 @@ def ampere_qnorm_rope_kv_fp8_insert(
     # swa_kv_cache may be [num_blocks, block_size, 584] or [num_blocks, flat]
     # quantize_and_insert_k_cache expects [num_blocks, block_bytes] uint8
     cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+
+    # [DSv4-ampere debug] BEFORE snapshot: read the target slots' bf16-RoPE
+    # region BEFORE quantize, so the AFTER read (SWA_WRITE probe) can tell whether
+    # quantize INTRODUCED the NaN or it pre-existed (stale/partial-write).
+    import os as _os_before
+    if _os_before.environ.get("VLLM_SM86_NAN_PROBE") == "1":
+        try:
+            if not (torch.distributed.is_available() and torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() != 0):
+                _swa_before_snapshot(swa_kv_cache, slot_mapping)
+        except Exception:
+            pass
+
     quantize_and_insert_k_cache(
         kv_roped,
         cache_2d,
