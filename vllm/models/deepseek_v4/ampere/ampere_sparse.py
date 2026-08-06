@@ -102,6 +102,7 @@ def _read_cache_rope_bytes(cache, slots):
 _STEP_WATCH_FIRED: bool = False
 _STEP_WATCH_PREV: torch.Tensor | None = None
 _STEP_WATCH_STEP: int = 0
+_STEP_WATCH_ERR_LOGGED: bool = False
 
 
 def _step_watch_cache_nan(cache) -> None:
@@ -133,7 +134,7 @@ def _step_watch_cache_nan(cache) -> None:
         blk = torch.arange(cache.shape[0], device=cache.device, dtype=torch.int64)
         pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
         abs_off = blk[:, None] * s0 + pos[None, :] * 576 + 448  # (nb, bs)
-        offs = torch.arange(64, device=cache.device, dtype=torch.int64)
+        offs = torch.arange(128, device=cache.device, dtype=torch.int64)  # 128 bytes = 64 bf16
         idx = (abs_off.reshape(-1)[:, None] + offs[None, :]).reshape(-1) + base
         gathered = flat[idx].view(torch.bfloat16).reshape(num_slots, 64).float()
         cur_nonfinite = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
@@ -157,7 +158,10 @@ def _step_watch_cache_nan(cache) -> None:
             )
         _STEP_WATCH_PREV = cur_nonfinite
     except Exception as e:  # noqa: BLE001
-        print(f"[STEP_WATCH] failed: {e}", flush=True)
+        if not _STEP_WATCH_ERR_LOGGED:
+            global _STEP_WATCH_ERR_LOGGED
+            _STEP_WATCH_ERR_LOGGED = True
+            print(f"[STEP_WATCH] failed: {e}", flush=True)
 
 
 def _swa_write_nan_probe(
