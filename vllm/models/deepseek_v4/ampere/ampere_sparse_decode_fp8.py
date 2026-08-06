@@ -7,6 +7,8 @@ then reuse the BF16 sparse MLA attention kernel (xpu_sparse_mla_bf16).
 This keeps the external KV cache layout identical to CUDA/ROCm.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -56,6 +58,51 @@ def _decode_probe(name: str, t) -> None:
         f"absmax={amax:.6e} shape={tuple(t.shape)}",
         flush=True,
     )
+
+
+def _nan_slot_diagnostic(topk_buf_3d, topk_idx_2d, topk_lens, kv_cache):
+    """When topk_dequant has NaN, identify WHICH gathered slot produced it and
+    whether that slot index is out of the valid written range.
+
+    topk_buf_3d: (num_tokens, max_topk, OUTPUT_DIM) dequantized gathered slots
+    topk_idx_2d: (num_tokens, max_topk) global slot IDs used for the gather
+    topk_lens:   (num_tokens,) number of VALID topk slots per token
+    kv_cache:    (num_blocks, block_size, 584) the cache we gathered from
+    """
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if _DECODE_PROBE_FIRED.get("nan_slot_diag"):
+        return
+    try:
+        nan_mask = torch.isnan(topk_buf_3d.float()).any(
+            2)  # (num_tokens, max_topk)
+        if not bool(nan_mask.any().item()):
+            return
+        _DECODE_PROBE_FIRED["nan_slot_diag"] = True
+        nt, mt = topk_idx_2d.shape
+        bad = torch.where(nan_mask)
+        tok_i = int(bad[0][0].item())
+        slot_j = int(bad[1][0].item())
+        slot_id = int(topk_idx_2d[tok_i, slot_j].item())
+        # valid range: per-token topk_lens, and the cache capacity
+        valid_len = (int(topk_lens[tok_i].item())
+                     if topk_lens is not None else -1)
+        num_slots_total = kv_cache.shape[0] * kv_cache.shape[1]
+        # min/max slot ids actually selected this step
+        sel = topk_idx_2d[tok_i]
+        sel_min = int(sel.min().item())
+        sel_max = int(sel.max().item())
+        print(
+            f"[NAN_SLOT_DIAG] first-NaN gathered slot: token={tok_i} "
+            f"pos_in_topk={slot_j} selected_slot_id={slot_id} "
+            f"valid_topk_len(token)={valid_len} "
+            f"cache_num_slots={num_slots_total} "
+            f"selected_slot_range=[{sel_min},{sel_max}] "
+            f"OUT_OF_RANGE={slot_id >= valid_len}",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[NAN_SLOT_DIAG] failed: {e}", flush=True)
 
 
 @triton.jit
@@ -267,9 +314,16 @@ def ampere_sparse_decode_fp8(
         dequant_gather_slots(topk_buf, kv_cache, topk_flat, compressed_block_size)
         ws_3d[:, :max_topk, :] = topk_buf.view(num_tokens, max_topk, OUTPUT_DIM)
         _decode_probe("topk_dequant", topk_buf)
-        # Also surface the raw slot indices that were selected: out-of-range or
-        # uninitialized slots are the prime suspect for a garbage UE8M0 scale.
-        if topk_idx_2d is not None:
+        # If topk_dequant has NaN, identify WHICH gathered slot produced it
+        # and whether that slot index is out of the valid written range. A slot
+        # index beyond the last written slot reads UNWRITTEN buffer memory (which
+        # in the strided cross-layer cache is not guaranteed zeroed -> may hold
+        # NaN bit patterns). This is the prime suspect for the token-~2053 NaN.
+        if topk_idx_2d is not None and os.environ.get(
+                "VLLM_SM86_NAN_PROBE") == "1":
+            _nan_slot_diagnostic(
+                topk_buf.view(num_tokens, max_topk, OUTPUT_DIM),
+                topk_idx_2d, topk_lens, kv_cache)
             _decode_probe("topk_indices", topk_idx_2d)
             _decode_probe("topk_lens", topk_lens)
 
