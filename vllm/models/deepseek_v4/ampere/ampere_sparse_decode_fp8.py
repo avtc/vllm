@@ -319,8 +319,10 @@ def ampere_sparse_decode_fp8(
         # index beyond the last written slot reads UNWRITTEN buffer memory (which
         # in the strided cross-layer cache is not guaranteed zeroed -> may hold
         # NaN bit patterns). This is the prime suspect for the token-~2053 NaN.
-        if topk_idx_2d is not None and os.environ.get(
-                "VLLM_SM86_NAN_PROBE") == "1":
+        # NOTE: _nan_slot_diagnostic self-gates on VLLM_SM86_NAN_PROBE (a later
+        # `import os` in this function makes `os` local, so we must NOT reference
+        # os.environ here before that import).
+        if topk_idx_2d is not None:
             _nan_slot_diagnostic(
                 topk_buf.view(num_tokens, max_topk, OUTPUT_DIM),
                 topk_idx_2d, topk_lens, kv_cache)
