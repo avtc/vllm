@@ -98,8 +98,12 @@ def _compressor_nan_probe(
             return
         sv = slots[valid].to(torch.int64)
         flat = kv_cache.reshape(-1)  # 1D (reshape copies if non-contiguous)
-        head_bytes = kv_cache.shape[-1]  # 584
-        row_ptrs = sv * head_bytes + fp8_dim
+        block_size = kv_cache.shape[1]
+        block_stride = block_size * 584  # bytes per block
+        token_data_stride = 576  # CORRECT: data stride within block (not 584)
+        block_idx = (sv // block_size)
+        pos_in_block = (sv % block_size)
+        row_ptrs = block_idx * block_stride + pos_in_block * token_data_stride + fp8_dim
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
         gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
         g = gathered.float()
@@ -124,7 +128,7 @@ def _compressor_nan_probe(
             print(
                 f"[COMPRESSOR_WRITE ### {prefix} ###] {tag}: WROTE NaN to KV "
                 f"bf16-RoPE! nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
-                f"{pos_info} n_valid_slots={int(sv.numel())} head_bytes={head_bytes}",
+                f"{pos_info} n_valid_slots={int(sv.numel())} data_stride=576",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001

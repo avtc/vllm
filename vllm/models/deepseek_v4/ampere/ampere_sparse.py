@@ -93,8 +93,12 @@ def _swa_write_nan_probe(
             return
         sv = slots[valid].to(torch.int64)
         flat = swa_kv_cache.reshape(-1)
-        head_bytes = swa_kv_cache.shape[-1]  # 584
-        row_ptrs = sv * head_bytes + fp8_dim
+        block_size = swa_kv_cache.shape[1]
+        block_stride = block_size * 584  # bytes per block
+        token_data_stride = 576  # CORRECT: data stride within block (not 584)
+        block_idx = (sv // block_size)
+        pos_in_block = (sv % block_size)
+        row_ptrs = block_idx * block_stride + pos_in_block * token_data_stride + fp8_dim
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
         gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
         g = gathered.float()
@@ -127,7 +131,7 @@ def _swa_write_nan_probe(
             print(
                 f"[SWA_WRITE ### {prefix} ###] {tag}: WROTE NaN to SWA bf16-RoPE! "
                 f"nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
-                f"{pos_info} n_valid_slots={int(sv.numel())} head_bytes={head_bytes}",
+                f"{pos_info} n_valid_slots={int(sv.numel())} data_stride=576",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001
@@ -161,15 +165,31 @@ def _cache_nan_scan(name: str, cache, pass_no: int) -> None:
     except Exception:
         pass
     try:
-        # bf16-RoPE region is bytes [448:576] of each token's row.
-        rope = cache[..., 448:576]  # [..., 128] uint8/int8
-        rows = rope.reshape(-1, 128)  # [num_slots, 128]
-        rows_bf16 = rows.view(torch.bfloat16).float()  # [num_slots, 64]
+        # CORRECT fp8_ds_mla layout: cache is [num_blocks, block_size, 584], but
+        # per-token DATA stride WITHIN a block is 576 (448 fp8 + 128 bf16); the 8
+        # scale bytes live in a SEPARATE region after all tokens' data
+        # (block_base + block_size*576 + pos*8). So token (block,pos) bf16-RoPE
+        # is at byte (block*block_stride + pos*576 + 448), NOT pos*584.
+        num_blocks = cache.shape[0]
+        block_size = cache.shape[1]
+        block_stride = block_size * 584  # bytes per block (cache last dim 584)
+        token_data_stride = 576
+        fp8_dim = 448
+        rope_bytes = 128  # 64 bf16
+        flat = cache.reshape(-1)
+        # build byte offsets for every (block, pos) bf16-RoPE region
+        blk = torch.arange(num_blocks, device=cache.device, dtype=torch.int64)
+        pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
+        base = (blk[:, None] * block_stride + pos[None, :] * token_data_stride + fp8_dim)  # [nb, bs]
+        base_flat = base.reshape(-1)  # [nb*bs]
+        offs = torch.arange(rope_bytes, device=cache.device, dtype=torch.int64)
+        gathered = flat[base_flat[:, None] + offs[None, :]].view(torch.bfloat16).float()
+        rows_bf16 = gathered  # [num_slots, 64]
         n_nan = int(torch.isnan(rows_bf16).sum().item())
         n_inf = int(torch.isinf(rows_bf16).sum().item())
         if n_nan or n_inf:
             _CACHE_SCAN_FIRED[name] = True
-            bad = torch.where(torch.isnan(rows_bf16).any(1))[0]
+            bad = torch.where(torch.isnan(rows_bf16).any(1) | torch.isinf(rows_bf16).any(1))[0]
             first_slot = int(bad[0].item()) if bad.numel() else -1
             print(
                 f"[CACHE_SCAN ### {name} ### pass {pass_no}] NaN FOUND in cache! "

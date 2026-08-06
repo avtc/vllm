@@ -41,9 +41,12 @@ def _swa_before_snapshot(swa_kv_cache, slot_mapping):
     if not bool(valid.any().item()):
         return
     sv = slots[valid].to(torch.int64)
-    head_bytes = swa_kv_cache.shape[-1]  # 584
+    block_size = swa_kv_cache.shape[1]
+    block_stride = block_size * 584  # bytes per block
     flat = swa_kv_cache.reshape(-1)
-    row_ptrs = sv * head_bytes + 448
+    block_idx = (sv // block_size)
+    pos_in_block = (sv % block_size)
+    row_ptrs = block_idx * block_stride + pos_in_block * 576 + 448  # data stride 576
     offs = torch.arange(128, device=sv.device, dtype=torch.int64)
     gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16).float()
     n_nan = int(torch.isnan(gathered).sum().item())
@@ -55,7 +58,7 @@ def _swa_before_snapshot(swa_kv_cache, slot_mapping):
         print(
             f"[SWA_BEFORE quantize] target slots ALREADY have non-finite! "
             f"nan={n_nan} inf={n_inf} bad_slots={bad_slots} "
-            f"n_target_slots={int(sv.numel())} head_bytes={head_bytes}",
+            f"n_target_slots={int(sv.numel())} data_stride=576",
             flush=True,
         )
 
