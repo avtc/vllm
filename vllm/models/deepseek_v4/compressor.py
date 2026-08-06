@@ -84,45 +84,47 @@ def _compressor_nan_probe(
     # --- output-side: ALWAYS read back the bf16 RoPE portion of the just-written
     # slots (even when input was finite) — this catches a write that produces NaN
     # from finite input, which is the prime suspect (input probe never fired before
-    # the decode read a poisoned slot). One-shot per prefix once a NaN is found. ---
-    # fp8_ds_mla paged layout: kv_cache is [num_blocks, block_size, head_bytes]
-    # (viewed as uint8). Each block holds block_size tokens each of token_stride
-    # (576) bytes [448 fp8 NoPE + 128 bf16 RoPE], THEN block_size*scale_dim scale
-    # bytes. So token t's RoPE bf16 area is at:
-    #   block_base = block_idx * block_stride
-    #   token_off = pos_in_block * token_stride + fp8_dim   (fp8_dim=448)
-    # where block_idx,pos_in_block come from the flat slot id.
+    # the decode read a poisoned slot). One-shot per prefix once a NaN is found.
+    # ROBUST 3D layout: kv_cache is [num_blocks, block_size, 584] uint8/int8.
+    # Reshape to [total_slots, 584] (reshape handles non-contiguity by copying),
+    # index the written slots, take bytes [448:576], view as 64 bf16. ---
     try:
         kv_slot_mapping = k_cache_metadata.slot_mapping
-        block_stride = kv_cache.stride(0)
-        kv_block_size = kv_cache.shape[1]
-        token_stride = 576  # TOKEN_DATA_SIZE for head=512 fp8_ds_mla
-        fp8_dim = 448       # bf16 RoPE area starts at byte 448
-        rope_bytes = 128    # 64 bf16 RoPE values = 128 bytes
+        fp8_dim = 448
+        rope_bytes = 128
         slots = kv_slot_mapping.detach()
         valid = slots >= 0
         if not bool(valid.any().item()):
             return
-        sv = slots[valid]
-        block_idx = (sv // kv_block_size).to(torch.int64)
-        pos_in_block = (sv % kv_block_size).to(torch.int64)
-        flat_uint = kv_cache.view(torch.uint8).view(-1)  # 1D uint8
-        row_ptrs = block_idx * block_stride + pos_in_block * token_stride + fp8_dim
+        sv = slots[valid].to(torch.int64)
+        flat = kv_cache.reshape(-1)  # 1D (reshape copies if non-contiguous)
+        head_bytes = kv_cache.shape[-1]  # 584
+        row_ptrs = sv * head_bytes + fp8_dim
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
-        # gather 128 bytes/slot, reinterpret as 64 bf16
-        gathered = flat_uint[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
+        gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
         g = gathered.float()
         n_nan = int(torch.isnan(g).sum().item())
         n_inf = int(torch.isinf(g).sum().item())
         if n_nan or n_inf:
             _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
             bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
-            bad_slot = int(sv[bad_rows[0]].item()) if bad_rows.numel() else -1
+            bad_slots = sv[bad_rows][:8].tolist()
+            # Correlate bad slots with their input positions (for chunk-boundary
+            # diagnosis): positions aligns with slot_mapping order.
+            pos_info = ""
+            try:
+                if positions is not None:
+                    pv = positions.detach()
+                    if pv.numel() == slots.numel():
+                        bad_pos = pv[valid][bad_rows][:8].tolist()
+                        pos_info = f" positions={bad_pos}"
+            except Exception:
+                pass
             tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
                 f"[COMPRESSOR_WRITE ### {prefix} ###] {tag}: WROTE NaN to KV "
-                f"bf16-RoPE! nan={n_nan} inf={n_inf} first_bad_slot={bad_slot} "
-                f"n_valid_slots={int(sv.numel())}",
+                f"bf16-RoPE! nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
+                f"{pos_info} n_valid_slots={int(sv.numel())} head_bytes={head_bytes}",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001

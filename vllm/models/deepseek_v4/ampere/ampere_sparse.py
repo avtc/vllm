@@ -80,35 +80,32 @@ def _swa_write_nan_probe(
             )
 
     # output-side: read back the bf16 RoPE portion of the just-written slots.
-    # fp8_ds_mla layout: token = 448 fp8 + 128 bf16 (64 RoPE values) bytes.
+    # ROBUST 3D layout: swa_kv_cache is [num_blocks, block_size, 584] uint8/int8.
+    # Reshape to 1D and index by slot*584+448 (reshape copies if non-contiguous).
     try:
-        block_stride = swa_kv_cache.stride(0)
-        kv_block_size = swa_kv_cache.shape[1]
-        token_stride = 576
         fp8_dim = 448
         rope_bytes = 128
         slots = slot_mapping.detach()
         valid = slots >= 0
         if not bool(valid.any().item()):
             return
-        sv = slots[valid]
-        block_idx = (sv // kv_block_size).to(torch.int64)
-        pos_in_block = (sv % kv_block_size).to(torch.int64)
-        flat_uint = swa_kv_cache.view(torch.uint8).view(-1)
-        row_ptrs = block_idx * block_stride + pos_in_block * token_stride + fp8_dim
+        sv = slots[valid].to(torch.int64)
+        flat = swa_kv_cache.reshape(-1)
+        head_bytes = swa_kv_cache.shape[-1]  # 584
+        row_ptrs = sv * head_bytes + fp8_dim
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
-        gathered = flat_uint[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
+        gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
         g = gathered.float()
         n_nan = int(torch.isnan(g).sum().item())
         n_inf = int(torch.isinf(g).sum().item())
         if n_nan or n_inf:
             _SWA_WRITE_PROBE_FIRED[prefix] = True
             bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
-            bad_slot = int(sv[bad_rows[0]].item()) if bad_rows.numel() else -1
+            bad_slots = sv[bad_rows][:8].tolist()
             tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
                 f"[SWA_WRITE ### {prefix} ###] {tag}: WROTE NaN to SWA bf16-RoPE! "
-                f"nan={n_nan} inf={n_inf} first_bad_slot={bad_slot} "
+                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots} "
                 f"n_valid_slots={int(sv.numel())}",
                 flush=True,
             )
@@ -493,6 +490,20 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+
+        # [DSv4-ampere debug] one-shot cache scan at PREFILL START (before this
+        # chunk writes anything). If NaN is ALREADY present here, it came from
+        # a PRIOR chunk or the profile run (not this chunk's write). Combined
+        # with the decode-start scan, this isolates WHICH prefill chunk first
+        # plants the NaN at slots 256+ (the chunk-1 boundary).
+        global _PREFILL_PASS_COUNTER
+        try:
+            _PREFILL_PASS_COUNTER += 1
+        except NameError:
+            _PREFILL_PASS_COUNTER = 1
+        if compressed_k_cache is not None:
+            _cache_nan_scan(f"{self.prefix}.main_mla.prefill_start", compressed_k_cache, _PREFILL_PASS_COUNTER)
+        _cache_nan_scan(f"{self.prefix}.swa.prefill_start", swa_k_cache, _PREFILL_PASS_COUNTER)
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
