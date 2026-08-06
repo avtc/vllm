@@ -98,19 +98,23 @@ def _read_cache_rope_bytes(cache, slots):
 # corrupt, independent of which writer did it. The delta filters out slots that
 # were non-finite from the start (unwritten/cross-layer buffer regions are
 # constant across steps, so never reported as "newly" corrupt). Vectorized: one
-# gather + one isnan per step. One-shot per rank once the first flip is found.
+# gather + one isnan per step. NOT one-shot: logs every flip with its step so
+# the full corruption timeline is visible. On each flip, also reports the
+# decode slot_mapping (the slot the compressor WROTE this step) so we can tell
+# a WRITE bug (flipped slot == written slot) from an OOB/alias corruption
+# (flipped slot != written slot).
 _STEP_WATCH_FIRED: bool = False
 _STEP_WATCH_PREV: torch.Tensor | None = None
 _STEP_WATCH_STEP: int = 0
 _STEP_WATCH_ERR_LOGGED: bool = False
+_STEP_WATCH_BASELINE_DUMPED: bool = False
 
 
-def _step_watch_cache_nan(cache) -> None:
-    global _STEP_WATCH_FIRED, _STEP_WATCH_PREV, _STEP_WATCH_STEP, _STEP_WATCH_ERR_LOGGED
+def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> None:
+    global _STEP_WATCH_FIRED, _STEP_WATCH_PREV, _STEP_WATCH_STEP
+    global _STEP_WATCH_ERR_LOGGED, _STEP_WATCH_BASELINE_DUMPED
     import os
     if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
-        return
-    if _STEP_WATCH_FIRED:
         return
     if cache is None:
         return
@@ -140,6 +144,21 @@ def _step_watch_cache_nan(cache) -> None:
         cur_nonfinite = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
         if _STEP_WATCH_PREV is None:
             _STEP_WATCH_PREV = cur_nonfinite
+            # dump the baseline non-finite slots (planted during prefill or
+            # unwritten buffer garbage) so we know the starting corruption set.
+            n_base = int(cur_nonfinite.sum().item())
+            if n_base > 0 and not _STEP_WATCH_BASELINE_DUMPED:
+                _STEP_WATCH_BASELINE_DUMPED = True
+                slots_all = torch.arange(num_slots, device=cache.device)
+                base_bad = slots_all[cur_nonfinite][:32].tolist()
+                print(
+                    f"[STEP_WATCH ### step 1 (baseline) ###] {n_base} slots "
+                    f"already non-finite BEFORE any decode; baseline_bad_slots="
+                    f"{base_bad} cache_shape={tuple(cache.shape)} "
+                    f"strides={cache.stride()} storage_offset={base} "
+                    f"storage_nbytes={st.nbytes()}",
+                    flush=True,
+                )
             return
         newly = cur_nonfinite & (~_STEP_WATCH_PREV)
         n_new = int(newly.sum().item())
@@ -147,13 +166,32 @@ def _step_watch_cache_nan(cache) -> None:
             _STEP_WATCH_FIRED = True
             slots_all = torch.arange(num_slots, device=cache.device)
             bad = slots_all[newly][:16].tolist()
-            # also report how many slots were ALREADY non-finite (baseline)
             n_baseline = int((_STEP_WATCH_PREV).sum().item())
+            # Correlate: is the flipped slot the one the compressor WROTE this
+            # step (decode_slot_mapping), or a different (prefill) slot?
+            written = ""
+            try:
+                if decode_slot_mapping is not None:
+                    wslots = decode_slot_mapping.detach()
+                    wslots = wslots[wslots >= 0].tolist()
+                    in_written = [b for b in bad if b in set(wslots)]
+                    written = (f" decode_written_slots={wslots[:8]} "
+                               f"flipped_slot_is_written={bool(in_written)}")
+            except Exception:
+                pass
+            bt = ""
+            try:
+                if block_table is not None:
+                    btv = block_table.detach().reshape(-1)
+                    btv = btv[btv >= 0][:16].tolist()
+                    bt = f" block_table[0,:16]={btv}"
+            except Exception:
+                pass
             print(
                 f"[STEP_WATCH ### step {_STEP_WATCH_STEP} ###] FLIP detected! "
                 f"{n_new} slot(s) turned finite->NaN this step; "
                 f"newly_bad_slots={bad} baseline_nonfinite={n_baseline} "
-                f"cache_shape={tuple(cache.shape)}",
+                f"cache_shape={tuple(cache.shape)}{written}{bt}",
                 flush=True,
             )
         _STEP_WATCH_PREV = cur_nonfinite
@@ -458,7 +496,15 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             if _WATCH_OWNER[0] is None:
                 _WATCH_OWNER[0] = self.prefix
             if self.prefix == _WATCH_OWNER[0]:
-                _step_watch_cache_nan(kv_cache)
+                _dslot = None
+                _bt = None
+                try:
+                    if attn_metadata is not None:
+                        _dslot = attn_metadata.slot_mapping
+                        _bt = attn_metadata.block_table
+                except Exception:
+                    pass
+                _step_watch_cache_nan(kv_cache, _dslot, _bt)
 
         topk_indices = None
         topk_lens = None
