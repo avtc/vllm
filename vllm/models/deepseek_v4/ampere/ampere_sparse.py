@@ -106,7 +106,7 @@ _STEP_WATCH_ERR_LOGGED: bool = False
 
 
 def _step_watch_cache_nan(cache) -> None:
-    global _STEP_WATCH_FIRED, _STEP_WATCH_PREV, _STEP_WATCH_STEP
+    global _STEP_WATCH_FIRED, _STEP_WATCH_PREV, _STEP_WATCH_STEP, _STEP_WATCH_ERR_LOGGED
     import os
     if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
         return
@@ -159,7 +159,6 @@ def _step_watch_cache_nan(cache) -> None:
         _STEP_WATCH_PREV = cur_nonfinite
     except Exception as e:  # noqa: BLE001
         if not _STEP_WATCH_ERR_LOGGED:
-            global _STEP_WATCH_ERR_LOGGED
             _STEP_WATCH_ERR_LOGGED = True
             print(f"[STEP_WATCH] failed: {e}", flush=True)
 
