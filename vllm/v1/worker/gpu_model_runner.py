@@ -7279,31 +7279,6 @@ class GPUModelRunner(
             # Initialize the memory buffer for KV cache
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
-            # [DSv4-ampere debug] one-shot post-allocation NaN scan: confirm the
-            # freshly-allocated (torch.zeros int8) KV buffers are actually clean
-            # (no leftover NaN bit patterns). If any reads non-finite as bf16,
-            # the NaN is NOT from writes but from un-zeroed allocation.
-            import os as _os_alloc
-            if _os_alloc.environ.get("VLLM_SM86_NAN_PROBE") == "1":
-                try:
-                    for _ln, _t in kv_cache_raw_tensors.items():
-                        _bf = _t.view(torch.bfloat16).float()
-                        _nn = int(torch.isnan(_bf).sum().item())
-                        _ni = int(torch.isinf(_bf).sum().item())
-                        if _nn or _ni:
-                            logger.warning(
-                                "[ALLOC_NAN] %s has non-finite at ALLOCATION: "
-                                "nan=%d inf=%d shape=%s (NOT zeroed!)",
-                                _ln, _nn, _ni, tuple(_t.shape),
-                            )
-                        else:
-                            logger.info_once(
-                                "[ALLOC_NAN] %s clean at allocation (zeroed OK) "
-                                "shape=%s", _ln, tuple(_t.shape),
-                            )
-                except Exception as _e:  # noqa: BLE001
-                    logger.warning("[ALLOC_NAN] scan failed: %s", _e)
-
             # Change the memory buffer to the desired shape
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_raw_tensors, kernel_block_sizes

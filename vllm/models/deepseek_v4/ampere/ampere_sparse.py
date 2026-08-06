@@ -47,6 +47,48 @@ if TYPE_CHECKING:
 _SWA_WRITE_PROBE_FIRED: dict[str, bool] = {}
 
 
+def _read_cache_rope_bytes(cache, slots):
+    """Read the bf16-RoPE region [448:576] (64 bf16 values) for the given
+    physical slot indices of a DSv4 fp8_ds_mla cache.
+
+    CORRECT on NON-CONTIGUOUS (strided) caches AND vectorized (single gather).
+
+    The cache tensor shape is (num_blocks, block_size, 584) but it is usually a
+    STRIDED view of a cross-layer buffer (observed strides=(1039680,584,1),
+    is_contig=False). Critically, the WRITE/READ kernels pack tokens at a
+    576-byte DATA stride within a block (448 fp8 + 128 bf16; the 8 scale bytes
+    live in a separate region after all tokens), NOT the tensor's last-dim 584.
+    So plain tensor indexing cache[blk, pos, 448:576] (which uses pos*584) reads
+    the WRONG bytes, and cache.reshape(-1) would copy+reorder the strided view.
+
+    We therefore index the underlying STORAGE directly with the KERNEL's byte
+    offset: storage_offset + block*stride0 + pos*576 + 448, via a 1D flat view
+    of the storage (no copy, no reorder). This matches exactly what the decode
+    kernel reads.
+
+    Args:
+        cache: (num_blocks, block_size, 584) int8/uint8 tensor (possibly strided)
+        slots: (N,) int64 physical slot indices (= block*block_size + pos)
+    Returns:
+        (N, 64) float32 bf16-RoPE values for those slots.
+    """
+    block_size = cache.shape[1]
+    s0 = cache.stride(0)  # block stride in elements (= bytes for int8/uint8)
+    block_idx = slots // block_size
+    pos_in_block = slots % block_size
+    # absolute element offset within cache's storage:
+    abs_off = block_idx * s0 + pos_in_block * 576 + 448  # (N,)
+    st = cache.untyped_storage()
+    n_elem = st.nbytes() // cache.element_size()
+    base = cache.storage_offset()
+    flat = torch.empty(0, dtype=cache.dtype, device=cache.device)
+    flat.set_(st, 0, (n_elem,), (1,))
+    offs = torch.arange(128, device=cache.device, dtype=torch.int64)
+    idx = (abs_off[:, None] + offs[None, :]) + base
+    gathered = flat[idx.reshape(-1)].view(torch.bfloat16).float().reshape(
+        slots.numel(), 64)
+    return gathered
+
 def _swa_write_nan_probe(
     prefix: str,
     kv: torch.Tensor,
@@ -94,28 +136,15 @@ def _swa_write_nan_probe(
         if not bool(valid.any().item()):
             return
         sv = slots[valid].to(torch.int64)
-        block_size = swa_kv_cache.shape[1]
-        token_data_stride = 576  # CORRECT: data stride within block (not 584)
-        block_idx = (sv // block_size)
-        pos_in_block = (sv % block_size)
-        offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
-        n_nan = 0
-        n_inf = 0
-        bad_slots = []
-        for i in range(sv.numel()):
-            blk = int(block_idx[i].item())
-            pin = int(pos_in_block[i].item())
-            block_bytes = swa_kv_cache[blk].reshape(-1)  # (37376,) contiguous
-            base = pin * token_data_stride + fp8_dim
-            gathered = block_bytes[base + offs].view(torch.bfloat16).float()
-            nn = int(torch.isnan(gathered).sum().item())
-            ni = int(torch.isinf(gathered).sum().item())
-            n_nan += nn
-            n_inf += ni
-            if nn or ni:
-                bad_slots.append(int(sv[i].item()))
+        # Vectorized correct read: kernel byte offsets via storage flat view.
+        gathered = _read_cache_rope_bytes(swa_kv_cache, sv)  # (N,64) float32
+        n_nan = int(torch.isnan(gathered).sum().item())
+        n_inf = int(torch.isinf(gathered).sum().item())
         if n_nan or n_inf:
             _SWA_WRITE_PROBE_FIRED[prefix] = True
+            bad_mask = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
+            bad_rows = torch.where(bad_mask)[0]
+            bad_slots = sv[bad_rows][:8].tolist()
             # Diagnose OOB cos_sin_cache read: correlate bad slots with their
             # input positions, and check whether any position exceeds the
             # cos_sin_cache length (pos*ROPE_DIM out of bounds => NaN cos/sin).
@@ -124,12 +153,7 @@ def _swa_write_nan_probe(
                 if positions is not None:
                     pv = positions.detach()
                     if pv.numel() == slots.numel():
-                        bad_set = set(bad_slots)
-                        bad_pos = [
-                            int(pv[valid][i].item())
-                            for i in range(sv.numel())
-                            if int(sv[i].item()) in bad_set
-                        ][:8]
+                        bad_pos = pv[valid][bad_rows][:8].tolist()
                         pos_info = f" positions={bad_pos}"
                     if cos_sin_cache is not None:
                         rope_dim = 64
@@ -143,97 +167,13 @@ def _swa_write_nan_probe(
             tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
                 f"[SWA_WRITE ### {prefix} ###] {tag}: WROTE NaN to SWA bf16-RoPE! "
-                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots[:8]}"
+                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
                 f"{pos_info} n_valid_slots={int(sv.numel())} data_stride=576",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001
         # ALWAYS surface readback failures (silent except => false 'clean').
         print(f"[SWA_WRITE {prefix}] readback FAILED: {e}", flush=True)
-
-
-# [DSv4-ampere debug] Periodic FULL-CACHE NaN scan at decode time. The per-write
-# readback probes silently failed on the packed-cache view, so they never
-# confirmed whether a write produced NaN from finite input. This scan is
-# LAYOUT-ROBUST: it indexes each cache's bf16-RoPE byte region [448:576] and
-# views it as bf16, scanning ALL slots for NaN. Finds the exact decode step (and
-# which cache/slot) at which the FIRST NaN appears — independent of which write
-# path put it there. Gated by VLLM_SM86_NAN_PROBE=1; one-shot per (rank, name).
-_CACHE_SCAN_FIRED: dict[str, bool] = {}
-
-
-def _cache_nan_scan(name: str, cache, pass_no: int) -> None:
-    import os
-
-    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
-        return
-    if cache is None:
-        return
-    if _CACHE_SCAN_FIRED.get(name):
-        return
-    try:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() != 0:
-                return
-    except Exception:
-        pass
-    try:
-        # CORRECT fp8_ds_mla layout: cache is [num_blocks, block_size, 584], but
-        # per-token DATA stride WITHIN a block is 576 (448 fp8 + 128 bf16); the 8
-        # scale bytes live in a SEPARATE region after all tokens' data
-        # (block_base + block_size*576 + pos*8). So token (block,pos) bf16-RoPE
-        # is at byte (block_base + pos*576 + 448), NOT pos*584.
-        #
-        # CRITICAL: the cache is often a NON-CONTIGUOUS strided view of a
-        # larger cross-layer buffer (observed strides=(1039680,584,1),
-        # is_contig=False). cache.reshape(-1) would COPY+REORDER bytes into
-        # C-order, making any index computed from the original strides read the
-        # WRONG memory. To avoid this, we read ONE BLOCK AT A TIME:
-        # cache[block_idx] collapses dim0 -> a contiguous (64,584) view with
-        # stride (584,1) regardless of the parent's stride0; reshape(-1) then
-        # gives that block's 37376 bytes in true memory order, and the kernel's
-        # 576-byte token stride indexes it correctly.
-        num_blocks = cache.shape[0]
-        block_size = cache.shape[1]
-        token_data_stride = 576
-        fp8_dim = 448
-        rope_bytes = 128  # 64 bf16
-        offs = torch.arange(rope_bytes, device=cache.device, dtype=torch.int64)
-        pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
-        nan_slots: list[int] = []
-        first_slot = -1
-        total_nan = 0
-        total_inf = 0
-        for blk in range(num_blocks):
-            block_bytes = cache[blk].reshape(-1)  # (37376,) contiguous, true order
-            base = pos * token_data_stride + fp8_dim  # (block_size,)
-            gathered = block_bytes[base[:, None] + offs[None, :]].view(
-                torch.bfloat16).float()  # (block_size, 64)
-            bad_mask = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
-            if bool(bad_mask.any().item()):
-                bad_idx = torch.where(bad_mask)[0]
-                for pi in bad_idx.tolist():
-                    slot = blk * block_size + pi
-                    if first_slot < 0:
-                        first_slot = slot
-                    nan_slots.append(slot)
-                total_nan += int(torch.isnan(gathered).sum().item())
-                total_inf += int(torch.isinf(gathered).sum().item())
-            if len(nan_slots) >= 16:  # enough evidence; stop early
-                break
-        if total_nan or total_inf:
-            _CACHE_SCAN_FIRED[name] = True
-            print(
-                f"[CACHE_SCAN ### {name} ### pass {pass_no}] NaN FOUND in cache! "
-                f"nan={total_nan} inf={total_inf} first_slot={first_slot} "
-                f"bad_slots={nan_slots[:16]} cache_shape={tuple(cache.shape)} "
-                f"strides={cache.stride()} is_contig={cache.is_contiguous()}",
-                flush=True,
-            )
-    except Exception as e:  # noqa: BLE001
-        # ALWAYS surface scan failures (silent except would make a missing
-        # 'NaN FOUND' falsely imply the cache is clean).
-        print(f"[CACHE_SCAN {name}] scan FAILED: {e}", flush=True)
 
 
 class DeepseekV4AmpereSparseBackend(DeepseekV4FlashMLABackend):
@@ -436,20 +376,6 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
-        # [DSv4-ampere debug] one-shot full-cache NaN scan BEFORE the attention
-        # reads. Finds the exact decode step at which a NaN first appears in
-        # either cache (main MLA or SWA), independent of which write path put
-        # it there. Layout-robust: scans the bf16-RoPE region of every slot.
-        global _DECODE_PASS_COUNTER
-        try:
-            _DECODE_PASS_COUNTER += 1
-        except NameError:
-            _DECODE_PASS_COUNTER = 1
-        if kv_cache is not None:
-            _cache_nan_scan(f"{self.prefix}.main_mla", kv_cache, _DECODE_PASS_COUNTER)
-        _cache_nan_scan(
-            f"{self.prefix}.swa", self.swa_cache_layer.kv_cache, _DECODE_PASS_COUNTER
-        )
 
         topk_indices = None
         topk_lens = None
@@ -567,20 +493,6 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
-
-        # [DSv4-ampere debug] one-shot cache scan at PREFILL START (before this
-        # chunk writes anything). If NaN is ALREADY present here, it came from
-        # a PRIOR chunk or the profile run (not this chunk's write). Combined
-        # with the decode-start scan, this isolates WHICH prefill chunk first
-        # plants the NaN at slots 256+ (the chunk-1 boundary).
-        global _PREFILL_PASS_COUNTER
-        try:
-            _PREFILL_PASS_COUNTER += 1
-        except NameError:
-            _PREFILL_PASS_COUNTER = 1
-        if compressed_k_cache is not None:
-            _cache_nan_scan(f"{self.prefix}.main_mla.prefill_start", compressed_k_cache, _PREFILL_PASS_COUNTER)
-        _cache_nan_scan(f"{self.prefix}.swa.prefill_start", swa_k_cache, _PREFILL_PASS_COUNTER)
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens

@@ -118,31 +118,33 @@ def _compressor_nan_probe(
                 f"is_contig={kv_cache.is_contiguous()} n_slots={int(sv.numel())}",
                 flush=True,
             )
-        # Per-block contiguous read (cache is often NON-CONTIGUOUS strided;
-        # kv_cache.reshape(-1) would copy+reorder and corrupt the offset math).
-        # kv_cache[blk] -> contiguous (64,584) view regardless of parent stride0;
-        # reshape(-1) -> 37376 true-order bytes; kernel token stride = 576.
+        # Vectorized correct read: kernel byte offsets via a flat STORAGE view
+        # (no copy/reorder). The cache is often NON-CONTIGUOUS strided
+        # (strides=(1039680,584,1)), and the kernels pack tokens at a 576-byte
+        # DATA stride within a block, NOT the tensor's last-dim 584 — so tensor
+        # indexing cache[blk,pos,448:576] (pos*584) and cache.reshape(-1)
+        # (reorders) both read WRONG bytes. We index the storage directly:
+        # storage_offset + block*stride0 + pos*576 + 448.
         block_size = kv_cache.shape[1]
-        token_data_stride = 576  # CORRECT: data stride within block (not 584)
+        s0 = kv_cache.stride(0)  # block stride in bytes (int8 dtype)
         block_idx = (sv // block_size)
         pos_in_block = (sv % block_size)
+        abs_off = block_idx * s0 + pos_in_block * 576 + fp8_dim  # (N,)
+        st = kv_cache.untyped_storage()
+        n_elem = st.nbytes() // kv_cache.element_size()
+        flat = torch.empty(0, dtype=kv_cache.dtype, device=kv_cache.device)
+        flat.set_(st, 0, (n_elem,), (1,))
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
-        n_nan = 0
-        n_inf = 0
+        idx = (abs_off[:, None] + offs[None, :]) + kv_cache.storage_offset()
+        gathered = flat[idx.reshape(-1)].view(torch.bfloat16).float().reshape(
+            sv.numel(), rope_bytes // 2)  # (N, 64)
+        n_nan = int(torch.isnan(gathered).sum().item())
+        n_inf = int(torch.isinf(gathered).sum().item())
         bad_slots = []
-        bad_pos_vals = []
-        for i in range(sv.numel()):
-            blk = int(block_idx[i].item())
-            pin = int(pos_in_block[i].item())
-            block_bytes = kv_cache[blk].reshape(-1)  # (37376,) contiguous
-            base = pin * token_data_stride + fp8_dim
-            gathered = block_bytes[base + offs].view(torch.bfloat16).float()
-            nn = int(torch.isnan(gathered).sum().item())
-            ni = int(torch.isinf(gathered).sum().item())
-            n_nan += nn
-            n_inf += ni
-            if nn or ni:
-                bad_slots.append(int(sv[i].item()))
+        if n_nan or n_inf:
+            bad_rows = torch.where(
+                torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1))[0]
+            bad_slots = sv[bad_rows][:8].tolist()
         g_finite = (n_nan == 0 and n_inf == 0)
         if n_nan or n_inf:
             _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
