@@ -52,6 +52,8 @@ def _swa_write_nan_probe(
     kv: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
 ) -> None:
     if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
         return
@@ -102,11 +104,30 @@ def _swa_write_nan_probe(
             _SWA_WRITE_PROBE_FIRED[prefix] = True
             bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
             bad_slots = sv[bad_rows][:8].tolist()
+            # Diagnose OOB cos_sin_cache read: correlate bad slots with their
+            # input positions, and check whether any position exceeds the
+            # cos_sin_cache length (pos*ROPE_DIM out of bounds => NaN cos/sin).
+            pos_info = ""
+            try:
+                if positions is not None:
+                    pv = positions.detach()
+                    if pv.numel() == slots.numel():
+                        bad_pos = pv[valid][bad_rows][:8].tolist()
+                        pos_info = f" positions={bad_pos}"
+                    if cos_sin_cache is not None:
+                        rope_dim = 64
+                        cache_len = cos_sin_cache.shape[0] // rope_dim
+                        max_pos = int(pv[valid].max().item()) if pv.numel() else -1
+                        pos_info += f" cos_sin_cache_pos_capacity={cache_len} max_pos={max_pos}"
+                        if max_pos >= cache_len:
+                            pos_info += " <<<OOB>>>"
+            except Exception:
+                pass
             tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
                 f"[SWA_WRITE ### {prefix} ###] {tag}: WROTE NaN to SWA bf16-RoPE! "
-                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots} "
-                f"n_valid_slots={int(sv.numel())}",
+                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
+                f"{pos_info} n_valid_slots={int(sv.numel())} head_bytes={head_bytes}",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001
@@ -253,6 +274,8 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             kv,
             self.swa_cache_layer.kv_cache,
             swa_metadata.slot_mapping,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
         )
         return q
 
