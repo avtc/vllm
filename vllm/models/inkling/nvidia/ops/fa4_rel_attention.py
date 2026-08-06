@@ -129,6 +129,7 @@ def inkling_fa4_rel_attention(
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    kv_is_fp8: bool = False,
 ) -> torch.Tensor:
     """Paged varlen FA4 over the bound K/V cache with the Inkling relative bias.
 
@@ -183,6 +184,7 @@ def inkling_fa4_rel_attention(
             out=out,
             k_scale=k_scale,
             v_scale=v_scale,
+            kv_is_fp8=kv_is_fp8,
         )
 
     ret = flash_attn_varlen_func(

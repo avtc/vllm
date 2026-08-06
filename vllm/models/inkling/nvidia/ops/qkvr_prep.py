@@ -6,6 +6,10 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import aux_stream
 
+# Reuse the fp8 e4m3 encode (manual bit math, portable to Ampere) defined
+# alongside the matching decode in the relative-attention backend.
+from .triton_rel_attention import _fp32_to_e4m3  # noqa: E402
+
 LOW_BLOCK_M = 32
 LOW_BLOCK_N = 64
 LOW_NUM_WARPS = 4
@@ -244,6 +248,7 @@ def _qkvr_qkv_kernel(
     D_REL: tl.constexpr,
     REL_EXTENT: tl.constexpr,
     REL_EXTENT_PADDED: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
 ):
     block = tl.program_id(0)
     num_q_rows = tokens * NUM_Q_HEADS
@@ -390,10 +395,13 @@ def _qkvr_qkv_kernel(
             safe_attention_slot = tl.maximum(attention_slot, 0)
             attention_block = safe_attention_slot // attention_page_size
             attention_offset = safe_attention_slot % attention_page_size
-            # fp8 KV cache: quantize K/V by the per-tensor scale before storing
-            # (tl.store then implicit-casts to the cache dtype from the pointer).
-            if key_cache_ptr.dtype.element_ty.is_fp8():
-                k_store = k_normalized.to(tl.float32) / tl.load(k_scale_ptr)
+            # fp8 KV cache: encode the normed K/V to float8_e4m3fn bytes (manual,
+            # since Ampere has no native e4m3 type) scaled by the per-tensor
+            # factor, then store as uint8. Non-fp8 caches store the fp value.
+            if KV_IS_FP8:
+                k_store = _fp32_to_e4m3(
+                    k_normalized.to(tl.float32) / tl.load(k_scale_ptr)
+                )
             else:
                 k_store = k_normalized
             tl.store(
@@ -405,8 +413,8 @@ def _qkvr_qkv_kernel(
                 k_store,
                 mask=attention_slot >= 0,
             )
-            if value_cache_ptr.dtype.element_ty.is_fp8():
-                v_store = v_rounded.to(tl.float32) / tl.load(v_scale_ptr)
+            if KV_IS_FP8:
+                v_store = _fp32_to_e4m3(v_rounded.to(tl.float32) / tl.load(v_scale_ptr))
             else:
                 v_store = v_rounded
             tl.store(
@@ -503,6 +511,7 @@ def _kv_kernel(
     OFF_K: tl.constexpr,
     OFF_V: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
 ):
     token = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     dims = tl.arange(0, HEAD_DIM)
@@ -612,10 +621,10 @@ def _kv_kernel(
     attention_block = safe_attention_slot // attention_page_size
     attention_offset = safe_attention_slot % attention_page_size
     attention_mask = row_mask & (attention_slot >= 0)
-    # fp8 KV cache: quantize K/V by the per-tensor scale before storing
-    # (tl.store then implicit-casts to the cache dtype from the pointer).
-    if key_cache_ptr.dtype.element_ty.is_fp8():
-        k_store = k_normalized.to(tl.float32) / tl.load(k_scale_ptr)
+    # fp8 KV cache: encode normed K/V to float8_e4m3fn bytes (manual) scaled by
+    # the per-tensor factor; non-fp8 caches store the fp value.
+    if KV_IS_FP8:
+        k_store = _fp32_to_e4m3(k_normalized.to(tl.float32) / tl.load(k_scale_ptr))
     else:
         k_store = k_normalized
     tl.store(
@@ -627,8 +636,8 @@ def _kv_kernel(
         k_store,
         mask=attention_mask[:, None],
     )
-    if value_cache_ptr.dtype.element_ty.is_fp8():
-        v_store = v_rounded.to(tl.float32) / tl.load(v_scale_ptr)
+    if KV_IS_FP8:
+        v_store = _fp32_to_e4m3(v_rounded.to(tl.float32) / tl.load(v_scale_ptr))
     else:
         v_store = v_rounded
     tl.store(
@@ -694,6 +703,7 @@ def _run_tiled_kv(
     conv_block_size: int,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    kv_is_fp8: bool,
 ) -> None:
     tokens = qkvr.shape[0]
     _kv_kernel[(triton.cdiv(tokens, KV_BLOCK_ROWS), num_kv_heads)](
@@ -737,6 +747,7 @@ def _run_tiled_kv(
         OFF_K=off_k,
         OFF_V=off_v,
         BLOCK_ROWS=KV_BLOCK_ROWS,
+        KV_IS_FP8=kv_is_fp8,
         num_warps=KV_NUM_WARPS,
     )
 
@@ -770,6 +781,7 @@ def _run_fused_small(
     log_scaling: torch.Tensor | None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    kv_is_fp8: bool,
 ) -> None:
     tokens = qkvr.shape[0]
 
@@ -825,6 +837,7 @@ def _run_fused_small(
         D_REL=16,
         REL_EXTENT=rel_proj.shape[1],
         REL_EXTENT_PADDED=triton.next_power_of_2(rel_proj.shape[1]),
+        KV_IS_FP8=kv_is_fp8,
         num_warps=SMALL_NUM_WARPS,
     )
 
@@ -856,6 +869,7 @@ def fused_qkvr_prep(
     log_scaling: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    kv_is_fp8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert d_rel == 16 and rel_proj.shape[0] == 16
     assert head_dim == 128
@@ -877,8 +891,9 @@ def fused_qkvr_prep(
     if tokens == 0:
         return q_out, rel_out
 
-    # fp8 KV cache per-tensor scales (device scalars); default to a 1.0 dummy
-    # when the cache is not fp8 — the is_fp8() branch is pruned at compile time.
+    # fp8 KV cache per-tensor scales (device scalars); default to a dummy
+    # when the cache is not fp8 -- the KV_IS_FP8 branch is pruned at compile
+    # time so the dummy is never dereferenced.
     scale_k = k_scale if k_scale is not None else _DUMMY_SCALE
     scale_v = v_scale if v_scale is not None else _DUMMY_SCALE
 
@@ -911,6 +926,7 @@ def fused_qkvr_prep(
             log_scaling=log_scaling,
             k_scale=scale_k,
             v_scale=scale_v,
+            kv_is_fp8=kv_is_fp8,
         )
         return q_out, rel_out
 
@@ -942,6 +958,7 @@ def fused_qkvr_prep(
             conv_block_size=conv_block_size,
             k_scale=scale_k,
             v_scale=scale_v,
+            kv_is_fp8=kv_is_fp8,
         )
     _run_tiled_q(
         qkvr,

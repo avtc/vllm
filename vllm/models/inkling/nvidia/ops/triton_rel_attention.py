@@ -48,6 +48,80 @@ def _num_sms(device_index: int) -> int:
 
 
 @triton.jit
+def _e4m3_to_fp32(x):
+    """Decode float8_e4m3fn bytes (stored as uint8) to fp32 by bit math.
+
+    Portable to GPUs without a native float8_e4m3fn type (Ampere SM<89), which
+    is why the kernels never reference an fp8 type. Layout: sign(1) exp(4)
+    mant(3), bias 7. Normal ``2^(e-7)*(1+m/8)``; subnormal (e==0) ``m*2^-9``;
+    exp=15/mant=7 is NaN (real KV never produces it; decodes to 448).
+    """
+    xb = x.to(tl.int32)
+    sign = (xb >> 7) & 1
+    exp = (xb >> 3) & 0xF
+    mant = xb & 0x7
+    # 2^(exp-7) as fp32 bits: unbiased exp k=exp-7 -> fp32 bits (127+k)<<23,
+    # i.e. (120+exp)<<23. Valid for exp in 1..15 (fp32 normal range).
+    pow2_bits = ((exp + 120) << 23).to(tl.uint32)
+    pow2 = pow2_bits.to(tl.float32, bitcast=True)
+    normal = pow2 * (1.0 + mant.to(tl.float32) * 0.125)
+    # subnormal: mant * 2^-9, i.e. 2^-9 -> fp32 bits (127-9)<<23 = 118<<23.
+    pow2_sub_bits = (118 << 23).to(tl.uint32)
+    pow2_sub = pow2_sub_bits.to(tl.float32, bitcast=True)
+    sub = mant.to(tl.float32) * pow2_sub
+    val = tl.where(exp == 0, sub, normal)
+    return tl.where(sign == 1, -val, val)
+
+
+@triton.jit
+def _fp32_to_e4m3(x):
+    """Encode fp32 to float8_e4m3fn bytes (returned as int, stored as uint8).
+
+    Round-to-nearest-even via fp32 bit manipulation, clamped to the e4m3fn
+    finite range (max ±448). Inverse of :func:`_e4m3_to_fp32`; portable to
+    GPUs without a native float8_e4m3fn type.
+    """
+    # Preserve sign; work on |x|. NaN -> 0x7f (never produced for real KV).
+    x32 = x.to(tl.float32)
+    bits = x32.to(tl.uint32, bitcast=True)
+    sign_bit = ((bits >> 31) & 1).to(tl.int32)
+    abs_bits = bits & 0x7FFFFFFF
+    abs_bits_f = abs_bits.to(tl.float32, bitcast=True)
+
+    e32 = (abs_bits >> 23) & 0xFF  # biased fp32 exponent
+    m32 = abs_bits & 0x7FFFFF  # 23-bit mantissa
+    # e4m3 exp field f = (e32-127)+7 = e32-120.
+    f = e32.to(tl.int32) - 120
+    # 3 mantissa bits + round-to-nearest-even from the remaining 20 bits.
+    top3 = (m32 >> 20).to(tl.int32) & 0x7
+    rem = (m32 & 0xFFFFF).to(tl.int32)
+    round_up = tl.where(
+        rem > 0x80000,
+        1,
+        tl.where((rem == 0x80000) & ((top3 & 1) == 1), 1, 0),
+    )
+    m4 = top3 + round_up
+    carry = (m4 == 8).to(tl.int32)
+    m4 = m4 - carry * 8  # m4 in 0..7 after carry
+    f = f + carry
+    # Subnormal: f < 1 -> value = round(|x| * 512) * 2^-9.
+    k = (abs_bits_f * 512.0 + 0.5).to(tl.int32)
+    k = tl.minimum(tl.maximum(k, 0), 7)
+    # Overflow (f > 15) -> max finite (f=15, m=7 = 448).
+    over = (f > 15).to(tl.int32)
+    f = tl.where(over == 1, 15, f)
+    m4 = tl.where(over == 1, 7, m4)
+    # Zero / subnormal select.
+    sub = (f < 1).to(tl.int32)
+    f_out = tl.where(sub == 1, 0, f)
+    m_out = tl.where(sub == 1, k, m4)
+    out = (sign_bit << 7) | (f_out << 3) | m_out
+    # Map exact zero (e32==0) to 0 (preserve sign).
+    out = tl.where(e32 == 0, sign_bit << 7, out)
+    return out
+
+
+@triton.jit
 def _inkling_rel_attn_decode_partial(
     Q,
     K_CACHE,
@@ -89,6 +163,7 @@ def _inkling_rel_attn_decode_partial(
     SW_RIGHT: tl.constexpr,
     USE_SW: tl.constexpr,
     BLOCKS_PER_SPLIT: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """One split of one (request, head): partial online-softmax over a KV range.
@@ -141,9 +216,9 @@ def _inkling_rel_attn_decode_partial(
         remaining = kv_len - blk_start
         n_mask = offs_n < remaining
 
-        # K, V: (BLOCK_N, HEAD_DIM). fp8 caches are dequantized to fp32 and
-        # multiplied by the per-tensor scale (the is_fp8() branch is pruned at
-        # compile time for bf16/fp16 caches).
+        # K, V: (BLOCK_N, HEAD_DIM). fp8 (float8_e4m3fn) caches are stored as
+        # uint8 bytes and decoded manually (Ampere has no native e4m3 type);
+        # the decoded fp32 value is multiplied by the per-tensor scale.
         k_load = tl.load(
             K_CACHE
             + phys * stride_kbt
@@ -162,13 +237,11 @@ def _inkling_rel_attn_decode_partial(
             mask=n_mask[:, None] & dmask[None, :],
             other=0.0,
         )
-        if k_load.dtype.is_fp8():
-            k = k_load.to(tl.float32) * tl.load(K_SCALE)
+        if KV_IS_FP8:
+            k = _e4m3_to_fp32(k_load) * tl.load(K_SCALE)
+            v = _e4m3_to_fp32(v_load) * tl.load(V_SCALE)
         else:
             k = k_load.to(tl.float32)
-        if v_load.dtype.is_fp8():
-            v = v_load.to(tl.float32) * tl.load(V_SCALE)
-        else:
             v = v_load.to(tl.float32)
 
         # QK^T for a single query: (BLOCK_N,)
@@ -325,6 +398,7 @@ def _inkling_rel_attn_prefill(
     SW_RIGHT: tl.constexpr,
     USE_SW: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """One program per (request, head, query block)."""
@@ -386,9 +460,9 @@ def _inkling_rel_attn_prefill(
         remaining = kv_len - blk_start
         n_mask = offs_n < remaining
 
-        # K: (HEAD_DIM, BLOCK_N), V: (BLOCK_N, HEAD_DIM). fp8 caches are
-        # dequantized to fp32 and multiplied by the per-tensor scale (the
-        # is_fp8() branch is pruned at compile time for bf16/fp16 caches).
+        # K: (HEAD_DIM, BLOCK_N), V: (BLOCK_N, HEAD_DIM). fp8 (float8_e4m3fn)
+        # caches are stored as uint8 bytes and decoded manually; the decoded
+        # fp32 value is multiplied by the per-tensor scale.
         k_load = tl.load(
             K_CACHE
             + phys * stride_kbt
@@ -407,13 +481,11 @@ def _inkling_rel_attn_prefill(
             mask=n_mask[:, None] & dmask[None, :],
             other=0.0,
         )
-        if k_load.dtype.is_fp8():
-            k = k_load.to(tl.float32) * tl.load(K_SCALE)
+        if KV_IS_FP8:
+            k = _e4m3_to_fp32(k_load) * tl.load(K_SCALE)
+            v = _e4m3_to_fp32(v_load) * tl.load(V_SCALE)
         else:
             k = k_load.to(tl.float32)
-        if v_load.dtype.is_fp8():
-            v = v_load.to(tl.float32) * tl.load(V_SCALE)
-        else:
             v = v_load.to(tl.float32)
 
         # QK^T: (BLOCK_M, BLOCK_N)
@@ -482,6 +554,7 @@ def inkling_triton_rel_attention(
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    kv_is_fp8: bool = False,
 ) -> torch.Tensor:
     """Triton paged attention with the Inkling relative bias (device-agnostic).
 
@@ -522,12 +595,12 @@ def inkling_triton_rel_attention(
     sw_left = window_size[0] if (use_sw and window_size[0] >= 0) else 0
     sw_right = window_size[1] if (use_sw and window_size[1] >= 0) else 0
 
-    # fp8 KV caches are stored as uint8 bytes and viewed as float8_e4m3fn by
-    # the caller (the logical dtype). The kernels dequant via ``is_fp8()``
-    # and apply the per-tensor scale, loaded inside the kernel from the device
-    # scalar tensors (capture-safe: no host sync). For non-fp8 caches the
-    # ``is_fp8()`` branch is pruned at compile time, so the (1.0) scales are
-    # never read.
+    # fp8 KV caches are stored as uint8 bytes and (on Ampere/SM<89, which has
+    # no native float8_e4m3fn type) decoded manually inside the kernels from
+    # the uint8 bit pattern, then multiplied by the per-tensor scale (loaded
+    # from device scalar tensors -- capture-safe, no host sync). The KV_IS_FP8
+    # constexpr gates the manual decode/encode so non-fp8 caches never
+    # reference an fp8 type.
     scale_k = k_scale if k_scale is not None else _DUMMY_SCALE
     scale_v = v_scale if v_scale is not None else _DUMMY_SCALE
 
@@ -602,6 +675,7 @@ def inkling_triton_rel_attention(
             SW_RIGHT=sw_right,
             USE_SW=use_sw,
             BLOCKS_PER_SPLIT=blocks_per_split,
+            KV_IS_FP8=kv_is_fp8,
             BLOCK_N=kv_block_size,
         )
         _inkling_rel_attn_combine[(num_reqs, num_heads)](
@@ -664,6 +738,7 @@ def inkling_triton_rel_attention(
             SW_LEFT=sw_left,
             SW_RIGHT=sw_right,
             USE_SW=use_sw,
+            KV_IS_FP8=kv_is_fp8,
             BLOCK_M=_BLOCK_M,
             BLOCK_N=kv_block_size,
         )

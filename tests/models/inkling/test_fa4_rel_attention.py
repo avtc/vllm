@@ -261,9 +261,9 @@ def _run_case(
     )
 
     # fp8 KV cache: round-trip K/V through float8_e4m3fn with a per-tensor
-    # scale (max(|x|) -> 448). The kernel sees the fp8 cache (logical dtype);
-    # the PyTorch reference sees the dequantized float cache so both share the
-    # same fp8-rounded values.
+    # scale (max(|x|) -> 448). The cache stays uint8 (the kernels decode the
+    # bytes manually on Ampere); the PyTorch reference sees the dequantized
+    # float cache so both share the same fp8-rounded values.
     ref_key_cache = key_cache
     ref_value_cache = value_cache
     k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
@@ -277,8 +277,9 @@ def _run_case(
         v_fp8 = (
             (value_cache.float() / v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
         )
-        key_cache = k_fp8
-        value_cache = v_fp8
+        # Store as uint8 bytes (matches the vLLM fp8 cache storage dtype).
+        key_cache = k_fp8.view(torch.uint8)
+        value_cache = v_fp8.view(torch.uint8)
         ref_key_cache = k_fp8.float() * k_scale
         ref_value_cache = v_fp8.float() * v_scale
 
@@ -326,6 +327,7 @@ def _run_case(
         out=preallocated_out,
         k_scale=k_scale,
         v_scale=v_scale,
+        kv_is_fp8=fp8,
     )
     assert out.data_ptr() == preallocated_out.data_ptr()
     out = out.view(total_q, num_heads, HEAD_DIM)

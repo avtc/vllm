@@ -184,6 +184,10 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         )
         self.register_buffer("k_scale", torch.ones((), dtype=torch.float32))
         self.register_buffer("v_scale", torch.ones((), dtype=torch.float32))
+        # fp8 (float8_e4m3fn) KV cache. Ampere (SM<89) has no native e4m3 type,
+        # so the kernels decode/encode the uint8 bytes manually (no float8 type
+        # referenced), keeping this path portable across all CUDA GPUs.
+        self._kv_is_fp8 = self.kv_cache_dtype in ("fp8", "fp8_e4m3")
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -232,12 +236,13 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         )
 
     def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # vLLM stores fp8 KV caches as uint8 bytes; view them with the logical
-        # float8_e4m3fn dtype so the backends/kernels dequantize correctly.
-        cache = self.kv_cache
-        if cache.dtype == torch.uint8 and self.kv_cache_dtype.startswith("fp8"):
-            cache = cache.view(torch.float8_e4m3fn)
-        key_cache, value_cache = cache.transpose(1, 2).split(self.head_dim, dim=-1)
+        # The KV cache is stored as a single (num_blocks, num_kv_heads,
+        # block_size, 2*head_dim) buffer; fp8 caches keep their uint8 storage
+        # dtype and are decoded manually inside the kernels (Ampere has no
+        # native float8_e4m3fn type, so we never view it as a float8 dtype).
+        key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
+            self.head_dim, dim=-1
+        )
         return (
             canonicalize_singleton_dim_strides(key_cache),
             canonicalize_singleton_dim_strides(value_cache),
@@ -304,6 +309,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                 log_scaling if not self.is_local else None,
                 k_scale=self.k_scale,
                 v_scale=self.v_scale,
+                kv_is_fp8=self._kv_is_fp8,
             )
             q = q.view(num_tokens, self.num_heads, self.head_dim)
             self._attention(q, rel_logits, attn_output)
@@ -352,4 +358,5 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             out=output[:nt],
             k_scale=self.k_scale,
             v_scale=self.v_scale,
+            kv_is_fp8=self._kv_is_fp8,
         )
