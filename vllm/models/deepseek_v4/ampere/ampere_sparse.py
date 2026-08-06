@@ -126,49 +126,69 @@ def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> 
         pass
     _STEP_WATCH_STEP += 1
     try:
-        num_slots = cache.shape[0] * cache.shape[1]
-        # Read every slot's bf16-RoPE via the correct kernel-offset (storage view).
-        s0 = cache.stride(0)
         block_size = cache.shape[1]
+        s0 = cache.stride(0)
         st = cache.untyped_storage()
         n_elem = st.nbytes() // cache.element_size()
         flat = torch.empty(0, dtype=cache.dtype, device=cache.device)
         flat.set_(st, 0, (n_elem,), (1,))
         base = cache.storage_offset()
-        blk = torch.arange(cache.shape[0], device=cache.device, dtype=torch.int64)
-        pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
-        abs_off = blk[:, None] * s0 + pos[None, :] * 576 + 448  # (nb, bs)
-        offs = torch.arange(128, device=cache.device, dtype=torch.int64)  # 128 bytes = 64 bf16
+
+        # SCOPE the scan to ONLY the active requests' physical blocks (from the
+        # block_table). Scanning all 1554 blocks reads a SHARED cross-layer/
+        # cross-cache buffer (storage_nbytes >> one layer's cache) and catches
+        # unrelated writes (other requests / profile / free-block churn) as false
+        # flips (LOG-18: 128 flips with NO model divergence => artifacts).
+        # block_table entries > 0 are valid physical blocks; scan their 64 slots.
+        if block_table is None or block_table.numel() == 0:
+            return
+        bt = block_table.detach().reshape(-1)
+        phys_blocks = torch.unique(bt[bt > 0])
+        if phys_blocks.numel() == 0:
+            return
+        # Build per-(physical block,pos) byte offsets for the bf16-RoPE region.
+        # slot = pb*block_size + pos; offset = pb*s0 + pos*576 + 448.
+        pos_arange = torch.arange(block_size, device=cache.device, dtype=torch.int64)
+        abs_off = (phys_blocks[:, None] * s0
+                   + pos_arange[None, :] * 576 + 448)  # (nblk, bs)
+        offs = torch.arange(128, device=cache.device, dtype=torch.int64)  # 128B=64bf16
         idx = (abs_off.reshape(-1)[:, None] + offs[None, :]).reshape(-1) + base
-        gathered = flat[idx].view(torch.bfloat16).reshape(num_slots, 64).float()
+        gathered = flat[idx].view(torch.bfloat16).reshape(-1, 64).float()  # (nblk*bs,64)
+        n_scanned = gathered.shape[0]
+        # Map each scanned row back to its physical slot id for reporting.
+        slot_ids = (phys_blocks[:, None] * block_size
+                    + pos_arange[None, :]).reshape(-1)  # (nblk*bs,)
         cur_nonfinite = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
         if _STEP_WATCH_PREV is None:
-            _STEP_WATCH_PREV = cur_nonfinite
-            # dump the baseline non-finite slots (planted during prefill or
-            # unwritten buffer garbage) so we know the starting corruption set.
+            # Baseline: record non-finite mask keyed by physical slot id in a dict.
+            _STEP_WATCH_PREV = {int(s.item()): bool(f.item())
+                                for s, f in zip(slot_ids, cur_nonfinite)}
             n_base = int(cur_nonfinite.sum().item())
-            if n_base > 0 and not _STEP_WATCH_BASELINE_DUMPED:
+            if not _STEP_WATCH_BASELINE_DUMPED:
                 _STEP_WATCH_BASELINE_DUMPED = True
-                slots_all = torch.arange(num_slots, device=cache.device)
-                base_bad = slots_all[cur_nonfinite][:32].tolist()
+                base_bad = slot_ids[cur_nonfinite][:32].tolist()
                 print(
-                    f"[STEP_WATCH ### step 1 (baseline) ###] {n_base} slots "
-                    f"already non-finite BEFORE any decode; baseline_bad_slots="
-                    f"{base_bad} cache_shape={tuple(cache.shape)} "
-                    f"strides={cache.stride()} storage_offset={base} "
-                    f"storage_nbytes={st.nbytes()}",
+                    f"[STEP_WATCH ### step 1 (baseline) ###] scanned {n_scanned} "
+                    f"slots across {phys_blocks.numel()} active blocks; "
+                    f"{n_base} already non-finite; baseline_bad_slots={base_bad} "
+                    f"phys_blocks={phys_blocks[:16].tolist()}",
                     flush=True,
                 )
             return
-        newly = cur_nonfinite & (~_STEP_WATCH_PREV)
-        n_new = int(newly.sum().item())
+        prev = _STEP_WATCH_PREV
+        newly_rows = []
+        for s, f in zip(slot_ids, cur_nonfinite):
+            sid = int(s.item())
+            now_nf = bool(f.item())
+            was_nf = prev.get(sid, False)  # treat unseen slots as finite(False)
+            if now_nf and not was_nf:
+                newly_rows.append(sid)
+            prev[sid] = now_nf  # update tracked state
+        n_new = len(newly_rows)
         if n_new > 0:
             _STEP_WATCH_FIRED = True
-            slots_all = torch.arange(num_slots, device=cache.device)
-            bad = slots_all[newly][:16].tolist()
-            n_baseline = int((_STEP_WATCH_PREV).sum().item())
-            # Correlate: is the flipped slot the one the compressor WROTE this
-            # step (decode_slot_mapping), or a different (prefill) slot?
+            bad = newly_rows[:16]
+            n_baseline = sum(1 for v in prev.values() if v)
             written = ""
             try:
                 if decode_slot_mapping is not None:
@@ -179,19 +199,11 @@ def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> 
                                f"flipped_slot_is_written={bool(in_written)}")
             except Exception:
                 pass
-            bt = ""
-            try:
-                if block_table is not None:
-                    btv = block_table.detach().reshape(-1)
-                    btv = btv[btv >= 0][:16].tolist()
-                    bt = f" block_table[0,:16]={btv}"
-            except Exception:
-                pass
             print(
-                f"[STEP_WATCH ### step {_STEP_WATCH_STEP} ###] FLIP detected! "
-                f"{n_new} slot(s) turned finite->NaN this step; "
-                f"newly_bad_slots={bad} baseline_nonfinite={n_baseline} "
-                f"cache_shape={tuple(cache.shape)}{written}{bt}",
+                f"[STEP_WATCH ### step {_STEP_WATCH_STEP} ###] FLIP in active KV! "
+                f"{n_new} slot(s) turned finite->NaN; newly_bad_slots={bad} "
+                f"baseline_nonfinite={n_baseline} n_scanned={n_scanned} "
+                f"n_active_blocks={phys_blocks.numel()}{written}",
                 flush=True,
             )
         _STEP_WATCH_PREV = cur_nonfinite
