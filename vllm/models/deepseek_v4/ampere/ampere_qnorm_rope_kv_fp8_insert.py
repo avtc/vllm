@@ -16,6 +16,10 @@ NOPE_DIM = HEAD_DIM - ROPE_DIM
 HALF_ROPE = ROPE_DIM // 2
 
 
+# [DSv4-ampere debug] one-shot flag for the ROPE_SHAPE log.
+_ampere_qnorm_rope_shape_logged = type("S", (), {"done": False})()
+
+
 # [DSv4-ampere debug] BEFORE-quantize snapshot of the SWA cache target slots.
 # Reads the bf16-RoPE region [448:576] of each slot to be written, logging any
 # pre-existing non-finite. Compared with the AFTER read (SWA_WRITE probe), this
@@ -196,6 +200,29 @@ def ampere_qnorm_rope_kv_fp8_insert(
         try:
             if not (torch.distributed.is_available() and torch.distributed.is_initialized()
                     and torch.distributed.get_rank() != 0):
+                # PRIME SUSPECT: num_tokens mismatch. The RoPE kernel writes
+                # kv_roped[0:q.shape[0]] (num_tokens=q.shape[0]), but
+                # quantize_and_insert_k_cache reads kv_roped[0:slot_mapping.shape[0]].
+                # If slot_mapping is LONGER than q/kv, quantize reads PAST kv_roped's
+                # end => uninitialized memory => NaN. Log the shapes once.
+                q_nt = q.shape[0]
+                kv_nt = kv.shape[0]
+                sm_nt = slot_mapping.shape[0]
+                kvr_nt = kv_roped.shape[0]
+                if not getattr(_ampere_qnorm_rope_shape_logged, "done", False):
+                    _ampere_qnorm_rope_shape_logged.done = True
+                    print(
+                        f"[ROPE_SHAPE] q_nt={q_nt} kv_nt={kv_nt} "
+                        f"slot_mapping_nt={sm_nt} kv_roped_nt={kvr_nt} num_heads={num_heads}",
+                        flush=True,
+                    )
+                if sm_nt > kvr_nt:
+                    print(
+                        f"[ROPE_OOB_READ] slot_mapping_nt={sm_nt} > kv_roped_nt={kvr_nt}! "
+                        f"quantize reads {sm_nt - kvr_nt} rows PAST kv_roped (uninitialized "
+                        f"=> NaN). q_nt={q_nt} kv_nt={kv_nt}",
+                        flush=True,
+                    )
                 rope_out = kv_roped[..., NOPE_DIM:].detach().float()  # [N, ROPE_DIM]
                 if rope_out.numel():
                     bad = torch.where(torch.isnan(rope_out).any(1) | torch.isinf(rope_out).any(1))[0]
