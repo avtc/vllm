@@ -206,7 +206,8 @@ def _step_watch_cache_nan(cache, decode_slot_mapping=None, block_table=None) -> 
                 f"n_active_blocks={phys_blocks.numel()}{written}",
                 flush=True,
             )
-        _STEP_WATCH_PREV = cur_nonfinite
+        # NOTE: per-slot state is updated in-place in the loop above (prev is
+        # _STEP_WATCH_PREV, a dict). Do NOT reassign to cur_nonfinite (Tensor).
     except Exception as e:  # noqa: BLE001
         if not _STEP_WATCH_ERR_LOGGED:
             _STEP_WATCH_ERR_LOGGED = True
