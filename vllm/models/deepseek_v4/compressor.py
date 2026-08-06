@@ -53,6 +53,7 @@ def _compressor_nan_probe(
     k_cache_metadata: Any,
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
+    head_dim: int = 512,
 ) -> None:
     import os
 
@@ -87,7 +88,13 @@ def _compressor_nan_probe(
     # the decode read a poisoned slot). One-shot per prefix once a NaN is found.
     # ROBUST 3D layout: kv_cache is [num_blocks, block_size, 584] uint8/int8.
     # Reshape to [total_slots, 584] (reshape handles non-contiguity by copying),
-    # index the written slots, take bytes [448:576], view as 64 bf16. ---
+    # index the written slots, take bytes [448:576], view as 64 bf16.
+    # NOTE: only head_dim==512 has a bf16-RoPE region (nope=448, bf16 64 vals).
+    # head_dim==128 (indexer) is ALL fp8 (token_stride=128) with NO bf16 region
+    # -> reading offset 448 would go past the 128-byte token into garbage.
+    # Skip the bf16 check for head_dim != 512 to avoid false positives.
+    if head_dim != 512:
+        return
     try:
         kv_slot_mapping = k_cache_metadata.slot_mapping
         fp8_dim = 448
@@ -559,6 +566,7 @@ class DeepseekCompressor(nn.Module):
             k_cache_metadata=k_cache_metadata,
             positions=positions,
             token_to_req_indices=token_to_req_indices,
+            head_dim=self.head_dim,
         )
 
     def _dcp_compress_and_insert(
