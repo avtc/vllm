@@ -42,22 +42,33 @@ def _swa_before_snapshot(swa_kv_cache, slot_mapping):
         return
     sv = slots[valid].to(torch.int64)
     block_size = swa_kv_cache.shape[1]
-    block_stride = block_size * 584  # bytes per block
-    flat = swa_kv_cache.reshape(-1)
+    token_data_stride = 576  # CORRECT: data stride within block (not 584)
     block_idx = (sv // block_size)
     pos_in_block = (sv % block_size)
-    row_ptrs = block_idx * block_stride + pos_in_block * 576 + 448  # data stride 576
     offs = torch.arange(128, device=sv.device, dtype=torch.int64)
-    gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16).float()
-    n_nan = int(torch.isnan(gathered).sum().item())
-    n_inf = int(torch.isinf(gathered).sum().item())
+    n_nan = 0
+    n_inf = 0
+    bad_slots = []
+    # Per-block contiguous read: swa_kv_cache may be a NON-CONTIGUOUS strided
+    # view (reshape(-1) would copy+reorder and corrupt offset math).
+    # swa_kv_cache[blk] -> contiguous (64,584) view regardless of parent stride0.
+    for i in range(sv.numel()):
+        blk = int(block_idx[i].item())
+        pin = int(pos_in_block[i].item())
+        block_bytes = swa_kv_cache[blk].reshape(-1)  # (37376,) contiguous
+        base = pin * token_data_stride + 448
+        gathered = block_bytes[base + offs].view(torch.bfloat16).float()
+        nn = int(torch.isnan(gathered).sum().item())
+        ni = int(torch.isinf(gathered).sum().item())
+        n_nan += nn
+        n_inf += ni
+        if nn or ni:
+            bad_slots.append(int(sv[i].item()))
     if n_nan or n_inf:
         _SWA_BEFORE_FIRED = True
-        bad_rows = torch.where(torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1))[0]
-        bad_slots = sv[bad_rows][:8].tolist()
         print(
             f"[SWA_BEFORE quantize] target slots ALREADY have non-finite! "
-            f"nan={n_nan} inf={n_inf} bad_slots={bad_slots} "
+            f"nan={n_nan} inf={n_inf} bad_slots={bad_slots[:8]} "
             f"n_target_slots={int(sv.numel())} data_stride=576",
             flush=True,
         )

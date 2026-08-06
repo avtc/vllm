@@ -82,8 +82,10 @@ def _swa_write_nan_probe(
             )
 
     # output-side: read back the bf16 RoPE portion of the just-written slots.
-    # ROBUST 3D layout: swa_kv_cache is [num_blocks, block_size, 584] uint8/int8.
-    # Reshape to 1D and index by slot*584+448 (reshape copies if non-contiguous).
+    # Per-block contiguous read (swa_kv_cache is often NON-CONTIGUOUS strided;
+    # reshape(-1) would copy+reorder and corrupt offset math). swa_kv_cache[blk]
+    # -> contiguous (64,584) view regardless of parent stride0; reshape(-1) ->
+    # 37376 true-order bytes; kernel token stride = 576.
     try:
         fp8_dim = 448
         rope_bytes = 128
@@ -92,22 +94,28 @@ def _swa_write_nan_probe(
         if not bool(valid.any().item()):
             return
         sv = slots[valid].to(torch.int64)
-        flat = swa_kv_cache.reshape(-1)
         block_size = swa_kv_cache.shape[1]
-        block_stride = block_size * 584  # bytes per block
         token_data_stride = 576  # CORRECT: data stride within block (not 584)
         block_idx = (sv // block_size)
         pos_in_block = (sv % block_size)
-        row_ptrs = block_idx * block_stride + pos_in_block * token_data_stride + fp8_dim
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
-        gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
-        g = gathered.float()
-        n_nan = int(torch.isnan(g).sum().item())
-        n_inf = int(torch.isinf(g).sum().item())
+        n_nan = 0
+        n_inf = 0
+        bad_slots = []
+        for i in range(sv.numel()):
+            blk = int(block_idx[i].item())
+            pin = int(pos_in_block[i].item())
+            block_bytes = swa_kv_cache[blk].reshape(-1)  # (37376,) contiguous
+            base = pin * token_data_stride + fp8_dim
+            gathered = block_bytes[base + offs].view(torch.bfloat16).float()
+            nn = int(torch.isnan(gathered).sum().item())
+            ni = int(torch.isinf(gathered).sum().item())
+            n_nan += nn
+            n_inf += ni
+            if nn or ni:
+                bad_slots.append(int(sv[i].item()))
         if n_nan or n_inf:
             _SWA_WRITE_PROBE_FIRED[prefix] = True
-            bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
-            bad_slots = sv[bad_rows][:8].tolist()
             # Diagnose OOB cos_sin_cache read: correlate bad slots with their
             # input positions, and check whether any position exceeds the
             # cos_sin_cache length (pos*ROPE_DIM out of bounds => NaN cos/sin).
@@ -116,7 +124,12 @@ def _swa_write_nan_probe(
                 if positions is not None:
                     pv = positions.detach()
                     if pv.numel() == slots.numel():
-                        bad_pos = pv[valid][bad_rows][:8].tolist()
+                        bad_set = set(bad_slots)
+                        bad_pos = [
+                            int(pv[valid][i].item())
+                            for i in range(sv.numel())
+                            if int(sv[i].item()) in bad_set
+                        ][:8]
                         pos_info = f" positions={bad_pos}"
                     if cos_sin_cache is not None:
                         rope_dim = 64
@@ -130,13 +143,13 @@ def _swa_write_nan_probe(
             tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
                 f"[SWA_WRITE ### {prefix} ###] {tag}: WROTE NaN to SWA bf16-RoPE! "
-                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
+                f"nan={n_nan} inf={n_inf} bad_slots={bad_slots[:8]}"
                 f"{pos_info} n_valid_slots={int(sv.numel())} data_stride=576",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001
-        if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
-            print(f"[SWA_WRITE {prefix}] readback FAILED: {e}", flush=True)
+        # ALWAYS surface readback failures (silent except => false 'clean').
+        print(f"[SWA_WRITE {prefix}] readback FAILED: {e}", flush=True)
 
 
 # [DSv4-ampere debug] Periodic FULL-CACHE NaN scan at decode time. The per-write
@@ -169,37 +182,58 @@ def _cache_nan_scan(name: str, cache, pass_no: int) -> None:
         # per-token DATA stride WITHIN a block is 576 (448 fp8 + 128 bf16); the 8
         # scale bytes live in a SEPARATE region after all tokens' data
         # (block_base + block_size*576 + pos*8). So token (block,pos) bf16-RoPE
-        # is at byte (block*block_stride + pos*576 + 448), NOT pos*584.
+        # is at byte (block_base + pos*576 + 448), NOT pos*584.
+        #
+        # CRITICAL: the cache is often a NON-CONTIGUOUS strided view of a
+        # larger cross-layer buffer (observed strides=(1039680,584,1),
+        # is_contig=False). cache.reshape(-1) would COPY+REORDER bytes into
+        # C-order, making any index computed from the original strides read the
+        # WRONG memory. To avoid this, we read ONE BLOCK AT A TIME:
+        # cache[block_idx] collapses dim0 -> a contiguous (64,584) view with
+        # stride (584,1) regardless of the parent's stride0; reshape(-1) then
+        # gives that block's 37376 bytes in true memory order, and the kernel's
+        # 576-byte token stride indexes it correctly.
         num_blocks = cache.shape[0]
         block_size = cache.shape[1]
-        block_stride = block_size * 584  # bytes per block (cache last dim 584)
         token_data_stride = 576
         fp8_dim = 448
         rope_bytes = 128  # 64 bf16
-        flat = cache.reshape(-1)
-        # build byte offsets for every (block, pos) bf16-RoPE region
-        blk = torch.arange(num_blocks, device=cache.device, dtype=torch.int64)
-        pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
-        base = (blk[:, None] * block_stride + pos[None, :] * token_data_stride + fp8_dim)  # [nb, bs]
-        base_flat = base.reshape(-1)  # [nb*bs]
         offs = torch.arange(rope_bytes, device=cache.device, dtype=torch.int64)
-        gathered = flat[base_flat[:, None] + offs[None, :]].view(torch.bfloat16).float()
-        rows_bf16 = gathered  # [num_slots, 64]
-        n_nan = int(torch.isnan(rows_bf16).sum().item())
-        n_inf = int(torch.isinf(rows_bf16).sum().item())
-        if n_nan or n_inf:
+        pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
+        nan_slots: list[int] = []
+        first_slot = -1
+        total_nan = 0
+        total_inf = 0
+        for blk in range(num_blocks):
+            block_bytes = cache[blk].reshape(-1)  # (37376,) contiguous, true order
+            base = pos * token_data_stride + fp8_dim  # (block_size,)
+            gathered = block_bytes[base[:, None] + offs[None, :]].view(
+                torch.bfloat16).float()  # (block_size, 64)
+            bad_mask = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
+            if bool(bad_mask.any().item()):
+                bad_idx = torch.where(bad_mask)[0]
+                for pi in bad_idx.tolist():
+                    slot = blk * block_size + pi
+                    if first_slot < 0:
+                        first_slot = slot
+                    nan_slots.append(slot)
+                total_nan += int(torch.isnan(gathered).sum().item())
+                total_inf += int(torch.isinf(gathered).sum().item())
+            if len(nan_slots) >= 16:  # enough evidence; stop early
+                break
+        if total_nan or total_inf:
             _CACHE_SCAN_FIRED[name] = True
-            bad = torch.where(torch.isnan(rows_bf16).any(1) | torch.isinf(rows_bf16).any(1))[0]
-            first_slot = int(bad[0].item()) if bad.numel() else -1
             print(
                 f"[CACHE_SCAN ### {name} ### pass {pass_no}] NaN FOUND in cache! "
-                f"nan={n_nan} inf={n_inf} first_slot={first_slot} "
-                f"cache_shape={tuple(cache.shape)}",
+                f"nan={total_nan} inf={total_inf} first_slot={first_slot} "
+                f"bad_slots={nan_slots[:16]} cache_shape={tuple(cache.shape)} "
+                f"strides={cache.stride()} is_contig={cache.is_contiguous()}",
                 flush=True,
             )
     except Exception as e:  # noqa: BLE001
-        if os.environ.get("VLLM_SM86_PROBE_VERBOSE") == "1":
-            print(f"[CACHE_SCAN {name}] scan FAILED: {e}", flush=True)
+        # ALWAYS surface scan failures (silent except would make a missing
+        # 'NaN FOUND' falsely imply the cache is clean).
+        print(f"[CACHE_SCAN {name}] scan FAILED: {e}", flush=True)
 
 
 class DeepseekV4AmpereSparseBackend(DeepseekV4FlashMLABackend):

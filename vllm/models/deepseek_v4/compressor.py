@@ -118,22 +118,34 @@ def _compressor_nan_probe(
                 f"is_contig={kv_cache.is_contiguous()} n_slots={int(sv.numel())}",
                 flush=True,
             )
-        flat = kv_cache.reshape(-1)  # 1D (reshape copies if non-contiguous)
+        # Per-block contiguous read (cache is often NON-CONTIGUOUS strided;
+        # kv_cache.reshape(-1) would copy+reorder and corrupt the offset math).
+        # kv_cache[blk] -> contiguous (64,584) view regardless of parent stride0;
+        # reshape(-1) -> 37376 true-order bytes; kernel token stride = 576.
         block_size = kv_cache.shape[1]
-        block_stride = block_size * 584  # bytes per block
         token_data_stride = 576  # CORRECT: data stride within block (not 584)
         block_idx = (sv // block_size)
         pos_in_block = (sv % block_size)
-        row_ptrs = block_idx * block_stride + pos_in_block * token_data_stride + fp8_dim
         offs = torch.arange(rope_bytes, device=sv.device, dtype=torch.int64)
-        gathered = flat[row_ptrs[:, None] + offs[None, :]].view(torch.bfloat16)
-        g = gathered.float()
-        n_nan = int(torch.isnan(g).sum().item())
-        n_inf = int(torch.isinf(g).sum().item())
+        n_nan = 0
+        n_inf = 0
+        bad_slots = []
+        bad_pos_vals = []
+        for i in range(sv.numel()):
+            blk = int(block_idx[i].item())
+            pin = int(pos_in_block[i].item())
+            block_bytes = kv_cache[blk].reshape(-1)  # (37376,) contiguous
+            base = pin * token_data_stride + fp8_dim
+            gathered = block_bytes[base + offs].view(torch.bfloat16).float()
+            nn = int(torch.isnan(gathered).sum().item())
+            ni = int(torch.isinf(gathered).sum().item())
+            n_nan += nn
+            n_inf += ni
+            if nn or ni:
+                bad_slots.append(int(sv[i].item()))
+        g_finite = (n_nan == 0 and n_inf == 0)
         if n_nan or n_inf:
             _COMPRESSOR_NAN_PROBE_FIRED[prefix] = True
-            bad_rows = torch.where(torch.isnan(g).any(1) | torch.isinf(g).any(1))[0]
-            bad_slots = sv[bad_rows][:8].tolist()
             # Correlate bad slots with their input positions (for chunk-boundary
             # diagnosis): positions aligns with slot_mapping order.
             pos_info = ""
@@ -141,14 +153,19 @@ def _compressor_nan_probe(
                 if positions is not None:
                     pv = positions.detach()
                     if pv.numel() == slots.numel():
-                        bad_pos = pv[valid][bad_rows][:8].tolist()
+                        bad_set = set(bad_slots)
+                        bad_pos = [
+                            int(pv[valid][i].item())
+                            for i in range(sv.numel())
+                            if int(sv[i].item()) in bad_set
+                        ][:8]
                         pos_info = f" positions={bad_pos}"
             except Exception:
                 pass
             tag = "OUTPUT-NaN-from-FINITE-input" if not input_nan else "OUTPUT-NaN (input also NaN)"
             print(
                 f"[COMPRESSOR_WRITE ### {prefix} ###] {tag}: WROTE NaN to KV "
-                f"bf16-RoPE! nan={n_nan} inf={n_inf} bad_slots={bad_slots}"
+                f"bf16-RoPE! nan={n_nan} inf={n_inf} bad_slots={bad_slots[:8]}"
                 f"{pos_info} n_valid_slots={int(sv.numel())} data_stride=576",
                 flush=True,
             )
