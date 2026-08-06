@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 # received a NaN input (kv) or wrote NaN from finite input. Gated by
 # VLLM_SM86_NAN_PROBE=1; one-shot per prefix; rank0 only.
 _SWA_WRITE_PROBE_FIRED: dict[str, bool] = {}
+_WATCH_OWNER: list = [None]
 
 
 def _read_cache_rope_bytes(cache, slots):
@@ -88,6 +89,76 @@ def _read_cache_rope_bytes(cache, slots):
     gathered = flat[idx.reshape(-1)].view(torch.bfloat16).float().reshape(
         slots.numel(), 64)
     return gathered
+
+
+# [DSv4-ampere debug] Per-decode-step NaN watch. Each decode step, scan EVERY
+# slot's bf16-RoPE of the main-MLA cache and report any slot that FLIPS
+# finite->NaN relative to the previous step (a delta). This isolates the exact
+# decode step + physical slot at which a written slot's bf16-RoPE becomes
+# corrupt, independent of which writer did it. The delta filters out slots that
+# were non-finite from the start (unwritten/cross-layer buffer regions are
+# constant across steps, so never reported as "newly" corrupt). Vectorized: one
+# gather + one isnan per step. One-shot per rank once the first flip is found.
+_STEP_WATCH_FIRED: bool = False
+_STEP_WATCH_PREV: torch.Tensor | None = None
+_STEP_WATCH_STEP: int = 0
+
+
+def _step_watch_cache_nan(cache) -> None:
+    global _STEP_WATCH_FIRED, _STEP_WATCH_PREV, _STEP_WATCH_STEP
+    import os
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if _STEP_WATCH_FIRED:
+        return
+    if cache is None:
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    _STEP_WATCH_STEP += 1
+    try:
+        num_slots = cache.shape[0] * cache.shape[1]
+        # Read every slot's bf16-RoPE via the correct kernel-offset (storage view).
+        s0 = cache.stride(0)
+        block_size = cache.shape[1]
+        st = cache.untyped_storage()
+        n_elem = st.nbytes() // cache.element_size()
+        flat = torch.empty(0, dtype=cache.dtype, device=cache.device)
+        flat.set_(st, 0, (n_elem,), (1,))
+        base = cache.storage_offset()
+        blk = torch.arange(cache.shape[0], device=cache.device, dtype=torch.int64)
+        pos = torch.arange(block_size, device=cache.device, dtype=torch.int64)
+        abs_off = blk[:, None] * s0 + pos[None, :] * 576 + 448  # (nb, bs)
+        offs = torch.arange(64, device=cache.device, dtype=torch.int64)
+        idx = (abs_off.reshape(-1)[:, None] + offs[None, :]).reshape(-1) + base
+        gathered = flat[idx].view(torch.bfloat16).reshape(num_slots, 64).float()
+        cur_nonfinite = torch.isnan(gathered).any(1) | torch.isinf(gathered).any(1)
+        if _STEP_WATCH_PREV is None:
+            _STEP_WATCH_PREV = cur_nonfinite
+            return
+        newly = cur_nonfinite & (~_STEP_WATCH_PREV)
+        n_new = int(newly.sum().item())
+        if n_new > 0:
+            _STEP_WATCH_FIRED = True
+            slots_all = torch.arange(num_slots, device=cache.device)
+            bad = slots_all[newly][:16].tolist()
+            # also report how many slots were ALREADY non-finite (baseline)
+            n_baseline = int((_STEP_WATCH_PREV).sum().item())
+            print(
+                f"[STEP_WATCH ### step {_STEP_WATCH_STEP} ###] FLIP detected! "
+                f"{n_new} slot(s) turned finite->NaN this step; "
+                f"newly_bad_slots={bad} baseline_nonfinite={n_baseline} "
+                f"cache_shape={tuple(cache.shape)}",
+                flush=True,
+            )
+        _STEP_WATCH_PREV = cur_nonfinite
+    except Exception as e:  # noqa: BLE001
+        print(f"[STEP_WATCH] failed: {e}", flush=True)
+
 
 def _swa_write_nan_probe(
     prefix: str,
@@ -376,6 +447,15 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
+        # [DSv4-ampere debug] per-step NaN watch on the main-MLA cache. Run once
+        # per decode STEP (owned by whichever attention layer calls first), so it
+        # doesn't repeat across the 43 layers. Reports the exact step + slot at
+        # which a written slot's bf16-RoPE flips finite->NaN.
+        if not swa_only and kv_cache is not None:
+            if _WATCH_OWNER[0] is None:
+                _WATCH_OWNER[0] = self.prefix
+            if self.prefix == _WATCH_OWNER[0]:
+                _step_watch_cache_nan(kv_cache)
 
         topk_indices = None
         topk_lens = None
