@@ -1135,6 +1135,11 @@ class GPUModelRunner(
                     continue
                 seen_ptrs.add(ptr)
                 self._compressed_zero_caches.append(kv)
+            logger.info(
+                "[COMPRESSED_ZERO] init: registered %d unique cache views "
+                "for block zeroing (has_compressed_kv_layers=True).",
+                len(self._compressed_zero_caches),
+            )
             return
 
         self._kv_block_zeroer = KVBlockZeroer(
@@ -1155,6 +1160,11 @@ class GPUModelRunner(
         # directly (see _init_kv_zero_meta for why KVBlockZeroer is bypassed).
         caches = getattr(self, "_compressed_zero_caches", None)
         if caches:
+            if not getattr(self, "_compressed_zero_logged", False):
+                logger.info(
+                    "[COMPRESSED_ZERO] zeroing %d block(s) %s across %d cache "
+                    "views.", len(block_ids), block_ids[:8], len(caches),
+                )
             for cache in caches:
                 # Guard against any block id beyond this view's capacity
                 # (all packed views share one physical block pool, but be
