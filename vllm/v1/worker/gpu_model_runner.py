@@ -1109,6 +1109,34 @@ class GPUModelRunner(
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        # DeepSeek-V4 uses a *packed* KV cache layout where many layer views
+        # are strided slices (stride(0) = full packed block stride) of a single
+        # backing tensor. The general KVBlockZeroer derives each block's zeroing
+        # size from ``kv.stride(block_dim)`` and assumes that equals one block's
+        # data -- an assumption that is wildly violated by the packed layout
+        # (it would zero the whole ~1MB packed block, i.e. every cache, per
+        # layer, and step blocks by the wrong amount). For compressed-MLA models
+        # we therefore bypass KVBlockZeroer and zero each cache view directly:
+        # ``cache[block_id].zero_()`` is bounded to exactly that layer's page
+        # (e.g. 64*584 B for DSv4 MLA), which is correct regardless of packing.
+        if self.kv_cache_config.has_compressed_kv_layers:
+            self._kv_block_zeroer = None
+            self._compressed_zero_caches: list[torch.Tensor] = []
+            seen_ptrs: set[int] = set()
+            forward_context = self.compilation_config.static_forward_context
+            for layer_name in forward_context:
+                kv = getattr(forward_context[layer_name], "kv_cache", None)
+                # Skip non-tensor caches (e.g. Mamba state lists) and unbound
+                # defaults (empty placeholder tensors) that have no block dim.
+                if not isinstance(kv, torch.Tensor) or kv.dim() == 0 or kv.shape[0] == 0:
+                    continue
+                ptr = kv.data_ptr()
+                if ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                self._compressed_zero_caches.append(kv)
+            return
+
         self._kv_block_zeroer = KVBlockZeroer(
             self.device,
             pin_memory=PIN_MEMORY,
@@ -1121,7 +1149,22 @@ class GPUModelRunner(
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if hasattr(self, "_kv_block_zeroer"):
+        if not block_ids:
+            return
+        # Packed compressed-MLA path: zero each cache view's block slice
+        # directly (see _init_kv_zero_meta for why KVBlockZeroer is bypassed).
+        caches = getattr(self, "_compressed_zero_caches", None)
+        if caches:
+            for cache in caches:
+                # Guard against any block id beyond this view's capacity
+                # (all packed views share one physical block pool, but be
+                # defensive against layout edge cases).
+                nb = cache.shape[0]
+                for blk in block_ids:
+                    if 0 <= blk < nb:
+                        cache[blk].zero_()
+            return
+        if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer is not None:
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
     # Note: used for model runner override.

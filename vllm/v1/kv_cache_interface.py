@@ -1010,5 +1010,21 @@ class KVCacheConfig:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
     @property
+    def has_compressed_kv_layers(self) -> bool:
+        """True if any KV cache group writes a compressed (sub-sampled) cache.
+
+        Compressed caches (e.g. DeepSeek-V4 MLA with compress_ratio > 1) only
+        store a subset of tokens per block. When a physical block is recycled
+        from the shared pool, the unwritten slots retain stale data from a
+        previous occupant, which can corrupt attention/indexer reads. Such
+        caches therefore require freshly-allocated blocks to be zeroed, just
+        like Mamba/SSM state caches.
+        """
+        return any(
+            getattr(g.kv_cache_spec, "compress_ratio", 1) > 1
+            for g in self.kv_cache_groups
+        )
+
+    @property
     def needs_kv_cache_zeroing(self) -> bool:
-        return self.has_mamba_layers
+        return self.has_mamba_layers or self.has_compressed_kv_layers
