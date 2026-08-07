@@ -24,6 +24,9 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import (
@@ -231,6 +234,11 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
+    # Slot mapping for the COMPRESSED k-cache write (pos//compress_ratio via
+    # block_table). The raw `slot_mapping` above is for the uncompressed
+    # state_cache (1 entry/input-token); the k-cache is compressed and must be
+    # written at compressed slots, matching what the reader/indexer use.
+    k_cache_slot_mapping: torch.Tensor | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -241,10 +249,28 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
         mla_spec = cast(SlidingWindowMLASpec | MLAAttentionSpec, self.kv_cache_spec)
         self.block_size = mla_spec.block_size
+        # The k-cache (NOT this state_cache spec) is compressed. The state_cache
+        # block_size encodes the compress ratio (4 -> block_size 4, 128 -> 8,
+        # see CompressorStateCache.__init__), so derive the k-cache compress_ratio
+        # from it. The k-cache storage_block_size = cache_config.block_size //
+        # compress_ratio (e.g. 256//4 = 64).
+        self.compress_ratio = 4 if self.block_size == 4 else 128
+        self.storage_block_size = (
+            self.vllm_config.cache_config.block_size // self.compress_ratio
+        )
+        self.cp_layout = ContextParallelLayout.from_config(self.vllm_config)
 
         self.token_to_req_indices = torch.zeros(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
+            device=self.device,
+        )
+        # Reusable buffer for the compressed k-cache slot mapping (avoids
+        # per-step allocation). Mirrors the indexer's compressed_slot_mapping_buffer.
+        self.compressed_k_slot_mapping_buffer = torch.full(
+            (self.vllm_config.scheduler_config.max_num_batched_tokens,),
+            -1,
+            dtype=torch.int64,
             device=self.device,
         )
 
@@ -260,11 +286,33 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
+        slot_mapping = common_attn_metadata.slot_mapping
+        block_table = common_attn_metadata.block_table_tensor.clamp_(min=0)
+        # The k-cache is COMPRESSED (compress_ratio>1): the compressor must
+        # write at compressed (pos//compress_ratio) slots, exactly as the
+        # indexer/reader do (get_compressed_slot_mapping). Using the raw common
+        # slot_mapping here scatters writes across wrong physical blocks and
+        # leaves the correct compressed slots unwritten -> fluent-but-wrong
+        # output that hard-fails when a bad slot is later read.
+        k_cache_slot_mapping = slot_mapping
+        num_tokens = slot_mapping.shape[0]
+        if self.compress_ratio > 1 and num_tokens > 0:
+            k_cache_slot_mapping = get_compressed_slot_mapping(
+                num_tokens,
+                common_attn_metadata.query_start_loc,
+                common_attn_metadata.seq_lens,
+                block_table,
+                self.storage_block_size,
+                self.compress_ratio,
+                out=self.compressed_k_slot_mapping_buffer,
+                cp_layout=self.cp_layout,
+            )
         return CompressorMetadata(
-            block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
-            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
+            k_cache_slot_mapping=k_cache_slot_mapping,
         )
 
 
@@ -562,7 +610,9 @@ class DeepseekCompressor(nn.Module):
                     "store is Hopper/Blackwell (cutedsl) only."
                 )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
+            extra_kwargs = dict(
+                kv_slot_mapping=state_metadata.k_cache_slot_mapping
+            )
 
         compress_norm_rope_store_fn(
             state_cache=state_cache,
