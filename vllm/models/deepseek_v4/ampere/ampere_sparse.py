@@ -9,6 +9,7 @@ Triton kernels for decode (FP8 dequant + BF16 attention) and prefill
 
 from typing import TYPE_CHECKING, cast
 
+import collections
 import os
 
 import torch
@@ -213,6 +214,199 @@ def _step_watch_cache_nan(cache, prefix="", decode_slot_mapping=None, block_tabl
         if not _STEP_WATCH_ERR_LOGGED:
             _STEP_WATCH_ERR_LOGGED = True
             print(f"[STEP_WATCH] failed: {e}", flush=True)
+
+
+# [DSv4-ampere debug] SCALES-REGION anomaly watch.
+# The corruption signature (confirmed by NAN_SLOT_DIAG across many logs) is
+# `scales=[0]*8` (all-zero UE8M0 scale bytes) WITH non-zero fp8 data in the
+# SAME slot -- impossible from a single correct compressor write (which sets
+# both atomically to ~119-ish). A correct write is scale byte ~= 119 for an
+# RMSNorm'd value. So zero-scales-with-real-fp8 means the SCALES REGION was
+# CLOBBERED by a separate write (stale recycled block / cross-cache alias /
+# sliding-window free-realloc returning an un-zeroed block to the shared pool).
+# STEP_WATCH scans the bf16-RoPE region and can MISS this (the rope may stay
+# finite while only the scales zero out). This watch scans the SCALES region
+# directly and detects the exact (step, layer, slot) where the anomaly first
+# appears, with a bounded ring buffer: we only log on anomaly ONSET or growth,
+# flushing the last N (step,layer,n_anomaly) snapshots so the transition is
+# visible without per-step log spam.
+_SCALES_WATCH_STEP: int = 0
+_SCALES_WATCH_RING: collections.deque = collections.deque(maxlen=12)
+_SCALES_WATCH_PREV_N: dict = {}   # prefix -> previous anomaly count
+_SCALES_WATCH_FIRED: dict = {}    # prefix -> bool (one detailed dump)
+_SCALES_WATCH_ERR: bool = False
+_SCALES_WATCH_PREV_BLOCKS: dict = {}  # prefix -> set(prev phys_block ids)
+
+
+def _scales_anomaly_watch(
+    cache, prefix="", block_table=None, seq_lens=None, compress_ratio=4
+) -> None:
+    """Scan the main-MLA SCALES region of active blocks; detect zero-scales-
+    with-real-fp8 anomaly. Bounded logging via ring buffer (flush on onset)."""
+    global _SCALES_WATCH_STEP, _SCALES_WATCH_ERR
+    import os
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if cache is None:
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    _SCALES_WATCH_STEP += 1
+    try:
+        block_size = cache.shape[1]          # 64 (storage_block_size)
+        s0 = cache.stride(0)                 # packed block stride (bytes)
+        st = cache.untyped_storage()
+        n_elem = st.nbytes() // cache.element_size()
+        flat = torch.empty(0, dtype=cache.dtype, device=cache.device)
+        flat.set_(st, 0, (n_elem,), (1,))
+        base = cache.storage_offset()
+        if block_table is None or block_table.numel() == 0:
+            return
+        bt = block_table.detach().reshape(-1)
+        phys_blocks = torch.unique(bt[bt > 0])
+        if phys_blocks.numel() == 0:
+            return
+        # Per-slot byte offsets within the packed block.
+        #   token DATA region:   pb*s0 + pos*576        (fp8 NoPE at +0)
+        #   scales region:       pb*s0 + block_size*576 + pos*SCALE_DIM
+        #                        = pb*s0 + 36864 + pos*8   (SCALE_DIM=8)
+        pos_arange = torch.arange(block_size, device=cache.device, dtype=torch.int64)
+        SCALE_DIM = 8
+        tok_base = (phys_blocks[:, None] * s0
+                    + pos_arange[None, :] * 576)        # (nblk, bs) fp8 start
+        scale_base = (phys_blocks[:, None] * s0
+                      + block_size * 576
+                      + pos_arange[None, :] * SCALE_DIM)  # (nblk, bs) scale start
+        # sample 8 fp8 bytes (token data) + 8 scale bytes per slot
+        eight = torch.arange(8, device=cache.device, dtype=torch.int64)
+        fp8_idx = (tok_base.reshape(-1)[:, None] + eight[None, :]).reshape(-1) + base
+        sc_idx = (scale_base.reshape(-1)[:, None] + eight[None, :]).reshape(-1) + base
+        fp8_bytes = flat[fp8_idx].view(torch.uint8).reshape(-1, 8)   # (N,8)
+        sc_bytes = flat[sc_idx].view(torch.uint8).reshape(-1, 8)     # (N,8)
+        # Anomaly: all 8 scale bytes zero AND at least one fp8 byte non-zero.
+        scales_zero = (sc_bytes == 0).all(dim=1)
+        fp8_real = (fp8_bytes != 0).any(dim=1)
+        anomaly = scales_zero & fp8_real                       # (N,)
+        slot_ids = (phys_blocks[:, None] * block_size
+                    + pos_arange[None, :]).reshape(-1)         # (N,)
+        n_anom = int(anomaly.sum().item())
+        n_scanned = anomaly.numel()
+
+        # Bounded logging: push (step,layer,n_anom) to ring; only print on
+        # ONSET (first non-zero for this prefix) or GROWTH vs previous.
+        prev_n = _SCALES_WATCH_PREV_N.get(prefix, 0)
+        _SCALES_WATCH_PREV_N[prefix] = n_anom
+        layer_idx = prefix
+        _SCALES_WATCH_RING.append((_SCALES_WATCH_STEP, layer_idx, n_anom))
+        # Block-newness: detect reallocated blocks (user hypothesis: the
+        # compressor state-cache sliding window frees blocks to the SHARED
+        # pool un-zeroed; main-MLA reallocs a stale block -> zero-scales
+        # anomaly on a NEWLY-SEEN physical block).
+        cur_blocks_set = set(int(b) for b in phys_blocks.tolist())
+        prev_blocks_set = _SCALES_WATCH_PREV_BLOCKS.get(prefix, set())
+        new_blocks = cur_blocks_set - prev_blocks_set
+        gone_blocks = prev_blocks_set - cur_blocks_set
+        _SCALES_WATCH_PREV_BLOCKS[prefix] = cur_blocks_set
+        realloc_str = ""
+        if new_blocks or gone_blocks:
+            realloc_str = (f" blocks_new={sorted(new_blocks)[:8]}"
+                           f" blocks_freed={sorted(gone_blocks)[:8]}")
+        if n_anom > 0 and (prev_n == 0 or not _SCALES_WATCH_FIRED.get(prefix)):
+            _SCALES_WATCH_FIRED[prefix] = True
+            anom_slots = slot_ids[anomaly][:24].tolist()
+            # Were any anomaly blocks freshly reallocated?
+            anom_block_ids = set(int(s) // block_size for s in anom_slots)
+            anom_on_new = sorted(anom_block_ids & new_blocks)[:8]
+            new_flag = (f" anomaly_on_NEWLY_ALLOC_blocks={anom_on_new}"
+                        if anom_on_new else "")
+            print(
+                f"[SCALES_WATCH ### ONSET step {_SCALES_WATCH_STEP} ### "
+                f"{prefix} ###] ZERO-SCALES-WITH-REAL-FP8 anomaly on "
+                f"{n_anom}/{n_scanned} slots; anomaly_slots={anom_slots}"
+                f" phys_blocks={phys_blocks[:12].tolist()}"
+                f"{realloc_str}{new_flag}",
+                flush=True,
+            )
+            # Flush the ring buffer so the transition (clean->anomaly) is visible.
+            ring_str = " | ".join(
+                f"s{s}#{lyr[:24]}:{n}" for s, lyr, n in _SCALES_WATCH_RING
+            )
+            print(f"[SCALES_WATCH ring] {ring_str}", flush=True)
+        elif n_anom > prev_n and n_anom > 0:
+            # Growth: brief one-liner (capped frequency by ring).
+            print(
+                f"[SCALES_WATCH growth step {_SCALES_WATCH_STEP} ### {prefix} ###] "
+                f"{prev_n}->{n_anom}{realloc_str}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        if not _SCALES_WATCH_ERR:
+            _SCALES_WATCH_ERR = True
+            print(f"[SCALES_WATCH] failed: {e}", flush=True)
+
+
+# [DSv4-ampere debug] Block-lifecycle watch: visualize the compressor state
+# cache's sliding-window free/realloc (sliding_window=8 for C4A) and confirm
+# the user's hypothesis that freed blocks return to the SHARED pool un-zeroed
+# and get reallocated. Logs only for layer 0 (prefix ends with '.0.attn' or
+# the first MLA layer) to avoid 43x spam, and only when the block_table
+# CHANGES (new/freed physical blocks) -- so output is bounded to ~1 line per
+# reallocation event (every ~8 tokens), not per step.
+_BLOCK_LIFE_PREV: dict = {}   # prefix -> set(prev phys_block ids)
+_BLOCK_LIFE_STEP: int = 0
+_BLOCK_LIFE_ERR: bool = False
+_BLOCK_LIFE_LOGGER: str | None = None  # the single designated logging prefix
+
+
+def _block_lifecycle_watch(prefix="", block_table=None, max_lines: int = 40) -> None:
+    global _BLOCK_LIFE_STEP, _BLOCK_LIFE_ERR, _BLOCK_LIFE_LOGGER
+    import os
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1":
+        return
+    if block_table is None or block_table.numel() == 0:
+        return
+    # Designate ONE MLA layer as the logger (the first one with active blocks)
+    # to avoid duplicating the same block_table view across all MLA layers.
+    if _BLOCK_LIFE_LOGGER is None:
+        bt0 = block_table.detach().reshape(-1)
+        if int((bt0 > 0).sum().item()) > 0:
+            _BLOCK_LIFE_LOGGER = prefix
+    if prefix != _BLOCK_LIFE_LOGGER:
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    _BLOCK_LIFE_STEP += 1
+    try:
+        bt = block_table.detach().reshape(-1)
+        cur = set(int(b) for b in bt[bt > 0].tolist())
+        prev = _BLOCK_LIFE_PREV.get(prefix)
+        _BLOCK_LIFE_PREV[prefix] = cur
+        if prev is None:
+            print(f"[BLOCK_LIFE init step {_BLOCK_LIFE_STEP} ### {prefix} ###] "
+                  f"initial blocks={sorted(cur)}", flush=True)
+            return
+        new = cur - prev
+        gone = prev - cur
+        if new or gone:
+            if _BLOCK_LIFE_STEP <= max_lines * 1000:  # hard cap on total lines
+                print(
+                    f"[BLOCK_LIFE step {_BLOCK_LIFE_STEP} ### {prefix} ###] "
+                    f"new={sorted(new)} freed={sorted(gone)} "
+                    f"cur_n={len(cur)} prev_n={len(prev)}",
+                    flush=True,
+                )
+    except Exception as e:  # noqa: BLE001
+        if not _BLOCK_LIFE_ERR:
+            _BLOCK_LIFE_ERR = True
+            print(f"[BLOCK_LIFE] failed: {e}", flush=True)
 
 
 def _swa_write_nan_probe(
@@ -519,6 +713,20 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             except Exception:
                 pass
             _step_watch_cache_nan(kv_cache, self.prefix, _dslot, _bt)
+            # [DSv4-ampere debug] SCALES-REGION anomaly watch: detects the
+            # zero-scales-with-real-fp8 signature (the confirmed corruption
+            # mode that STEP_WATCH's rope scan can miss) and localizes the
+            # exact (step, layer) of onset via a bounded ring buffer.
+            _scales_anomaly_watch(
+                kv_cache,
+                self.prefix,
+                _bt,
+                getattr(swa_metadata, "seq_lens", None),
+                self.compress_ratio,
+            )
+            # [DSv4-ampere debug] Block-lifecycle watch: visualize sliding-
+            # window free/realloc of the shared block pool (user hypothesis).
+            _block_lifecycle_watch(self.prefix, _bt)
 
         topk_indices = None
         topk_lens = None
