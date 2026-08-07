@@ -123,16 +123,26 @@ def _nan_slot_diagnostic(topk_buf_3d, topk_idx_2d, topk_lens, kv_cache):
 
         # fp8 NoPE bytes (448) -> check for NaN/Inf encoding (e4m3fn: 0x7F,0xFF)
         fp8_bytes = flat[tok_base:tok_base + 448].to(torch.uint8)
-        fp8_nan_bytes = int(((fp8_bytes == 0x7F) | (fp8_bytes == 0xFF)).sum().item())
+        fp8_nan_byte_mask = (fp8_bytes == 0x7F) | (fp8_bytes == 0xFF)
+        fp8_nan_bytes = int(fp8_nan_byte_mask.sum().item())
+        # DISAMBIGUATION: is this slot UNWRITTEN (all-zero except NaN scribbles)
+        # or WRITTEN-WITH-NaN-INPUT (many nonzero fp8 + scale 0 from NaN exponent)?
+        # A NaN-input write produces fp8 bytes 0x7F/0xFF for MOST elements; an
+        # unwritten slot is all 0x00 except sparse OOB scribbles. Count nonzero
+        # (non-NaN-encoding) fp8 bytes + nonzero bf16 RoPE values.
+        fp8_nonzero = int(((fp8_bytes != 0x00) & (~fp8_nan_byte_mask)).sum().item())
+        fp8_zero = int((fp8_bytes == 0x00).sum().item())
         # bf16 RoPE (64 values)
         rope_vals = flat[tok_base + 448:tok_base + 576].view(torch.bfloat16).float()
         rope_nf = bool((torch.isnan(rope_vals) | torch.isinf(rope_vals)).any().item())
         rope_nan = int(torch.isnan(rope_vals).sum().item())
         rope_inf = int(torch.isinf(rope_vals).sum().item())
+        rope_nonzero = int(((rope_vals != 0.0) & torch.isfinite(rope_vals)).sum().item())
         # scales (8 bytes) -> flag overflow (byte 255 -> 2^128)
         scale_bytes = flat[scale_base:scale_base + 8].to(torch.uint8)
         scale_list = scale_bytes.tolist()
         has_overflow_scale = any(b >= 250 for b in scale_list)
+        all_scales_zero = all(b == 0 for b in scale_list)
 
         # If the NaN col is fp8 NoPE, report that exact stored byte + its scale
         fp8_detail = ""
@@ -150,18 +160,33 @@ def _nan_slot_diagnostic(topk_buf_3d, topk_idx_2d, topk_lens, kv_cache):
 
         storage_verdict = ("STORAGE_HAS_NaN" if (fp8_nan_bytes or rope_nan)
                            else "STORAGE_CLEAN")
+        # DISAMBIGUATION verdict: unwritten vs written-with-NaN-input.
+        # all_scales_zero AND (fp8 nearly all zero) => UNWRITTEN (OOB scribble).
+        # nonzero fp8/rope data present => WRITTEN (NaN input => downstream).
+        slot_kind = ("UNWRITTEN" if (all_scales_zero and fp8_nonzero == 0
+                                      and rope_nonzero == 0)
+                     else "WRITTEN-DATA-PRESENT")
         if storage_verdict == "STORAGE_HAS_NaN":
-            interp = ("(A) DATA-NaN: slot corrupted between write~2010 and "
-                      "read~2053 by an OOB write -> all-layers STEP_WATCH finds the planting step")
+            if slot_kind == "UNWRITTEN":
+                interp = ("(A1) DATA-NaN in UNWRITTEN slot: zero-init slot had "
+                          "NaN SCRIBBLED by an OOB write (sparse: only "
+                          f"{fp8_nan_bytes} fp8 + {rope_nan} rope NaN bytes). "
+                          "Root = OOB write + indexer selecting unwritten slot.")
+            else:
+                interp = ("(A2) DATA-NaN in WRITTEN slot: nonzero fp8/rope data "
+                          "present => compressor WROTE this slot with NaN INPUT "
+                          "(residual already NaN) => DOWNSTREAM symptom, not root.")
         else:
             interp = ("(B) GATHER-NaN: storage clean; gather/dequant kernel "
                       "produced NaN from clean data -> read-side kernel bug")
         print(
             f"[NAN_SLOT_DIAG] slot_id={slot_id} (block={block_idx} pos={pos}) "
             f"gathered_nNaN={n_nan} first_nan_col={first_nan_col} region={region}\n"
-            f"  -> STORAGE: {storage_verdict} | fp8_nan_bytes={fp8_nan_bytes} "
-            f"rope_nan={rope_nan} rope_inf={rope_inf} "
-            f"scales={scale_list} overflow_scale={has_overflow_scale}"
+            f"  -> STORAGE: {storage_verdict} | slot_kind={slot_kind} | "
+            f"fp8_nan_bytes={fp8_nan_bytes} fp8_nonzero={fp8_nonzero} "
+            f"fp8_zero={fp8_zero} rope_nan={rope_nan} rope_inf={rope_inf} "
+            f"rope_nonzero={rope_nonzero} scales={scale_list} "
+            f"all_scales_zero={all_scales_zero} overflow_scale={has_overflow_scale}"
             f"{fp8_detail}{rope_detail}\n"
             f"  -> {interp}",
             flush=True,
