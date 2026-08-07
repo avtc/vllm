@@ -591,6 +591,67 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
+            # [DSv4-ampere debug] Decide whether common_attn_metadata.slot_mapping
+            # (what the COMPRESSOR writes with) is RAW input-position slots or
+            # already COMPRESSED (pos//4). The indexer assumes common is RAW
+            # (it remaps via get_compressed_slot_mapping). If common is already
+            # compressed, get_compressed would double-divide (wrong) => so this
+            # comparison resolves the compressor-slot_mapping question for sure:
+            #   common != compressed => common is RAW => compressor writes raw
+            #     slots into a compressed cache (suspect).
+            #   common == compressed => common is already compressed =>
+            #     compressor is fine, look elsewhere.
+            # One-shot, rank0, decode only.
+            import os as _os_map
+            if (
+                _os_map.environ.get("VLLM_SM86_NAN_PROBE") == "1"
+                and num_decode_tokens > 0
+                and not getattr(self, "_slot_map_probe_done", False)
+            ):
+                _rank_ok = True
+                try:
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and torch.distributed.get_rank() != 0
+                    ):
+                        _rank_ok = False
+                except Exception:
+                    pass
+                if _rank_ok:
+                    try:
+                        self._slot_map_probe_done = True
+                        _n = min(8, num_decode_tokens)
+                        _common = (
+                            slot_mapping[:_n].detach().cpu().tolist()
+                            if slot_mapping.numel() else []
+                        )
+                        _comp = (
+                            compressed_slot_mapping[:_n].detach().cpu().tolist()
+                            if compressed_slot_mapping.numel() else []
+                        )
+                        _sl = (
+                            seq_lens[:max(1, num_decodes)].detach().cpu().tolist()
+                            if seq_lens.numel() else []
+                        )
+                        _bt0 = (
+                            block_table[0, :8].detach().cpu().tolist()
+                            if block_table.numel() else []
+                        )
+                        _same = "SAME" if _common == _comp else "DIFFER"
+                        print(
+                            f"[SLOT_MAP_PROBE] compress_ratio={self.compress_ratio} "
+                            f"storage_block_size={self.kv_cache_spec.storage_block_size} "
+                            f"num_decode_tokens={num_decode_tokens} "
+                            f"seq_lens={_sl} block_table[0,:8]={_bt0}\n"
+                            f"  common_slot_mapping[:{_n}]  (compressor writes) = {_common}\n"
+                            f"  compressed_slot_mapping[:{_n}] (indexer uses)    = {_comp}\n"
+                            f"  => common is {'COMPRESSED (compressor OK)' if _same == 'SAME' else 'RAW (compressor SUSPECT)'}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+
         prefill_metadata = None
         if num_prefills > 0:
             # This CPU value is an upper bound for async-spec extend rows.  It
