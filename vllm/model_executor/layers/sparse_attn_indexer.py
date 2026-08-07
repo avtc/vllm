@@ -756,10 +756,18 @@ def sparse_attn_indexer(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
+        # [DSv4-ampere debug] VLLM_SM86_TOPK_REF=1 forces the deterministic
+        # top_k_per_row_decode (insertion/radix-sort) C++ op instead of the
+        # persistent_topk radix kernel. Removes the gratuitous tie-breaking
+        # divergence among the three topk algorithms. Inert when unset:
+        # Hopper still uses cooperative_topk (use_cooperative_topk takes
+        # priority), Ampere still uses persistent_topk.
+        import os as _os_topk
+        _force_topk_ref = _os_topk.environ.get("VLLM_SM86_TOPK_REF") == "1"
+        use_persistent_topk = (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and not _force_topk_ref
         )
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()
