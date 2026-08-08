@@ -61,14 +61,13 @@ def _e4m3_to_fp32(x):
     exp = (xb >> 3) & 0xF
     mant = xb & 0x7
     # 2^(exp-7) as fp32 bits: unbiased exp k=exp-7 -> fp32 bits (127+k)<<23,
-    # i.e. (120+exp)<<23. Valid for exp in 1..15 (fp32 normal range).
+    # i.e. (120+exp)<<23 (exp is a tensor, so this stays a tensor). Valid for
+    # exp in 1..15 (fp32 normal range).
     pow2_bits = ((exp + 120) << 23).to(tl.uint32)
     pow2 = pow2_bits.to(tl.float32, bitcast=True)
     normal = pow2 * (1.0 + mant.to(tl.float32) * 0.125)
-    # subnormal: mant * 2^-9, i.e. 2^-9 -> fp32 bits (127-9)<<23 = 118<<23.
-    pow2_sub_bits = (118 << 23).to(tl.uint32)
-    pow2_sub = pow2_sub_bits.to(tl.float32, bitcast=True)
-    sub = mant.to(tl.float32) * pow2_sub
+    # subnormal: mant * 2^-9 (literal scalar; 2^-9 == 0.001953125).
+    sub = mant.to(tl.float32) * 0.001953125
     val = tl.where(exp == 0, sub, normal)
     return tl.where(sign == 1, -val, val)
 
