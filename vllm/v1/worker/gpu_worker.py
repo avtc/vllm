@@ -808,9 +808,37 @@ class Worker(WorkerBase):
         _has_init = hasattr(self.model_runner, "_init_kv_zero_meta")
         logger.info(
             "[COMPRESSED_ZERO] gpu_worker gate: needs_kv_cache_zeroing=%s "
-            "has_init_kv_zero_meta=%s",
+            "has_init_kv_zero_meta=%s has_compressed_kv_layers=%s "
+            "n_kv_cache_groups=%d",
             _needs_zero, _has_init,
+            kv_cache_config.has_compressed_kv_layers,
+            len(kv_cache_config.kv_cache_groups),
         )
+        # One-shot spec inventory: dumps each group's spec TYPE, its
+        # compress_ratio (via getattr, as the property does), and -- if the
+        # spec is a UniformTypeKVCacheSpecs wrapper (which does not expose
+        # compress_ratio itself) -- the inner children's types + ratios. This
+        # verifies whether DSv4 groups are wrapped and whether the gate sees
+        # the real compress_ratio. Essential to confirm the root-cause fix.
+        for i, g in enumerate(kv_cache_config.kv_cache_groups):
+            spec = g.kv_cache_spec
+            cr = getattr(spec, "compress_ratio", "<none>")
+            inner = getattr(spec, "kv_cache_specs", None)
+            if inner:
+                kids = ", ".join(
+                    f"{type(c).__name__}(cr={getattr(c,'compress_ratio','?')})"
+                    for c in inner.values()
+                )
+                logger.info(
+                    "[COMPRESSED_ZERO] group[%d] spec=%s cr=%s "
+                    "UNIFORM-wrapper children=[%s]",
+                    i, type(spec).__name__, cr, kids,
+                )
+            else:
+                logger.info(
+                    "[COMPRESSED_ZERO] group[%d] spec=%s cr=%s",
+                    i, type(spec).__name__, cr,
+                )
         if _needs_zero and _has_init:
             self.model_runner._init_kv_zero_meta()
 
