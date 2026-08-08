@@ -6650,6 +6650,12 @@ class GPUModelRunner(
                     # budget — otherwise they'd load during capture_model, after
                     # KV is allocated (unreserved → OOM risk).
                     do_capture = envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                    logger.info(
+                        "[cg-probe] mode=%s do_capture=%s "
+                        "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=%s)",
+                        mode.name, do_capture,
+                        envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS,
+                    )
                     for i, desc in enumerate(profile_descs):
                         mem_before = torch.accelerator.get_memory_info()[0]
                         self._warmup_and_capture(
@@ -6668,6 +6674,12 @@ class GPUModelRunner(
                         torch.accelerator.synchronize()
                         free_after = torch.accelerator.get_memory_info()[0]
                         mem_samples.append(mem_before - free_after)
+                        logger.info(
+                            "[cg-probe]   desc[%d] num_tokens=%d mode=%s "
+                            "capture=%s mem_delta=%.2f MiB",
+                            i, desc.num_tokens, mode.name, do_capture,
+                            (mem_before - free_after) / (1 << 20),
+                        )
 
                     first_capture = mem_samples[0]
                     # Use at least 1 MiB per graph for driver overhead
@@ -6814,6 +6826,11 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        logger.info(
+            "[cg-probe] _warmup_and_capture enter num_tokens=%d mode=%s "
+            "capture=%s warmups=%d",
+            desc.num_tokens, cudagraph_runtime_mode.name, capture, num_warmups,
+        )
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -6834,7 +6851,12 @@ class GPUModelRunner(
             # but no throwaway graph is captured/ measured/cleared (that probe
             # graph is pure overhead when its estimate is discarded). The real
             # graphs are still built later by capture_model after KV init.
+            logger.info(
+                "[cg-probe]   warmup-only -> skip throwaway graph capture "
+                "(no graph built; estimate will be ~0)"
+            )
             return
+        logger.info("[cg-probe]   capturing graph (is_graph_capturing=True)...")
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -6846,6 +6868,7 @@ class GPUModelRunner(
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
         )
+        logger.info("[cg-probe]   graph captured (num_tokens=%d)", desc.num_tokens)
 
     def _capture_cudagraphs(
         self,
