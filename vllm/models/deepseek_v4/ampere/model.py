@@ -83,14 +83,17 @@ def _probe_layers() -> bool:
 # kernel time to the decoder phases (indexer, compressor, sparse-decode, MoE,
 # per-layer) in the chrome/nsys trace. Must be OFF during steady-state (the
 # record_function itself is cheap, but we keep it off to avoid any capture
-# interaction in FULL mode).
+# interaction in FULL mode). The env var is read ONCE at import (cached) so
+# the per-call cost is a boolean check, not a dict lookup (5x43 calls/step).
 import contextlib as _dsv4_ctxlib
 import os as _dsv4_os
+
+_DSV4_TRACE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1"
 
 
 def _dsv4_trace(name: str):
     """Return a record_function context if VLLM_DSV4_TRACE=1, else nullcontext."""
-    if _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1":
+    if _DSV4_TRACE_ON:
         return torch.profiler.record_function(name)
     return _dsv4_ctxlib.nullcontext()
 
