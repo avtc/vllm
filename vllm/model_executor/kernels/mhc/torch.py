@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.model_executor.kernels.mhc.sinkhorn import (
+    _fuse_sinkhorn_enabled,
+    _fused_comb_mix,
+)
+
 
 def mhc_pre_torch(
     residual: torch.Tensor,
@@ -72,14 +77,30 @@ def mhc_pre_torch(
     )
     post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
 
-    comb_logits = mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[
-        2
-    ] + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
-    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+    # Fused softmax + Sinkhorn: the reference runs a 19-iter Python loop of tiny
+    # sum/div kernels (~114 launches) on a 16-element matrix -- a dominant source
+    # of decode glue. Fuse into one Triton kernel (16 floats in registers).
+    # Set VLLM_DSV4_FUSE_SINKHORN=0 to restore the Python loop (A/B verify).
+    if _fuse_sinkhorn_enabled():
+        comb_mix_flat = _fused_comb_mix(
+            mixes[:, 2 * hc_mult :],          # [N, hc_mult*hc_mult]
+            hc_base[2 * hc_mult :],           # [hc_mult*hc_mult]
+            hc_scale[2],
+            hc_sinkhorn_eps,
+            sinkhorn_repeat,
+            hc_mult,
+        )
+        comb_mix = comb_mix_flat.view(num_tokens, hc_mult, hc_mult)
+    else:
+        comb_logits = (
+            mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
+            + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+        )
+        comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
         comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+            comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
