@@ -804,9 +804,14 @@ class Worker(WorkerBase):
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
-        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
-            self.model_runner, "_init_kv_zero_meta"
-        ):
+        _needs_zero = kv_cache_config.needs_kv_cache_zeroing
+        _has_init = hasattr(self.model_runner, "_init_kv_zero_meta")
+        logger.info(
+            "[COMPRESSED_ZERO] gpu_worker gate: needs_kv_cache_zeroing=%s "
+            "has_init_kv_zero_meta=%s",
+            _needs_zero, _has_init,
+        )
+        if _needs_zero and _has_init:
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")

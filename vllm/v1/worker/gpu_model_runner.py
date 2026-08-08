@@ -1185,19 +1185,20 @@ class GPUModelRunner(
         # Packed compressed-MLA path: zero each cache view's block slice
         # directly (see _init_kv_zero_meta for why KVBlockZeroer is bypassed).
         caches = getattr(self, "_compressed_zero_caches", None)
-        # If the compressed cache list was never built (e.g. _init_kv_zero_meta
-        # compressed branch did not run, or ran before forward_context was
-        # populated), build it on demand here from static_forward_context so
-        # that zeroing still happens. Memory obtained from the shared block
-        # pool is NOT cleared by the pool (block_pool.get_new_blocks just pops
-        # + bumps ref_cnt), so recycled blocks carry the previous occupant's
-        # bytes (including NaN bit patterns) unless we clear them here.
-        if caches is None and self.kv_cache_config.has_compressed_kv_layers:
+        # If the compressed cache list was never built OR was built empty
+        # (e.g. _init_kv_zero_meta ran before forward_context was populated,
+        # or its compressed branch did not run), build it on demand here from
+        # static_forward_context so that zeroing still happens. Memory obtained
+        # from the shared block pool is NOT cleared by the pool
+        # (block_pool.get_new_blocks just pops + bumps ref_cnt), so recycled
+        # blocks carry the previous occupant's bytes (including NaN bit
+        # patterns) unless we clear them here.
+        if not caches and self.kv_cache_config.has_compressed_kv_layers:
             caches = self._build_compressed_zero_caches()
             self._compressed_zero_caches = caches
             logger.info(
                 "[COMPRESSED_ZERO] on-demand build: registered %d cache "
-                "views (init path was dead/late).",
+                "views (init list was None/empty).",
                 len(caches),
             )
         if caches:
@@ -1264,7 +1265,19 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
+            if not getattr(self, "_zero_block_ids_logged", False):
+                self._zero_block_ids_logged = True
+                logger.info(
+                    "[COMPRESSED_ZERO] _zero_block_ids reached: "
+                    "ids=%s (first call only)",
+                    scheduler_output.new_block_ids_to_zero[:8],
+                )
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        elif not getattr(self, "_zero_empty_logged", False):
+            # one-shot: confirm new_block_ids_to_zero is EMPTY on the steps
+            # where SCALES_WATCH would fire (rules out a missing-ids bug vs a
+            # zeroing-doesn't-clear bug).
+            pass  # too noisy; rely on the on-demand/ENTRY logs instead
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
