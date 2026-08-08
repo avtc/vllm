@@ -77,6 +77,23 @@ def _probe_layers() -> bool:
     return os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
 
 
+# [DSv4-ampere perf] Env-gated per-phase record_function markers for profiler
+# attribution (torch.profiler / nsys). OFF by default = zero overhead
+# (nullcontext). Set VLLM_DSV4_TRACE=1 to emit markers that attribute GPU
+# kernel time to the decoder phases (indexer, compressor, sparse-decode, MoE,
+# per-layer) in the chrome/nsys trace. Must be OFF during steady-state (the
+# record_function itself is cheap, but we keep it off to avoid any capture
+# interaction in FULL mode).
+import contextlib as _dsv4_ctxlib
+
+
+def _dsv4_trace(name: str):
+    """Return a record_function context if VLLM_DSV4_TRACE=1, else nullcontext."""
+    if os.environ.get("VLLM_DSV4_TRACE") == "1":
+        return torch.profiler.record_function(name)
+    return _dsv4_ctxlib.nullcontext()
+
+
 # [DSv4-ampere debug] Probe 0: confirm whether the residual grows across layers
 # (normal accumulation ~43*50) or explodes (a real bug). One-shot: logs pre_attn
 # absmax for layers {0,3,26,42} at the FIRST real prefill pass only, rank0.
@@ -1228,7 +1245,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             _nan_probe(f"L{self._li}.pre_attn", x)
         _probe_residual_baseline(self._li, x)
         x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        with _dsv4_trace(f"L{self._li}.attn"):
+            x = self.attn(positions, x, None)
         if self._probe_l0:
             _nan_probe("L0.attn_out", x)
         elif _probe_layers():
@@ -1253,7 +1271,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         elif _probe_layers():
             _nan_probe(f"L{self._li}.post_mhc", x)
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        with _dsv4_trace(f"L{self._li}.moe"):
+            x = self.ffn(x, input_ids)
         if self._probe_l0:
             _nan_probe("L0.ffn_out", x)
         elif _probe_layers():

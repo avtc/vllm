@@ -39,6 +39,20 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+# [DSv4-ampere perf] Env-gated per-phase record_function markers (VLLM_DSV4_TRACE=1).
+# Self-contained (no import from model.py to avoid circular import). Same env var.
+import contextlib as _dsv4_ctxlib
+import os as _dsv4_os
+
+
+def _dsv4_trace(name: str):
+    """record_function context if VLLM_DSV4_TRACE=1, else nullcontext."""
+    if _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1":
+        import torch
+        return torch.profiler.record_function(name)
+    return _dsv4_ctxlib.nullcontext()
+
+
 # [DSv4-ampere debug] One-shot probe for the SWA (sliding-window) KV-cache WRITE.
 # The SWA cache stores UN-NORMALIZED RoPE-applied KV; the bf16 RoPE portion is
 # copied verbatim by quantize_and_insert_k_kernel. swa_dequant showed nan=64
@@ -738,13 +752,14 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
-                global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
-                )
+                with _dsv4_trace(f"{self.prefix}.indexer_topk"):
+                    global_indices, topk_lens = compute_global_topk_indices_and_lens(
+                        self.topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        is_valid,
+                    )
                 # Uniform-width buffer (PR #44573): under DCP the local topk
                 # width varies per rank; keep the full buffer width, -1 padded.
                 topk_indices = self.topk_indices_buffer[:num_decode_tokens]
@@ -800,20 +815,21 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             )
             return
 
-        out_attn, lse = ampere_sparse_decode_fp8(
-            q=q,
-            kv_cache=kv_cache,
-            swa_kv_cache=self.swa_cache_layer.kv_cache,
-            swa_only=swa_only,
-            topk_indices=topk_indices,
-            topk_lens=topk_lens,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
-            softmax_scale=self.scale,
-            head_dim=self.head_dim,
-            nope_head_dim=self.nope_head_dim,
-            rope_head_dim=self.rope_head_dim,
-        )
+        with _dsv4_trace(f"{self.prefix}.sparse_decode"):
+            out_attn, lse = ampere_sparse_decode_fp8(
+                q=q,
+                kv_cache=kv_cache,
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                swa_only=swa_only,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                softmax_scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+            )
         if use_dcp:
             dcp_merge_flashmla_output(
                 out_attn[:, :num_real_heads, :],

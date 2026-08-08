@@ -50,6 +50,17 @@ _COMPRESSOR_NAN_PROBE_FIRED: dict[str, bool] = {}
 _COMPRESSOR_READBACK_CONFIRMED: dict[str, bool] = {}
 
 
+# [DSv4-ampere perf] Env-gated record_function marker (VLLM_DSV4_TRACE=1).
+import contextlib as _dsv4_ctxlib
+
+
+def _dsv4_trace(name: str):
+    """record_function context if VLLM_DSV4_TRACE=1, else nullcontext."""
+    if os.environ.get("VLLM_DSV4_TRACE") == "1":
+        return torch.profiler.record_function(name)
+    return _dsv4_ctxlib.nullcontext()
+
+
 def _compressor_nan_probe(
     prefix: str,
     kv_score: torch.Tensor,
@@ -573,31 +584,32 @@ class DeepseekCompressor(nn.Module):
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
-        compress_norm_rope_store_fn(
-            state_cache=state_cache,
-            num_actual=num_actual,
-            token_to_req_indices=token_to_req_indices,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            block_size=block_size,
-            state_width=state_width,
-            cos_sin_cache=cos_sin_cache,
-            kv_cache=kv_cache,
-            k_cache_metadata=k_cache_metadata,
-            pdl_kwargs=pdl_kwargs,
-            head_dim=self.head_dim,
-            rope_head_dim=self.rope_head_dim,
-            compress_ratio=self.compress_ratio,
-            overlap=self.overlap,
-            use_fp4_cache=self.use_fp4_cache,
-            rms_norm_weight=self.norm.weight,
-            rms_norm_eps=self.rms_norm_eps,
-            quant_block=self._quant_block,
-            token_stride=self._token_stride,
-            scale_dim=self._scale_dim,
-            **extra_kwargs,
-        )
+        with _dsv4_trace(f"{self.prefix}.compressor_store"):
+            compress_norm_rope_store_fn(
+                state_cache=state_cache,
+                num_actual=num_actual,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=block_size,
+                state_width=state_width,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                k_cache_metadata=k_cache_metadata,
+                pdl_kwargs=pdl_kwargs,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                use_fp4_cache=self.use_fp4_cache,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_block=self._quant_block,
+                token_stride=self._token_stride,
+                scale_dim=self._scale_dim,
+                **extra_kwargs,
+            )
 
         # [DSv4-ampere debug] one-shot NaN probe on the compressor KV-cache write.
         _compressor_nan_probe(
