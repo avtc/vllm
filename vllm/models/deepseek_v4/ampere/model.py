@@ -85,11 +85,12 @@ def _probe_layers() -> bool:
 # record_function itself is cheap, but we keep it off to avoid any capture
 # interaction in FULL mode).
 import contextlib as _dsv4_ctxlib
+import os as _dsv4_os
 
 
 def _dsv4_trace(name: str):
     """Return a record_function context if VLLM_DSV4_TRACE=1, else nullcontext."""
-    if os.environ.get("VLLM_DSV4_TRACE") == "1":
+    if _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1":
         return torch.profiler.record_function(name)
     return _dsv4_ctxlib.nullcontext()
 
