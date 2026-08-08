@@ -275,6 +275,12 @@ class SingleTypeKVCacheManager(ABC):
             TQFullAttentionSpec,
             MLAAttentionSpec,
             HiddenStateCacheSpec,
+            # DSv4 SWA (SlidingWindowMLASpec) caches also read recycled
+            # blocks: a freshly-allocated block carries the previous
+            # occupant's bytes. Without zeroing, stale data (including NaN
+            # bit patterns) persists and corrupts SWA reads. Track SWA blocks
+            # so they enter new_block_ids_to_zero and get cleared on alloc.
+            SlidingWindowMLASpec,
         ):
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -308,6 +314,9 @@ class SingleTypeKVCacheManager(ABC):
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
                 HiddenStateCacheSpec,
+                # DSv4 SWA caches: see allocate_new_computed_blocks for why
+                # SlidingWindowMLASpec blocks must be tracked for zeroing.
+                SlidingWindowMLASpec,
             ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks

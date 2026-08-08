@@ -1109,6 +1109,18 @@ class GPUModelRunner(
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        # [DSv4-ampere diag] unconditional entry log: confirms this method runs
+        # and what the compressed-gate evaluates to. The prior [COMPRESSED_ZERO]
+        # init log only printed INSIDE the compressed branch, so its absence in
+        # the logs was ambiguous (method-not-called vs gate-false vs exception).
+        _has_compressed = self.kv_cache_config.has_compressed_kv_layers
+        _has_mamba = self.kv_cache_config.has_mamba_layers
+        _n_groups = len(self.kv_cache_config.kv_cache_groups)
+        logger.info(
+            "[COMPRESSED_ZERO] ENTRY: has_compressed_kv_layers=%s "
+            "has_mamba_layers=%s n_kv_cache_groups=%d",
+            _has_compressed, _has_mamba, _n_groups,
+        )
         # DeepSeek-V4 uses a *packed* KV cache layout where many layer views
         # are strided slices (stride(0) = full packed block stride) of a single
         # backing tensor. The general KVBlockZeroer derives each block's zeroing
@@ -1119,22 +1131,9 @@ class GPUModelRunner(
         # we therefore bypass KVBlockZeroer and zero each cache view directly:
         # ``cache[block_id].zero_()`` is bounded to exactly that layer's page
         # (e.g. 64*584 B for DSv4 MLA), which is correct regardless of packing.
-        if self.kv_cache_config.has_compressed_kv_layers:
+        if _has_compressed:
             self._kv_block_zeroer = None
-            self._compressed_zero_caches: list[torch.Tensor] = []
-            seen_ptrs: set[int] = set()
-            forward_context = self.compilation_config.static_forward_context
-            for layer_name in forward_context:
-                kv = getattr(forward_context[layer_name], "kv_cache", None)
-                # Skip non-tensor caches (e.g. Mamba state lists) and unbound
-                # defaults (empty placeholder tensors) that have no block dim.
-                if not isinstance(kv, torch.Tensor) or kv.dim() == 0 or kv.shape[0] == 0:
-                    continue
-                ptr = kv.data_ptr()
-                if ptr in seen_ptrs:
-                    continue
-                seen_ptrs.add(ptr)
-                self._compressed_zero_caches.append(kv)
+            self._compressed_zero_caches = self._build_compressed_zero_caches()
             logger.info(
                 "[COMPRESSED_ZERO] init: registered %d unique cache views "
                 "for block zeroing (has_compressed_kv_layers=True).",
@@ -1152,6 +1151,33 @@ class GPUModelRunner(
             static_forward_context=self.compilation_config.static_forward_context,
         )
 
+    def _build_compressed_zero_caches(self) -> list[torch.Tensor]:
+        """Collect unique KV cache tensor views for clear-on-alloc zeroing.
+
+        DeepSeek-V4 packs many layer cache views (main MLA + indexer +
+        compressor + SWA) as strided slices of one physical backing tensor,
+        all sharing the same block pool. ``cache[block_id].zero_()`` clears
+        exactly that view's page regardless of packing, so we collect every
+        unique (by data_ptr) cache tensor. Dedup by data_ptr because packed
+        views alias the same storage.
+        """
+        caches: list[torch.Tensor] = []
+        seen_ptrs: set[int] = set()
+        forward_context = self.compilation_config.static_forward_context
+        for layer_name in forward_context:
+            kv = getattr(forward_context[layer_name], "kv_cache", None)
+            # Skip non-tensor caches (e.g. Mamba state lists) and unbound
+            # defaults (empty placeholder tensors) that have no block dim.
+            if not isinstance(kv, torch.Tensor) or kv.dim() == 0 \
+                    or kv.shape[0] == 0:
+                continue
+            ptr = kv.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            caches.append(kv)
+        return caches
+
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids:
@@ -1159,6 +1185,21 @@ class GPUModelRunner(
         # Packed compressed-MLA path: zero each cache view's block slice
         # directly (see _init_kv_zero_meta for why KVBlockZeroer is bypassed).
         caches = getattr(self, "_compressed_zero_caches", None)
+        # If the compressed cache list was never built (e.g. _init_kv_zero_meta
+        # compressed branch did not run, or ran before forward_context was
+        # populated), build it on demand here from static_forward_context so
+        # that zeroing still happens. Memory obtained from the shared block
+        # pool is NOT cleared by the pool (block_pool.get_new_blocks just pops
+        # + bumps ref_cnt), so recycled blocks carry the previous occupant's
+        # bytes (including NaN bit patterns) unless we clear them here.
+        if caches is None and self.kv_cache_config.has_compressed_kv_layers:
+            caches = self._build_compressed_zero_caches()
+            self._compressed_zero_caches = caches
+            logger.info(
+                "[COMPRESSED_ZERO] on-demand build: registered %d cache "
+                "views (init path was dead/late).",
+                len(caches),
+            )
         if caches:
             if not getattr(self, "_compressed_zero_logged", False):
                 logger.info(
