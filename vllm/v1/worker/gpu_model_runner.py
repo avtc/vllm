@@ -4168,6 +4168,12 @@ class GPUModelRunner(
         val = os.environ.get("VLLM_DSV4_PROFILE")
         if not val:
             return
+        # NOTE: import torch.profiler FIRST. A later bare `import torch.profiler`
+        # would make Python treat `torch` as a function-local name for the whole
+        # function, breaking the `torch.distributed` reference below
+        # (UnboundLocalError). Importing it up front binds `torch` as local from
+        # the first line instead.
+        import torch.profiler  # noqa: F401  (ensures torch.profiler is loaded)
         try:
             active = int(val)
         except ValueError:
@@ -4182,7 +4188,6 @@ class GPUModelRunner(
         )
         if rank != 0:
             return
-        import torch.profiler
         out_dir = os.environ.get("VLLM_DSV4_PROFILE_DIR", ".")
         os.makedirs(out_dir, exist_ok=True)
 
