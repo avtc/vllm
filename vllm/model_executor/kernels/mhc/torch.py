@@ -5,6 +5,10 @@ import torch
 from vllm.model_executor.kernels.mhc.sinkhorn import (
     _fuse_sinkhorn_enabled,
     _fused_comb_mix,
+    _fuse_layer_input_enabled,
+    _fuse_mhc_post_enabled,
+    fused_layer_input,
+    fused_mhc_post,
 )
 
 
@@ -102,9 +106,15 @@ def mhc_pre_torch(
             comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
             comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
-    layer_input = torch.sum(
-        pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
-    ).to(torch.bfloat16)
+    # Fused layer_input: weighted sum of the hc_mult residual rows -> bf16.
+    # Reference: torch.sum(pre_mix.unsqueeze(-1) * residual.float, dim=1).to(bf16)
+    # (~5 kernels -> 1). VLLM_DSV4_FUSE_LAYER_INPUT=0 restores the torch path.
+    if _fuse_layer_input_enabled():
+        layer_input = fused_layer_input(pre_mix, residual_flat, hc_mult)
+    else:
+        layer_input = torch.sum(
+            pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
+        ).to(torch.bfloat16)
     return (
         post_mix.view(*outer_shape, hc_mult, 1),
         comb_mix.view(*outer_shape, hc_mult, hc_mult),
@@ -118,6 +128,14 @@ def mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    # Fused mhc_post: einsum(...ij,...ih->...jh) + post_term + add -> bf16 in one
+    # kernel (~8 kernels -> 1). VLLM_DSV4_FUSE_MHC_POST=0 restores the torch path.
+    if _fuse_mhc_post_enabled() and residual.dim() >= 2:
+        hc_mult = residual.shape[-2]
+        return fused_mhc_post(
+            comb_res_mix.to(torch.float32), residual, post_layer_mix.to(torch.float32),
+            x, hc_mult,
+        )
     mixed_residual = torch.einsum(
         "...ij,...ih->...jh",
         comb_res_mix.to(torch.float32),

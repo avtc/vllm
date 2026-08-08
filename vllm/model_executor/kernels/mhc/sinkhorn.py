@@ -89,3 +89,126 @@ def _fused_comb_mix(
 
 def _fuse_sinkhorn_enabled() -> bool:
     return os.environ.get("VLLM_DSV4_FUSE_SINKHORN", "1") == "1"
+
+
+def _fuse_layer_input_enabled() -> bool:
+    return os.environ.get("VLLM_DSV4_FUSE_LAYER_INPUT", "1") == "1"
+
+
+def _fuse_mhc_post_enabled() -> bool:
+    return os.environ.get("VLLM_DSV4_FUSE_MHC_POST", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Fused layer_input: out[n,h] = sum_i pre_mix[n,i] * residual[n,i,h] -> bf16.
+# Reference: torch.sum(pre_mix.unsqueeze(-1) * residual.float, dim=1).to(bf16)
+# ~5 kernels (unsqueeze, cast, mul, sum, cast) -> 1.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _layer_input_kernel(
+    pre_mix_ptr,    # [num_tokens, HC_MULT] fp32
+    residual_ptr,   # [num_tokens, HC_MULT, HIDDEN] bf16
+    out_ptr,        # [num_tokens, HIDDEN] bf16
+    stride_pm_n, stride_pm_m,
+    stride_r_n, stride_r_m, stride_r_h,
+    stride_o_n, stride_o_h,
+    HIDDEN: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    n = tl.program_id(0)
+    hb = tl.program_id(1)
+    h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    hmask = h < HIDDEN
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for i in tl.static_range(HC_MULT):
+        pm = tl.load(pre_mix_ptr + n * stride_pm_n + i * stride_pm_m)
+        r = tl.load(
+            residual_ptr + n * stride_r_n + i * stride_r_m + h * stride_r_h,
+            mask=hmask, other=0.0,
+        ).to(tl.float32)
+        acc += pm * r
+    tl.store(out_ptr + n * stride_o_n + h * stride_o_h, acc.to(tl.bfloat16), mask=hmask)
+
+
+def fused_layer_input(
+    pre_mix: torch.Tensor,    # [N, hc_mult] fp32
+    residual: torch.Tensor,   # [N, hc_mult, hidden] bf16
+    hc_mult: int,
+) -> torch.Tensor:
+    n, _, hidden = residual.shape
+    out = torch.empty((n, hidden), dtype=torch.bfloat16, device=residual.device)
+    BLOCK_H = 256
+    _layer_input_kernel[(n, triton.cdiv(hidden, BLOCK_H))](
+        pre_mix, residual, out,
+        pre_mix.stride(0), pre_mix.stride(1),
+        residual.stride(0), residual.stride(1), residual.stride(2),
+        out.stride(0), out.stride(1),
+        HIDDEN=hidden, HC_MULT=hc_mult, BLOCK_H=BLOCK_H,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fused mhc_post: out[n,j,h] = sum_i comb_res_mix[n,i,j]*residual[n,i,h]
+#                                + post_layer_mix[n,j]*x[n,h]  -> bf16.
+# Reference: einsum(...ij,...ih->...jh) + post_term, ~8 kernels -> 1.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mhc_post_kernel(
+    comb_res_mix_ptr,   # [num_tokens, HC_MULT, HC_MULT] fp32
+    residual_ptr,       # [num_tokens, HC_MULT, HIDDEN] bf16
+    post_layer_mix_ptr, # [num_tokens, HC_MULT] fp32
+    x_ptr,              # [num_tokens, HIDDEN] bf16
+    out_ptr,            # [num_tokens, HC_MULT, HIDDEN] bf16
+    stride_c_n, stride_c_i, stride_c_j,
+    stride_r_n, stride_r_i, stride_r_h,
+    stride_p_n, stride_p_j,
+    stride_x_n, stride_x_h,
+    stride_o_n, stride_o_j, stride_o_h,
+    HIDDEN: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    n = tl.program_id(0)
+    hb = tl.program_id(1)
+    h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    hmask = h < HIDDEN
+    for j in tl.static_range(HC_MULT):
+        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+        for i in tl.static_range(HC_MULT):
+            c = tl.load(comb_res_mix_ptr + n * stride_c_n + i * stride_c_i + j * stride_c_j)
+            r = tl.load(
+                residual_ptr + n * stride_r_n + i * stride_r_i + h * stride_r_h,
+                mask=hmask, other=0.0,
+            ).to(tl.float32)
+            acc += c * r
+        plm = tl.load(post_layer_mix_ptr + n * stride_p_n + j * stride_p_j)
+        xv = tl.load(x_ptr + n * stride_x_n + h * stride_x_h, mask=hmask, other=0.0).to(tl.float32)
+        acc += plm * xv
+        tl.store(
+            out_ptr + n * stride_o_n + j * stride_o_j + h * stride_o_h,
+            acc.to(tl.bfloat16), mask=hmask,
+        )
+
+
+def fused_mhc_post(
+    comb_res_mix: torch.Tensor,   # [N, hc_mult, hc_mult] fp32
+    residual: torch.Tensor,       # [N, hc_mult, hidden] bf16
+    post_layer_mix: torch.Tensor, # [N, hc_mult] fp32
+    x: torch.Tensor,              # [N, hidden] bf16
+    hc_mult: int,
+) -> torch.Tensor:
+    n, _, hidden = residual.shape
+    out = torch.empty((n, hc_mult, hidden), dtype=torch.bfloat16, device=residual.device)
+    BLOCK_H = 256
+    _mhc_post_kernel[(n, triton.cdiv(hidden, BLOCK_H))](
+        comb_res_mix, residual, post_layer_mix, x, out,
+        comb_res_mix.stride(0), comb_res_mix.stride(1), comb_res_mix.stride(2),
+        residual.stride(0), residual.stride(1), residual.stride(2),
+        post_layer_mix.stride(0), post_layer_mix.stride(1),
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        HIDDEN=hidden, HC_MULT=hc_mult, BLOCK_H=BLOCK_H,
+    )
+    return out
