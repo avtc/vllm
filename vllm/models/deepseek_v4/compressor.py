@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
+import os
 
 import torch
 from torch import nn
@@ -50,6 +51,8 @@ _COMPRESSOR_NAN_PROBE_FIRED: dict[str, bool] = {}
 # One-shot per-prefix confirmation that the output readback actually executed
 # (so an absence of OUTPUT-NaN lines is trustworthy, not a silent exception).
 _COMPRESSOR_READBACK_CONFIRMED: dict[str, bool] = {}
+# One-shot log of the VLLM_DSV4_COMPRESSED_KSLOT fix state (A/B test toggle).
+_COMPRESSED_KSLOT_LOGGED: bool = False
 
 
 def _compressor_nan_probe(
@@ -610,9 +613,29 @@ class DeepseekCompressor(nn.Module):
                     "store is Hopper/Blackwell (cutedsl) only."
                 )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = dict(
-                kv_slot_mapping=state_metadata.k_cache_slot_mapping
-            )
+            # f96a06f234 fix: write the COMPRESSED main-MLA k-cache at
+            # compressed (pos//compress_ratio) slots via the compressor-built
+            # k_cache_slot_mapping, overriding k_cache_metadata.slot_mapping.
+            # Gated by VLLM_DSV4_COMPRESSED_KSLOT (default 1 = fix ON) so the
+            # fix can be A/B-tested: set to 0 to fall back to the store using
+            # k_cache_metadata.slot_mapping (pre-fix behavior).
+            if os.environ.get("VLLM_DSV4_COMPRESSED_KSLOT", "1") == "1":
+                extra_kwargs = dict(
+                    kv_slot_mapping=state_metadata.k_cache_slot_mapping
+                )
+            else:
+                extra_kwargs = {}
+            global _COMPRESSED_KSLOT_LOGGED
+            if not _COMPRESSED_KSLOT_LOGGED:
+                _COMPRESSED_KSLOT_LOGGED = True
+                print(
+                    f"[COMPRESSED_KSLOT] head_dim={self.head_dim} "
+                    f"compress_ratio={self.compress_ratio} "
+                    f"FIX={'ON' if extra_kwargs else 'OFF'} "
+                    f"(VLLM_DSV4_COMPRESSED_KSLOT="
+                    f"{os.environ.get('VLLM_DSV4_COMPRESSED_KSLOT', '1')}) "
+                    f"store={'compressed k_cache_slot_mapping' if extra_kwargs else 'k_cache_metadata.slot_mapping'}"
+                )
 
         compress_norm_rope_store_fn(
             state_cache=state_cache,
