@@ -277,7 +277,14 @@ def _dequant_gather_slots_kernel(
         # Load UE8M0 scale: scale = 2^(stored_value - 127)
         encoded_scale = tl.load(token_scale_ptr + qblock_idx)
         exponent = encoded_scale.to(tl.float32) - 127.0
-        scale = tl.exp2(exponent)
+        # Overflow guard: fp8 e4m3 max is 448 (~2^9.8); float32 max is ~2^127.8,
+        # so a scale exponent above ~118 overflows float32 on dequant
+        # (448 * 2^128 > float32 max -> Inf -> NaN in softmax). Clamp the
+        # exponent to a safe ceiling; this is a pure safety clamp (normal
+        # RMSNorm'd KV values never approach it) that prevents stale/garbage
+        # scale bytes (e.g. 254-255) from generating Inf/NaN at block
+        # boundaries where newly-allocated blocks may hold stale data.
+        scale = tl.exp2(tl.minimum(exponent, 118.0))
 
         # Dequantize and store as bf16
         x_dequant = x_float * scale

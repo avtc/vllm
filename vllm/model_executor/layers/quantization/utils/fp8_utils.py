@@ -766,6 +766,33 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
 
 
 @triton.jit
+def _e4m3_uint8_to_f32(u):
+    """Decode an ``e4m3fn`` byte (1-4-3, exp bias 7) to f32 without ever
+    materializing Triton's ``fp8e4nv`` type, which Ampere (SM80/SM86) cannot
+    represent. ``u`` is the raw uint8 bit pattern. NaN (S.1111.111) is not
+    produced by quantized weights and is decoded as a finite value.
+
+    Ported from Lvllmds4-x (SM80_DEEPSEEK_V4_NOTES.md): DSv4 quantizes all
+    dense+attention linears to FP8 block(128); on SM86 the native fp8 tl.dot
+    fails ("type fp8e4nv not supported in this architecture"), so operands are
+    bitcast to uint8 and decoded e4m3 -> bf16 in-kernel (e4m3 widens exactly
+    into bf16, so this is lossless; block scales apply after the dot).
+    """
+    ui = u.to(tl.int32)
+    sign = (ui >> 7) & 1
+    exp = (ui >> 3) & 0xF
+    man = ui & 0x7
+    mant = man.to(tl.float32) * 0.125
+    # normal: 2^(exp-7) * (1+mant); subnormal (exp==0): 2^-6 * mant
+    val = tl.where(
+        exp != 0,
+        tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant),
+        0.015625 * mant,
+    )
+    return tl.where(sign != 0, -val, val)
+
+
+@triton.jit
 def _w8a8_triton_block_scaled_mm(
     # Pointers to inputs and output
     A,
@@ -796,6 +823,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    DECODE_E4M3: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -824,8 +852,21 @@ def _w8a8_triton_block_scaled_mm(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        a_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+        b_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+        if DECODE_E4M3:
+            # Ampere (SM80/SM86): no FP8 tensor core, Triton cannot represent
+            # fp8e4nv, so operands arrive bitcast to uint8 and are decoded
+            # e4m3 -> bf16 in-kernel (lossless; block scales apply after dot).
+            a = _e4m3_uint8_to_f32(tl.load(a_ptrs, mask=a_mask, other=0)).to(
+                tl.bfloat16
+            )
+            b = _e4m3_uint8_to_f32(tl.load(b_ptrs, mask=b_mask, other=0)).to(
+                tl.bfloat16
+            )
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -959,6 +1000,22 @@ def w8a8_triton_block_scaled_mm(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    # Ampere (SM80/SM86) has no FP8 tensor cores and Triton cannot represent
+    # fp8e4nv on this arch at all, so bitcast the e4m3 operands to uint8 and
+    # decode them to bf16 inside the kernel. FP8-capable archs (SM89/SM90/
+    # SM100/SM12x) keep the native FP8 tl.dot. DSv4 quantizes all dense+attention
+    # linears to FP8 block(128); without this gate the kernel would try a native
+    # fp8 tl.dot on SM86 and fail/garbage.
+    decode_e4m3 = (
+        current_platform.is_cuda()
+        and not current_platform.supports_fp8()
+        and A.dtype == torch.float8_e4m3fn
+        and B.dtype == torch.float8_e4m3fn
+    )
+    if decode_e4m3:
+        A = A.view(torch.uint8)
+        B = B.view(torch.uint8)
+
     _w8a8_triton_block_scaled_mm[grid](
         A,
         B,
@@ -980,6 +1037,7 @@ def w8a8_triton_block_scaled_mm(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        DECODE_E4M3=decode_e4m3,
         **config,
     )
 

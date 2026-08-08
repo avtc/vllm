@@ -465,7 +465,11 @@ def _dequantize_and_gather_k_kernel(
                 # UE8M0: scale = 2^(stored_value - 127)
                 encoded_scale = tl.load(token_scale_ptr + qblock_idx)
                 exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
+                # Overflow guard: clamp scale exponent so dequant cannot overflow
+                # float32 (448 * 2^128 > float32 max). Pure safety clamp; normal
+                # values never approach it. Prevents stale/garbage scale bytes
+                # (e.g. on newly-allocated recycled blocks) from generating Inf/NaN.
+                scale = tl.exp2(tl.minimum(exponent, 118.0))
 
                 # Dequantize: bf16_value = fp8_value * scale
                 x_dequant = x_float * scale
