@@ -1020,10 +1020,22 @@ class KVCacheConfig:
         caches therefore require freshly-allocated blocks to be zeroed, just
         like Mamba/SSM state caches.
         """
-        return any(
-            getattr(g.kv_cache_spec, "compress_ratio", 1) > 1
-            for g in self.kv_cache_groups
-        )
+        for g in self.kv_cache_groups:
+            spec = g.kv_cache_spec
+            # UniformTypeKVCacheSpecs wraps multiple same-type specs but does
+            # NOT expose compress_ratio itself, so look inside its children.
+            # If any child (or the spec itself) has compress_ratio > 1, the
+            # group needs zeroing.
+            if getattr(spec, "compress_ratio", 1) > 1:
+                return True
+            child_specs = getattr(spec, "kv_cache_specs", None)
+            if child_specs:
+                if any(
+                    getattr(c, "compress_ratio", 1) > 1
+                    for c in child_specs.values()
+                ):
+                    return True
+        return False
 
     @property
     def needs_kv_cache_zeroing(self) -> bool:

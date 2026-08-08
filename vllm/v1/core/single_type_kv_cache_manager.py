@@ -281,7 +281,7 @@ class SingleTypeKVCacheManager(ABC):
             # bit patterns) persists and corrupts SWA reads. Track SWA blocks
             # so they enter new_block_ids_to_zero and get cleared on alloc.
             SlidingWindowMLASpec,
-        ):
+        ) or self._spec_needs_zeroing():
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -317,9 +317,39 @@ class SingleTypeKVCacheManager(ABC):
                 # DSv4 SWA caches: see allocate_new_computed_blocks for why
                 # SlidingWindowMLASpec blocks must be tracked for zeroing.
                 SlidingWindowMLASpec,
-            ):
+            ) or self._spec_needs_zeroing():
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
+
+    def _spec_needs_zeroing(self) -> bool:
+        """True if this manager's spec needs recycled blocks zeroed.
+
+        Handles UniformTypeKVCacheSpecs (DSv4 packs multiple same-type specs
+        into one wrapper that does NOT expose compress_ratio / the inner type).
+        Looks inside the wrapper's children: if any child has compress_ratio>1
+        or is a type that reads recycled slots (MLA/SWA), the group needs
+        zeroing. Without this, DSv4's merged MLA groups (compress_ratio 4/128)
+        would never be tracked and recycled blocks would carry stale data.
+        """
+        spec = self.kv_cache_spec
+        # Unwrap UniformTypeKVCacheSpecs -> inspect children.
+        children = getattr(spec, "kv_cache_specs", None)
+        if children:
+            for c in children.values():
+                if getattr(c, "compress_ratio", 1) > 1:
+                    return True
+                if isinstance(
+                    c,
+                    (
+                        MLAAttentionSpec,
+                        SlidingWindowMLASpec,
+                        FullAttentionSpec,
+                        HiddenStateCacheSpec,
+                    ),
+                ):
+                    return True
+            return False
+        return getattr(spec, "compress_ratio", 1) > 1
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
