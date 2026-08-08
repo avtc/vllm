@@ -29,6 +29,10 @@ import torch
 from vllm.triton_utils import tl, triton
 
 _BLOCK_M = 64
+# Smaller query tile for the fp8 prefill path: the manual e4m3 decode raises
+# register/shared-memory pressure, and BLOCK_M=64 overflows Ampere's
+# (SM<89) 101376-byte shared-memory limit together with the fp32 matmul tiles.
+_BLOCK_M_FP8 = 32
 
 # Dummy scalar pointer used only when no fp8 scale is supplied: the fp8
 # dequant branch is pruned at compile time for non-fp8 caches, so this tensor
@@ -697,7 +701,13 @@ def inkling_triton_rel_attention(
         )
     else:
         # ---- prefill (and mixed prefill+decode batches) ----
-        num_m_blocks = (max_seqlen_q + _BLOCK_M - 1) // _BLOCK_M
+        # fp8 (manual e4m3 decode) raises register/shared-memory pressure; on
+        # Ampere (SM<89) BLOCK_M=64 + the fp32 matmul tiles + decode
+        # temporaries overflow the 101376-byte shared-memory limit. Drop to
+        # BLOCK_M=32 and num_stages=1 for fp8 (mirroring how vLLM's standard
+        # Triton decode kernel avoids the same limit). bf16 keeps BLOCK_M=64.
+        prefill_block_m = _BLOCK_M_FP8 if kv_is_fp8 else _BLOCK_M
+        num_m_blocks = (max_seqlen_q + prefill_block_m - 1) // prefill_block_m
         grid = (num_reqs, num_heads, num_m_blocks)
         _inkling_rel_attn_prefill[grid](
             q,
@@ -738,8 +748,10 @@ def inkling_triton_rel_attention(
             SW_RIGHT=sw_right,
             USE_SW=use_sw,
             KV_IS_FP8=kv_is_fp8,
-            BLOCK_M=_BLOCK_M,
+            BLOCK_M=prefill_block_m,
             BLOCK_N=kv_block_size,
+            num_warps=4,
+            num_stages=1 if kv_is_fp8 else 2,
         )
 
     return out
