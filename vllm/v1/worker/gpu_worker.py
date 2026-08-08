@@ -806,14 +806,15 @@ class Worker(WorkerBase):
         # allocator and are not discarded during sleep/wake cycles.
         _needs_zero = kv_cache_config.needs_kv_cache_zeroing
         _has_init = hasattr(self.model_runner, "_init_kv_zero_meta")
-        logger.info(
-            "[COMPRESSED_ZERO] gpu_worker gate: needs_kv_cache_zeroing=%s "
-            "has_init_kv_zero_meta=%s has_compressed_kv_layers=%s "
-            "n_kv_cache_groups=%d",
-            _needs_zero, _has_init,
-            kv_cache_config.has_compressed_kv_layers,
-            len(kv_cache_config.kv_cache_groups),
-        )
+        if os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1":
+            logger.info(
+                "[COMPRESSED_ZERO] gpu_worker gate: needs_kv_cache_zeroing=%s "
+                "has_init_kv_zero_meta=%s has_compressed_kv_layers=%s "
+                "n_kv_cache_groups=%d",
+                _needs_zero, _has_init,
+                kv_cache_config.has_compressed_kv_layers,
+                len(kv_cache_config.kv_cache_groups),
+            )
         # One-shot spec inventory: dumps each group's spec TYPE, its
         # compress_ratio (via getattr, as the property does), and -- if the
         # spec is a UniformTypeKVCacheSpecs wrapper (which does not expose

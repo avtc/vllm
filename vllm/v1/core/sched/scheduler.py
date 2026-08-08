@@ -1078,10 +1078,9 @@ class Scheduler(SchedulerInterface):
             # new_block_ids_to_zero. One-shot + throttled behind
             # VLLM_DSV4_ZERO_DEBUG=1 to avoid log spam.
             self._sched_zero_n = getattr(self, "_sched_zero_n", 0) + 1
-            if self._sched_zero_n == 1 or (
-                os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1"
-                and self._sched_zero_n % 50 == 0
-            ):
+            if (os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1"
+                    and (self._sched_zero_n == 1
+                         or self._sched_zero_n % 50 == 0)):
                 logger.info(
                     "[COMPRESSED_ZERO] scheduler emit %d block(s) %s "
                     "(needs_kv_cache_zeroing=%s, emit #%d)",

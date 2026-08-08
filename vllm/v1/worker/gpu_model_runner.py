@@ -1117,11 +1117,12 @@ class GPUModelRunner(
         _has_compressed = self.kv_cache_config.has_compressed_kv_layers
         _has_mamba = self.kv_cache_config.has_mamba_layers
         _n_groups = len(self.kv_cache_config.kv_cache_groups)
-        logger.info(
-            "[COMPRESSED_ZERO] ENTRY: has_compressed_kv_layers=%s "
-            "has_mamba_layers=%s n_kv_cache_groups=%d",
-            _has_compressed, _has_mamba, _n_groups,
-        )
+        if os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1":
+            logger.info(
+                "[COMPRESSED_ZERO] ENTRY: has_compressed_kv_layers=%s "
+                "has_mamba_layers=%s n_kv_cache_groups=%d",
+                _has_compressed, _has_mamba, _n_groups,
+            )
         # DeepSeek-V4 uses a *packed* KV cache layout where many layer views
         # are strided slices (stride(0) = full packed block stride) of a single
         # backing tensor. The general KVBlockZeroer derives each block's zeroing
@@ -1135,11 +1136,12 @@ class GPUModelRunner(
         if _has_compressed:
             self._kv_block_zeroer = None
             self._compressed_zero_caches = self._build_compressed_zero_caches()
-            logger.info(
-                "[COMPRESSED_ZERO] init: registered %d unique cache views "
-                "for block zeroing (has_compressed_kv_layers=True).",
-                len(self._compressed_zero_caches),
-            )
+            if os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1":
+                logger.info(
+                    "[COMPRESSED_ZERO] init: registered %d unique cache views "
+                    "for block zeroing (has_compressed_kv_layers=True).",
+                    len(self._compressed_zero_caches),
+                )
             return
 
         self._kv_block_zeroer = KVBlockZeroer(
@@ -1197,13 +1199,15 @@ class GPUModelRunner(
         if not caches and self.kv_cache_config.has_compressed_kv_layers:
             caches = self._build_compressed_zero_caches()
             self._compressed_zero_caches = caches
-            logger.info(
-                "[COMPRESSED_ZERO] on-demand build: registered %d cache "
-                "views (init list was None/empty).",
-                len(caches),
-            )
+            if os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1":
+                logger.info(
+                    "[COMPRESSED_ZERO] on-demand build: registered %d cache "
+                    "views (init list was None/empty).",
+                    len(caches),
+                )
         if caches:
-            if not getattr(self, "_compressed_zero_logged", False):
+            if (not getattr(self, "_compressed_zero_logged", False)
+                    and os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1"):
                 logger.info(
                     "[COMPRESSED_ZERO] zeroing %d block(s) %s across %d cache "
                     "views.", len(block_ids), block_ids[:8], len(caches),
@@ -1267,20 +1271,12 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
-            # Verbose per-step zeroing log (call count + block ids). Gated by
-            # VLLM_DSV4_ZERO_DEBUG=1; default off to avoid log spam/perf cost
-            # during steady-state decode. Keep a one-shot confirmation so a
-            # clean run still proves zeroing fired at least once.
+            # All [COMPRESSED_ZERO] logging gated behind VLLM_DSV4_ZERO_DEBUG=1
+            # so production runs are clean. The zeroing itself always runs.
             self._zero_call_count = getattr(self, "_zero_call_count", 0) + 1
-            if self._zero_call_count == 1:
-                logger.info(
-                    "[COMPRESSED_ZERO] first zeroing call: %d block(s) %s "
-                    "(set VLLM_DSV4_ZERO_DEBUG=1 for periodic logging)",
-                    len(scheduler_output.new_block_ids_to_zero),
-                    scheduler_output.new_block_ids_to_zero[:8],
-                )
-            elif (os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1"
-                  and self._zero_call_count % 50 == 0):
+            if (os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1"
+                    and (self._zero_call_count == 1
+                         or self._zero_call_count % 50 == 0)):
                 logger.info(
                     "[COMPRESSED_ZERO] zeroing %d block(s) %s (call #%d)",
                     len(scheduler_output.new_block_ids_to_zero),
