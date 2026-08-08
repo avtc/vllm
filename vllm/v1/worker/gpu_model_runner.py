@@ -4151,6 +4151,73 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    # [DSv4-ampere perf] torch.profiler injection for FULL-cudagraph decode.
+    # In FULL mode the forward is a graph replay, so per-kernel CUDA-event
+    # timing inside the graph is impossible; torch.profiler captures the
+    # replayed kernels' durations from outside. Gated by VLLM_DSV4_PROFILE=N
+    # (N = active decode steps to profile after warmup). Rank0 only to avoid
+    # 8x duplicate traces. The trace (chrome://tracing JSON) shows the
+    # per-kernel decode breakdown: MoE GEMM vs indexer vs compressor vs sparse
+    # decode vs NCCL -- the key to finding the optimization target.
+    _dsv4_profiler = None
+    _dsv4_profiler_step = 0
+
+    def _maybe_init_dsv4_profiler(self) -> None:
+        if self._dsv4_profiler is not None:
+            return
+        val = os.environ.get("VLLM_DSV4_PROFILE")
+        if not val:
+            return
+        try:
+            active = int(val)
+        except ValueError:
+            active = 20
+        if active <= 0:
+            return
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else 0
+        )
+        if rank != 0:
+            return
+        import torch.profiler
+        out_dir = os.environ.get("VLLM_DSV4_PROFILE_DIR", ".")
+        os.makedirs(out_dir, exist_ok=True)
+
+        def _save_trace(p):
+            path = os.path.join(out_dir, f"dsv4_profile_rank{rank}.json")
+            p.export_chrome_trace(path)
+            logger.info("[DSV4_PROFILE] trace written to %s", path)
+
+        self._dsv4_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            # wait through graph capture/warmup, then profile `active` steps.
+            schedule=torch.profiler.schedule(
+                wait=3, warmup=2, active=active, repeat=1
+            ),
+            on_trace_ready=_save_trace,
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+        )
+        self._dsv4_profiler.start()
+        logger.info(
+            "[DSV4_PROFILE] torch.profiler started (rank0): wait=3 warmup=2 "
+            "active=%d -> %s/dsv4_profile_rank%d.json", active, out_dir, rank,
+        )
+
+    def _step_dsv4_profiler(self) -> None:
+        if self._dsv4_profiler is None:
+            return
+        self._dsv4_profiler.step()
+        self._dsv4_profiler_step += 1
+        # The profiler auto-stops after `active` steps per the schedule.
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4162,6 +4229,9 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+
+        # [DSv4-ampere perf] lazily start torch.profiler (VLLM_DSV4_PROFILE=N).
+        self._maybe_init_dsv4_profiler()
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -4798,6 +4868,8 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        # [DSv4-ampere perf] advance the profiler schedule one decode step.
+        self._step_dsv4_profiler()
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
