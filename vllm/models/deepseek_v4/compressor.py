@@ -613,13 +613,15 @@ class DeepseekCompressor(nn.Module):
                     "store is Hopper/Blackwell (cutedsl) only."
                 )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            # f96a06f234 fix: write the COMPRESSED main-MLA k-cache at
-            # compressed (pos//compress_ratio) slots via the compressor-built
-            # k_cache_slot_mapping, overriding k_cache_metadata.slot_mapping.
-            # Gated by VLLM_DSV4_COMPRESSED_KSLOT (default 1 = fix ON) so the
-            # fix can be A/B-tested: set to 0 to fall back to the store using
-            # k_cache_metadata.slot_mapping (pre-fix behavior).
-            if os.environ.get("VLLM_DSV4_COMPRESSED_KSLOT", "1") == "1":
+            # f96a06f234 attempted to override the store's KV slot_mapping
+            # with the compressor-built k_cache_slot_mapping, but A/B testing
+            # (VLLM_DSV4_COMPRESSED_KSLOT) proved it WRONG: with the override
+            # ("1") the next block after a boundary becomes incoherent very
+            # fast; WITHOUT it ("0", using k_cache_metadata.slot_mapping from
+            # sparse_mla.py) output is coherent. Default is therefore "0"
+            # (fix DISABLED = correct). The earlier Chinese->English change was
+            # caused by the MoE swiglu clamp (59bdc930d9), NOT this commit.
+            if os.environ.get("VLLM_DSV4_COMPRESSED_KSLOT", "0") == "1":
                 extra_kwargs = dict(
                     kv_slot_mapping=state_metadata.k_cache_slot_mapping
                 )

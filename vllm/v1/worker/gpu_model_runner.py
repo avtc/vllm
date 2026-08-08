@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -1266,15 +1267,22 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
-            # Log each non-empty allocation (throttled to every 50 calls + the
-            # first) so we can confirm the per-step zeroing fires when blocks
-            # are allocated/recycled -- especially across block boundaries in
-            # FULL mode, where this is the only visibility (probes break capture).
+            # Verbose per-step zeroing log (call count + block ids). Gated by
+            # VLLM_DSV4_ZERO_DEBUG=1; default off to avoid log spam/perf cost
+            # during steady-state decode. Keep a one-shot confirmation so a
+            # clean run still proves zeroing fired at least once.
             self._zero_call_count = getattr(self, "_zero_call_count", 0) + 1
-            if self._zero_call_count == 1 or self._zero_call_count % 50 == 0:
+            if self._zero_call_count == 1:
                 logger.info(
-                    "[COMPRESSED_ZERO] zeroing %d block(s) %s "
-                    "(call #%d)",
+                    "[COMPRESSED_ZERO] first zeroing call: %d block(s) %s "
+                    "(set VLLM_DSV4_ZERO_DEBUG=1 for periodic logging)",
+                    len(scheduler_output.new_block_ids_to_zero),
+                    scheduler_output.new_block_ids_to_zero[:8],
+                )
+            elif (os.environ.get("VLLM_DSV4_ZERO_DEBUG") == "1"
+                  and self._zero_call_count % 50 == 0):
+                logger.info(
+                    "[COMPRESSED_ZERO] zeroing %d block(s) %s (call #%d)",
                     len(scheduler_output.new_block_ids_to_zero),
                     scheduler_output.new_block_ids_to_zero[:8],
                     self._zero_call_count,
