@@ -99,6 +99,86 @@ def _fuse_mhc_post_enabled() -> bool:
     return os.environ.get("VLLM_DSV4_FUSE_MHC_POST", "1") == "1"
 
 
+def _fuse_mhc_norm_enabled() -> bool:
+    return os.environ.get("VLLM_DSV4_FUSE_MHC_NORM", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Fused mhc_pre norm+sigmoid: sqrsum = sum(residual^2) over hc_mult*hidden,
+# then RMSNorm-scale mixes, then pre_mix/post_mix sigmoids. Outputs the
+# SCALED mixes (comb slice feeds the Sinkhorn kernel) + pre_mix + post_mix.
+# Reference (~10 kernels: cast, square, sum, rsqrt, div, mul, slice, mul, add,
+# sigmoid x2) -> 1.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mhc_norm_sigmoid_kernel(
+    residual_ptr,   # [num_tokens, HC_MULT*HIDDEN] bf16
+    mixes_ptr,      # [num_tokens, HC_MULT3] fp32 (raw, from matmul)
+    scaled_mixes_ptr,  # [num_tokens, HC_MULT3] fp32 (out: RMSNorm-scaled)
+    pre_mix_ptr,    # [num_tokens, HC_MULT] fp32 (out)
+    post_mix_ptr,   # [num_tokens, HC_MULT] fp32 (out)
+    hc_scale0, hc_scale1,   # scalars
+    base_pre_ptr,   # [HC_MULT] fp32
+    base_post_ptr,  # [HC_MULT] fp32
+    rms_eps, hc_pre_eps, hc_post_mult,
+    stride_res_n,
+    HC_MULT: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    HC_MULT3: tl.constexpr,
+    BLOCK_R: tl.constexpr,   # reduction block over HC_MULT*HIDDEN
+):
+    n = tl.program_id(0)
+    red_len = HC_MULT * HIDDEN
+    # ---- sqrsum reduction over [HC_MULT*HIDDEN] ----
+    sq = 0.0
+    for off in tl.range(0, red_len, BLOCK_R):
+        idx = off + tl.arange(0, BLOCK_R)
+        m = idx < red_len
+        r = tl.load(residual_ptr + n * stride_res_n + idx, mask=m, other=0.0).to(tl.float32)
+        sq += tl.sum(r * r)
+    rscale = tl.rsqrt(sq / red_len + rms_eps)
+    # ---- scale mixes + pre/post sigmoid ----
+    moff = n * HC_MULT3 + tl.arange(0, HC_MULT3)
+    mixes = tl.load(mixes_ptr + moff) * rscale
+    tl.store(scaled_mixes_ptr + moff, mixes)
+    # pre: first HC_MULT of mixes
+    pi = tl.arange(0, HC_MULT)
+    pre_logits = tl.load(mixes_ptr + n * HC_MULT3 + pi) * rscale * hc_scale0 \
+        + tl.load(base_pre_ptr + pi)   # recompute on the slice (mixes already scaled)
+    tl.store(pre_mix_ptr + n * HC_MULT + pi, tl.sigmoid(pre_logits) + hc_pre_eps)
+    # post: next HC_MULT
+    poi = HC_MULT + tl.arange(0, HC_MULT)
+    post_logits = tl.load(mixes_ptr + n * HC_MULT3 + poi) * rscale * hc_scale1 \
+        + tl.load(base_post_ptr + pi)
+    tl.store(post_mix_ptr + n * HC_MULT + pi, tl.sigmoid(post_logits) * hc_post_mult)
+
+
+def fused_mhc_norm_sigmoid(
+    residual_flat: torch.Tensor,   # [N, hc_mult*hidden] bf16
+    mixes: torch.Tensor,           # [N, hc_mult3] fp32 (raw)
+    hc_scale: torch.Tensor,        # [3] fp32
+    hc_base: torch.Tensor,         # [hc_mult3] fp32
+    rms_eps: float, hc_pre_eps: float, hc_post_mult: float,
+    hc_mult: int, hidden: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = residual_flat.shape[0]
+    hc_mult3 = mixes.shape[1]
+    scaled = torch.empty_like(mixes)
+    pre_mix = torch.empty((n, hc_mult), dtype=torch.float32, device=mixes.device)
+    post_mix = torch.empty((n, hc_mult), dtype=torch.float32, device=mixes.device)
+    red_len = hc_mult * hidden
+    BLOCK_R = 1024
+    _mhc_norm_sigmoid_kernel[(n,)](
+        residual_flat, mixes, scaled, pre_mix, post_mix,
+        hc_scale[0], hc_scale[1],
+        hc_base[:hc_mult].contiguous(), hc_base[hc_mult:2 * hc_mult].contiguous(),
+        rms_eps, hc_pre_eps, hc_post_mult,
+        residual_flat.stride(0),
+        HC_MULT=hc_mult, HIDDEN=hidden, HC_MULT3=hc_mult3, BLOCK_R=BLOCK_R,
+    )
+    return pre_mix, post_mix, scaled
+
+
 # ---------------------------------------------------------------------------
 # Fused layer_input: out[n,h] = sum_i pre_mix[n,i] * residual[n,i,h] -> bf16.
 # Reference: torch.sum(pre_mix.unsqueeze(-1) * residual.float, dim=1).to(bf16)

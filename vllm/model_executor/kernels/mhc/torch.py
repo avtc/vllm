@@ -7,8 +7,10 @@ from vllm.model_executor.kernels.mhc.sinkhorn import (
     _fused_comb_mix,
     _fuse_layer_input_enabled,
     _fuse_mhc_post_enabled,
+    _fuse_mhc_norm_enabled,
     fused_layer_input,
     fused_mhc_post,
+    fused_mhc_norm_sigmoid,
 )
 
 
@@ -70,16 +72,26 @@ def mhc_pre_torch(
 
     x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
     mixes = torch.matmul(x, fn_flat.t())
-    sqrsum = x.square().sum(dim=-1, keepdim=True)
-    mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+    # Fused sqrsum + RMSNorm-scale mixes + pre/post sigmoid (~10 kernels -> 1).
+    # Outputs the SCALED mixes (comb slice feeds the Sinkhorn kernel). Set
+    # VLLM_DSV4_FUSE_MHC_NORM=0 to restore the torch path.
+    if _fuse_mhc_norm_enabled():
+        pre_mix, post_mix, mixes = fused_mhc_norm_sigmoid(
+            x, mixes, hc_scale, hc_base, rms_eps, hc_pre_eps,
+            hc_post_mult_value, hc_mult, hidden_size,
+        )
+    else:
+        sqrsum = x.square().sum(dim=-1, keepdim=True)
+        mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+        pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+        pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
 
-    post_logits = (
-        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
-    post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
+        post_logits = (
+            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult]
+        )
+        post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
 
     # Fused softmax + Sinkhorn: the reference runs a 19-iter Python loop of tiny
     # sum/div kernels (~114 launches) on a 16-element matrix -- a dominant source
