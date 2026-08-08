@@ -1265,19 +1265,20 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            if not getattr(self, "_zero_block_ids_logged", False):
-                self._zero_block_ids_logged = True
-                logger.info(
-                    "[COMPRESSED_ZERO] _zero_block_ids reached: "
-                    "ids=%s (first call only)",
-                    scheduler_output.new_block_ids_to_zero[:8],
-                )
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
-        elif not getattr(self, "_zero_empty_logged", False):
-            # one-shot: confirm new_block_ids_to_zero is EMPTY on the steps
-            # where SCALES_WATCH would fire (rules out a missing-ids bug vs a
-            # zeroing-doesn't-clear bug).
-            pass  # too noisy; rely on the on-demand/ENTRY logs instead
+            # Log each non-empty allocation (throttled to every 50 calls + the
+            # first) so we can confirm the per-step zeroing fires when blocks
+            # are allocated/recycled -- especially across block boundaries in
+            # FULL mode, where this is the only visibility (probes break capture).
+            self._zero_call_count = getattr(self, "_zero_call_count", 0) + 1
+            if self._zero_call_count == 1 or self._zero_call_count % 50 == 0:
+                logger.info(
+                    "[COMPRESSED_ZERO] zeroing %d block(s) %s "
+                    "(call #%d)",
+                    len(scheduler_output.new_block_ids_to_zero),
+                    scheduler_output.new_block_ids_to_zero[:8],
+                    self._zero_call_count,
+                )
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:

@@ -1072,6 +1072,20 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+        if new_block_ids_to_zero:
+            # [DSv4-ampere diag] confirm the scheduler emits non-empty
+            # new_block_ids_to_zero (so the worker actually zeroes recycled
+            # blocks). Throttled to every 50 + the first.
+            self._sched_zero_n = getattr(self, "_sched_zero_n", 0) + 1
+            if self._sched_zero_n == 1 or self._sched_zero_n % 50 == 0:
+                logger.info(
+                    "[COMPRESSED_ZERO] scheduler emit %d block(s) %s "
+                    "(needs_kv_cache_zeroing=%s, emit #%d)",
+                    len(new_block_ids_to_zero),
+                    new_block_ids_to_zero[:8],
+                    self.needs_kv_cache_zeroing,
+                    self._sched_zero_n,
+                )
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
