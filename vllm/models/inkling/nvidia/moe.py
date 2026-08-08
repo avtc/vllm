@@ -278,6 +278,14 @@ _PER_EXPERT_GPTQ_RE = re.compile(
     r"^experts\.(?P<eid>\d+)\.(?P<stack>w13|w2)_weight\."
     r"(?P<sub>qweight|qzeros|scales|g_idx)$"
 )
+# auto-round also splits the shared sink experts per-instance and adds the
+# nn.Linear ``.weight`` suffix: ``shared_experts.<i>.shared_<w13|w2>_weight[.weight]``.
+# InklingSinkExperts stacks them, so each instance loads into its slot.
+# (AWQ keeps the canonical fused ``shared_experts.shared_<key>`` naming, which
+# does not match this regex and falls through to the fused path below.)
+_SHARED_PER_INSTANCE_RE = re.compile(
+    r"^shared_experts\.(?P<eid>\d+)\.shared_(?P<key>w13|w2)_weight(?:\.weight)?$"
+)
 
 
 def _inkling_moe_ep_size() -> int:
@@ -324,21 +332,41 @@ class InklingSinkExperts(nn.Module):
         )
         self._unit: torch.Tensor | None = None
 
-    def load_weight(self, key: str, weight: torch.Tensor) -> list[str]:
-        """Load one checkpoint sink tensor (stacked over the S experts)."""
+    def load_weight(
+        self, key: str, weight: torch.Tensor, expert_id: int | None = None
+    ) -> list[str]:
+        """Load one checkpoint sink tensor.
+
+        ``expert_id=None`` loads the canonical stacked tensor (one tensor over
+        all S sink experts); an explicit ``expert_id`` loads a single
+        per-instance tensor (auto-round export) into that expert's slot.
+        """
         if key == "w13_weight":
-            if weight.shape != self.w13_weight.shape:
-                shard = self.w13_weight.shape[1]
-                weight = weight.narrow(1, self.tp_rank * shard, shard)
-            self.w13_weight.data.copy_(weight)
+            shard = self.w13_weight.shape[1]  # 2 * intermediate_pp
+            if expert_id is None:
+                if weight.shape != self.w13_weight.shape:
+                    weight = weight.narrow(1, self.tp_rank * shard, shard)
+                self.w13_weight.data.copy_(weight)
+            else:
+                # per-instance: [2 * intermediate, d_model] -> TP-shard dim 0.
+                if weight.shape[0] != shard:
+                    weight = weight.narrow(0, self.tp_rank * shard, shard)
+                self.w13_weight.data[expert_id].copy_(weight)
             return [key]
 
         assert key == "w2_weight"
-        shard = self.w2_weight.shape[1] // self.n_experts
-        shard_start = 0 if weight.shape[2] == shard else self.tp_rank * shard
-        for expert_idx, expert_weight in enumerate(weight):
-            local_weight = expert_weight.narrow(1, shard_start, shard)
-            start = expert_idx * shard
+        shard = self.w2_weight.shape[1] // self.n_experts  # intermediate_pp
+        if expert_id is None:
+            shard_start = 0 if weight.shape[2] == shard else self.tp_rank * shard
+            for expert_idx, expert_weight in enumerate(weight):
+                local_weight = expert_weight.narrow(1, shard_start, shard)
+                start = expert_idx * shard
+                self.w2_weight.data[:, start : start + shard].copy_(local_weight)
+        else:
+            # per-instance: [d_model, intermediate] -> TP-shard dim 1.
+            shard_start = 0 if weight.shape[1] == shard else self.tp_rank * shard
+            local_weight = weight.narrow(1, shard_start, shard)
+            start = expert_id * shard
             self.w2_weight.data[:, start : start + shard].copy_(local_weight)
         return [key]
 
@@ -566,6 +594,17 @@ class InklingMoE(nn.Module):
         loaded param names (relative to this module).
         """
         if name.startswith("shared_experts."):
+            # auto-round splits the sink experts per-instance:
+            # shared_experts.<i>.shared_<w13|w2>_weight[.weight] -> slot i.
+            per_inst = _SHARED_PER_INSTANCE_RE.match(name)
+            if per_inst is not None:
+                key = per_inst.group("key") + "_weight"
+                eid = int(per_inst.group("eid"))
+                return [
+                    f"sink_experts.{p}"
+                    for p in self.sink_experts.load_weight(key, weight, expert_id=eid)
+                ]
+            # Canonical fused layout: shared_experts.shared_<t>.
             key = name.split(".", 1)[1].replace("shared_", "", 1)
             return [
                 f"sink_experts.{p}" for p in self.sink_experts.load_weight(key, weight)
