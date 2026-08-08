@@ -25,9 +25,6 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import (
-    get_compressed_slot_mapping,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import (
@@ -51,8 +48,6 @@ _COMPRESSOR_NAN_PROBE_FIRED: dict[str, bool] = {}
 # One-shot per-prefix confirmation that the output readback actually executed
 # (so an absence of OUTPUT-NaN lines is trustworthy, not a silent exception).
 _COMPRESSOR_READBACK_CONFIRMED: dict[str, bool] = {}
-# One-shot log of the VLLM_DSV4_COMPRESSED_KSLOT fix state (A/B test toggle).
-_COMPRESSED_KSLOT_LOGGED: bool = False
 
 
 def _compressor_nan_probe(
@@ -237,11 +232,6 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    # Slot mapping for the COMPRESSED k-cache write (pos//compress_ratio via
-    # block_table). The raw `slot_mapping` above is for the uncompressed
-    # state_cache (1 entry/input-token); the k-cache is compressed and must be
-    # written at compressed slots, matching what the reader/indexer use.
-    k_cache_slot_mapping: torch.Tensor | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -255,25 +245,13 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         # The k-cache (NOT this state_cache spec) is compressed. The state_cache
         # block_size encodes the compress ratio (4 -> block_size 4, 128 -> 8,
         # see CompressorStateCache.__init__), so derive the k-cache compress_ratio
-        # from it. The k-cache storage_block_size = cache_config.block_size //
-        # compress_ratio (e.g. 256//4 = 64).
+        # from it.
         self.compress_ratio = 4 if self.block_size == 4 else 128
-        self.storage_block_size = (
-            self.vllm_config.cache_config.block_size // self.compress_ratio
-        )
         self.cp_layout = ContextParallelLayout.from_config(self.vllm_config)
 
         self.token_to_req_indices = torch.zeros(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
-            device=self.device,
-        )
-        # Reusable buffer for the compressed k-cache slot mapping (avoids
-        # per-step allocation). Mirrors the indexer's compressed_slot_mapping_buffer.
-        self.compressed_k_slot_mapping_buffer = torch.full(
-            (self.vllm_config.scheduler_config.max_num_batched_tokens,),
-            -1,
-            dtype=torch.int64,
             device=self.device,
         )
 
@@ -291,31 +269,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         token_to_req_indices.copy_(x, non_blocking=True)
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor.clamp_(min=0)
-        # The k-cache is COMPRESSED (compress_ratio>1): the compressor must
-        # write at compressed (pos//compress_ratio) slots, exactly as the
-        # indexer/reader do (get_compressed_slot_mapping). Using the raw common
-        # slot_mapping here scatters writes across wrong physical blocks and
-        # leaves the correct compressed slots unwritten -> fluent-but-wrong
-        # output that hard-fails when a bad slot is later read.
-        k_cache_slot_mapping = slot_mapping
-        num_tokens = slot_mapping.shape[0]
-        if self.compress_ratio > 1 and num_tokens > 0:
-            k_cache_slot_mapping = get_compressed_slot_mapping(
-                num_tokens,
-                common_attn_metadata.query_start_loc,
-                common_attn_metadata.seq_lens,
-                block_table,
-                self.storage_block_size,
-                self.compress_ratio,
-                out=self.compressed_k_slot_mapping_buffer,
-                cp_layout=self.cp_layout,
-            )
         return CompressorMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
-            k_cache_slot_mapping=k_cache_slot_mapping,
         )
 
 
@@ -613,31 +571,7 @@ class DeepseekCompressor(nn.Module):
                     "store is Hopper/Blackwell (cutedsl) only."
                 )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            # f96a06f234 attempted to override the store's KV slot_mapping
-            # with the compressor-built k_cache_slot_mapping, but A/B testing
-            # (VLLM_DSV4_COMPRESSED_KSLOT) proved it WRONG: with the override
-            # ("1") the next block after a boundary becomes incoherent very
-            # fast; WITHOUT it ("0", using k_cache_metadata.slot_mapping from
-            # sparse_mla.py) output is coherent. Default is therefore "0"
-            # (fix DISABLED = correct). The earlier Chinese->English change was
-            # caused by the MoE swiglu clamp (59bdc930d9), NOT this commit.
-            if os.environ.get("VLLM_DSV4_COMPRESSED_KSLOT", "0") == "1":
-                extra_kwargs = dict(
-                    kv_slot_mapping=state_metadata.k_cache_slot_mapping
-                )
-            else:
-                extra_kwargs = {}
-            global _COMPRESSED_KSLOT_LOGGED
-            if not _COMPRESSED_KSLOT_LOGGED:
-                _COMPRESSED_KSLOT_LOGGED = True
-                print(
-                    f"[COMPRESSED_KSLOT] head_dim={self.head_dim} "
-                    f"compress_ratio={self.compress_ratio} "
-                    f"FIX={'ON' if extra_kwargs else 'OFF'} "
-                    f"(VLLM_DSV4_COMPRESSED_KSLOT="
-                    f"{os.environ.get('VLLM_DSV4_COMPRESSED_KSLOT', '1')}) "
-                    f"store={'compressed k_cache_slot_mapping' if extra_kwargs else 'k_cache_metadata.slot_mapping'}"
-                )
+            extra_kwargs = {}
 
         compress_norm_rope_store_fn(
             state_cache=state_cache,

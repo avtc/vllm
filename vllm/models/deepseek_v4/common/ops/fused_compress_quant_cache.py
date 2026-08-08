@@ -92,17 +92,11 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
-    kv_slot_mapping: torch.Tensor | None = None,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
-
-    ``kv_slot_mapping``: when provided, overrides ``k_cache_metadata.slot_mapping``
-    as the write target for the COMPRESSED k-cache. The compressor must write at
-    compressed (pos//compress_ratio) slots to match the reader/indexer; passing
-    the raw common slot_mapping scatters writes across wrong physical blocks.
     """
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
@@ -113,12 +107,6 @@ def compress_norm_rope_store_triton(
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
-
-    _kv_slot_mapping = (
-        kv_slot_mapping
-        if kv_slot_mapping is not None
-        else k_cache_metadata.slot_mapping
-    )
 
     kernel[(num_actual,)](
         # state cache
@@ -140,7 +128,7 @@ def compress_norm_rope_store_triton(
         cos_sin_cache.stride(0),
         # KV cache
         kv_cache,
-        _kv_slot_mapping,
+        k_cache_metadata.slot_mapping,
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
         # constexprs
         HEAD_SIZE=head_dim,
