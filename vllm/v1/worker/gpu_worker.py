@@ -847,7 +847,7 @@ class Worker(WorkerBase):
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
-    def compile_or_warm_up_model(self) -> CompilationTimes:
+    def _compile_or_warm_up_model_impl(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -1021,6 +1021,48 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Warm up + capture cudagraphs. Optionally profile the capture pass.
+
+        VLLM_DSV4_PROFILE_CAPTURE=1 wraps the warmup (which includes the graph
+        capture passes) in torch.profiler. The capture pass runs the model
+        forward at FULL GPU speed with the in-forward record_function markers
+        (VLLM_DSV4_TRACE=1) firing, giving per-phase attribution that transfers
+        to FULL-mode decode (same kernels, same order, real durations) -- unlike
+        eager profiling (CPU-launch-starved, distorts ratios) or FULL replay
+        (markers don't fire). The trace is exported to dsv4_profile_capture.json.
+        """
+        if os.environ.get("VLLM_DSV4_PROFILE_CAPTURE") != "1":
+            return self._compile_or_warm_up_model_impl()
+
+        import torch.profiler
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else 0
+        )
+        out_dir = os.environ.get("VLLM_DSV4_PROFILE_DIR", ".")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"dsv4_profile_capture_rank{rank}.json")
+        logger.info(
+            "[DSV4_PROFILE] capturing WARMUP/graph-capture pass (rank%d) -> %s",
+            rank, path,
+        )
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True,
+        ) as prof:
+            result = self._compile_or_warm_up_model_impl()
+        prof.export_chrome_trace(path)
+        logger.info("[DSV4_PROFILE] capture-pass trace written to %s", path)
+        return result
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
