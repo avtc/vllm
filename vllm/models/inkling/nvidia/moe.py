@@ -269,6 +269,15 @@ _PER_EXPERT_WEIGHT_RE = re.compile(
     r"^experts\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)"
     r"\.(?P<suffix>weight.*)$"
 )
+# Per-expert GPTQ tensors from auto-round's auto_gptq export:
+# ``experts.<e>.{w13,w2}_weight.{qweight,qzeros,scales,g_idx}``. The canonical
+# inkling experts are fused (experts.w13_weight); auto-round splits them
+# per-expert. The fused w13 gate/up halves are interleaved [g0,u0,...] along
+# the last dim (same as the bf16 release layout).
+_PER_EXPERT_GPTQ_RE = re.compile(
+    r"^experts\.(?P<eid>\d+)\.(?P<stack>w13|w2)_weight\."
+    r"(?P<sub>qweight|qzeros|scales|g_idx)$"
+)
 
 
 def _inkling_moe_ep_size() -> int:
@@ -585,6 +594,28 @@ class InklingMoE(nn.Module):
             )
             return [f"experts.routed_experts.{pname}"]
 
+        # Per-expert GPTQ (auto-round auto_gptq export): experts.<e>.{w13,w2}.
+        # The fused w13 gate/up are interleaved along the last dim, so split
+        # into w1 (gate) / w3 (up) and let the FusedMoE weight loader handle
+        # the transposed/packed TP/EP sharding. g_idx is synthesized in
+        # finalize_load (the checkpoint carries none for desc_act=False).
+        gptq = _PER_EXPERT_GPTQ_RE.match(name)
+        if gptq is not None:
+            self._has_gptq_experts = True
+            experts = self.experts.routed_experts
+            stack = gptq.group("stack")
+            sub = gptq.group("sub")
+            eid = int(gptq.group("eid"))
+            param = getattr(experts, f"{stack}_{sub}", None)
+            if param is None:
+                return []  # artifact not registered by the active kernel
+            if stack == "w13":
+                param.weight_loader(param, weight[..., 0::2], name, "w1", eid)
+                param.weight_loader(param, weight[..., 1::2], name, "w3", eid)
+            else:
+                param.weight_loader(param, weight, name, "w2", eid)
+            return [f"experts.routed_experts.{stack}_{sub}"]
+
         experts: RoutedExperts = self.experts.routed_experts
         key = name.split(".", 1)[1]
 
@@ -633,9 +664,28 @@ class InklingMoE(nn.Module):
         return [f"experts.routed_experts.{key}"]
 
     def finalize_load(self) -> list[str]:
-        """Post-load fixups for zeroed padding experts."""
+        """Post-load fixups: GPTQ g_idx synthesis + zeroed padding experts."""
         experts = self.experts.routed_experts
         out: list[str] = []
+
+        # GPTQ checkpoints (auto-round) carry no g_idx; for desc_act=False it
+        # is the trivial per-input-feature group ramp, and the Marlin repack
+        # (process_weights_after_loading) reads w13/w2_g_idx, so synthesize it.
+        if getattr(self, "_has_gptq_experts", False):
+            for stack in ("w13", "w2"):
+                g = getattr(experts, f"{stack}_g_idx", None)
+                if g is None:
+                    continue
+                n_in = g.shape[1]
+                sc = getattr(experts, f"{stack}_scales", None)
+                num_groups = sc.shape[1] if (sc is not None and sc.ndim >= 2) else 1
+                group_size = max(1, n_in // num_groups) if num_groups > 0 else n_in
+                ramp = (torch.arange(n_in, device=g.device) // group_size).to(
+                    torch.int32
+                )
+                g.data[:] = ramp.unsqueeze(0)
+                out.append(f"experts.routed_experts.{stack}_g_idx")
+
         # Zero the EP-alignment padding experts (if any) so their
         # (never-routed) slots hold defined values.
         slots = self._local_expert_slots()
@@ -650,6 +700,14 @@ class InklingMoE(nn.Module):
                 "w2_weight_scale",
                 "w13_weight_scale_2",
                 "w2_weight_scale_2",
+                "w13_qweight",
+                "w2_qweight",
+                "w13_qzeros",
+                "w2_qzeros",
+                "w13_scales",
+                "w2_scales",
+                "w13_g_idx",
+                "w2_g_idx",
             ):
                 p = getattr(experts, pname, None)
                 if p is not None:
