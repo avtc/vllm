@@ -42,6 +42,16 @@ def _is_sm8x() -> bool:
     )
 
 
+# Compute the SM8x dispatch ONCE at module load. ``get_device_capability`` is
+# ``@functools.cache``-wrapped (a C function), which torch.compile/dynamo
+# cannot trace -- calling ``_is_sm8x()`` inside the hot ``forward_cuda`` path
+# raised ``Unsupported: can't handle functions not implemented in python`` and
+# aborted inductor compilation. ``_IS_SM8X`` is a plain module-global bool that
+# dynamo specializes on as a guard, so the branch compiles cleanly. The device
+# capability is static for the process, so caching once is correct.
+_IS_SM8X: bool = _is_sm8x()
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -72,7 +82,7 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _is_sm8x():
+        if _IS_SM8X:
             return self.forward_native(
                 residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
                 hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
@@ -232,7 +242,7 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        if _is_sm8x():
+        if _IS_SM8X:
             return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
@@ -313,7 +323,7 @@ class HCHeadOp(CustomOp):
         rms_norm_eps: float,
         hc_eps: float,
     ) -> torch.Tensor:
-        if _is_sm8x():
+        if _IS_SM8X:
             # No native torch hc_head; use the portable triton path (as XPU does).
             return self.forward_xpu(
                 hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
@@ -443,7 +453,7 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _is_sm8x():
+        if _IS_SM8X:
             return self.forward_native(
                 x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
                 rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
