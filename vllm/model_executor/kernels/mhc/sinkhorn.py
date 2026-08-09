@@ -79,7 +79,7 @@ def _fused_comb_mix(
         mixes_comb,
         base_comb,
         out,
-        hc_scale_comb,
+        float(hc_scale_comb),
         hc_eps,
         HC_MULT=hc_mult,
         SINKHORN_REPEAT=sinkhorn_repeat,
@@ -136,7 +136,7 @@ def _mhc_norm_sigmoid_kernel(
         idx = off + tl.arange(0, BLOCK_R)
         m = idx < red_len
         r = tl.load(residual_ptr + n * stride_res_n + idx, mask=m, other=0.0).to(tl.float32)
-        sq += tl.sum(r * r)
+        sq = sq + tl.sum(r * r)
     rscale = tl.rsqrt(sq / red_len + rms_eps)
     # ---- scale mixes + pre/post sigmoid ----
     # HC_MULT3 (24) is not a power of 2 -> pad to M3_PAD (32) and mask.
@@ -175,7 +175,7 @@ def fused_mhc_norm_sigmoid(
     m3_pad = triton.next_power_of_2(hc_mult3)
     _mhc_norm_sigmoid_kernel[(n,)](
         residual_flat, mixes, scaled, pre_mix, post_mix,
-        hc_scale[0], hc_scale[1],
+        float(hc_scale[0]), float(hc_scale[1]),
         hc_base[:hc_mult].contiguous(), hc_base[hc_mult:2 * hc_mult].contiguous(),
         rms_eps, hc_pre_eps, hc_post_mult,
         residual_flat.stride(0),
