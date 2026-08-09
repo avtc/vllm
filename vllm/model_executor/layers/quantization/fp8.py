@@ -92,6 +92,11 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = init_logger(__name__)
 
+# Cached at import so torch.compile/dynamo specializes on it (False in normal
+# runs -> the debug-print blocks below are dead-code-eliminated, avoiding the
+# untraceable `globals()` builtin that previously aborted inductor compilation).
+_FP8_DEBUG: bool = os.environ.get("VLLM_SM86_FP8_DEBUG") == "1"
+
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -472,8 +477,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # SM8x diagnostic (VLLM_SM86_FP8_BF16=1): dequantize the raw block-fp8
         # weight to bf16 on the fly (correctly decoding e8m0 scales via
         # .to(float32)) and run a plain matmul, bypassing MarlinFP8.
-        if not globals().get("_FP8_DBG_DONE"):
-            globals()["_FP8_DBG_DONE"] = True
+        if _FP8_DEBUG:
             print(
                 f"[FP8_DBG] env FP8_BF16={os.environ.get('VLLM_SM86_FP8_BF16')!r} "
                 f"NAN_PROBE={os.environ.get('VLLM_SM86_NAN_PROBE')!r} "
@@ -488,8 +492,7 @@ class Fp8LinearMethod(LinearMethodBase):
             and getattr(layer, "weight_scale_inv", None) is not None
             and not getattr(layer, "is_bmm", False)
         ):
-            if not globals().get("_FP8_BYPASS_LOGGED"):
-                globals()["_FP8_BYPASS_LOGGED"] = True
+            if _FP8_DEBUG:
                 print("[FP8_DBG] bf16 bypass FIRED", flush=True)
             w = layer.weight  # [out, in] float8_e4m3fn
             s = layer.weight_scale_inv  # [ceil(out/bn), ceil(in/bk)] (e8m0 or f32)

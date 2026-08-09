@@ -25,6 +25,11 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+
+import os
+# Cached at import so torch.compile/dynamo dead-code-eliminates the debug
+# block below (avoids the untraceable `globals()` builtin).
+_KINS_DEBUG: bool = os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
 from vllm.v1.worker.cp_utils import (
     DEFAULT_CP_LAYOUT,
     ContextParallelLayout,
@@ -226,10 +231,7 @@ def _quantize_and_insert_k_cache_sm86_pyref(
     cache_2d = k_cache if k_cache.dim() == 2 else k_cache.reshape(k_cache.shape[0], -1)
     import os
 
-    if os.environ.get("VLLM_SM86_NAN_PROBE") == "1" and not globals().get(
-        "_KINS_DBG"
-    ):
-        globals()["_KINS_DBG"] = True
+    if _KINS_DEBUG:
         print(
             f"[KINS_DBG] k_cache shape={tuple(k_cache.shape)} "
             f"stride={k_cache.stride()} contig={k_cache.is_contiguous()} "
