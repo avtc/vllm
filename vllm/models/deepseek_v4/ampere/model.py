@@ -1313,16 +1313,20 @@ class DeepseekV4Model(nn.Module):
         # Multi-stream overlap: run the indexer / compressor / lighter input
         # GEMMs on aux CUDA streams in parallel with fused_wqa_wkv + wq_b on
         # the default stream (TRT-LLM Level-1 overlap, same as the nvidia/
-        # Hopper path). This was disabled during NaN debugging to rule out a
-        # cross-stream race; the NaN root cause was since fixed (recycled-block
-        # zeroing + slot_mapping), and CUDA streams work on all GPUs, so the
-        # overlap is re-enabled by default. Set VLLM_DSV4_AMPERE_AUX_STREAM=0
-        # to fall back to serial execution for A/B comparison.
-        if _dsv4_os.environ.get("VLLM_DSV4_AMPERE_AUX_STREAM", "1") == "1":
+        # Hopper path). This was disabled during NaN debugging (the NaN root
+        # cause was since fixed: recycled-block zeroing + slot_mapping).
+        #
+        # NOTE: profiling showed the DSv4 decode GPU is ~100% saturated (kernels
+        # back-to-back, zero idle gaps), so overlapping independent work onto
+        # aux streams CANNOT reduce step time — it just rearranges already-
+        # busy GPU time. Default is therefore OFF. Kept for experimentation:
+        # set VLLM_DSV4_AMPERE_AUX_STREAM=1 to enable (may help only if future
+        # kernel fusion creates idle gaps for aux work to fill).
+        if _dsv4_os.environ.get("VLLM_DSV4_AMPERE_AUX_STREAM", "0") == "1":
             aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
             logger.info_once(
                 "DSv4 Ampere: aux-stream overlap ENABLED (3 streams). "
-                "Set VLLM_DSV4_AMPERE_AUX_STREAM=0 to disable.")
+                "NOTE: decode GPU is saturated; overlap is unlikely to help.")
         else:
             aux_stream_list = None
 
