@@ -26,7 +26,8 @@ def _fused_comb_mix_kernel(
     mixes_comb_ptr,   # [num_tokens, HC_MULT*HC_MULT] fp32 (the comb slice of mixes)
     base_comb_ptr,    # [HC_MULT*HC_MULT] fp32
     out_ptr,          # [num_tokens, HC_MULT*HC_MULT] fp32
-    hc_scale_comb,    # scalar fp32 (comb scale = hc_scale[2])
+    hc_scale_ptr,     # [3] fp32 pointer -- tl.load(element) in-kernel (capture-safe;
+                     #   avoids both the pointer-mult error and a host float() sync)
     hc_eps,           # sinkhorn eps (added after softmax)
     HC_MULT: tl.constexpr,
     SINKHORN_REPEAT: tl.constexpr,
@@ -35,6 +36,7 @@ def _fused_comb_mix_kernel(
     does softmax + eps + col-norm + (repeat-1) Sinkhorn iterations entirely
     in-kernel. Matches mhc_pre_torch lines 75-82 bit-for-bit (fp32 math)."""
     n = tl.program_id(0)
+    hc_scale_comb = tl.load(hc_scale_ptr + 2)   # comb scale = hc_scale[2]
     # offsets for a [HC_MULT, HC_MULT] block belonging to token n
     row = tl.arange(0, HC_MULT)[:, None]   # [HC_MULT, 1]
     col = tl.arange(0, HC_MULT)[None, :]   # [1, HC_MULT]
@@ -65,7 +67,7 @@ def _fused_comb_mix_kernel(
 def _fused_comb_mix(
     mixes_comb: torch.Tensor,   # [num_tokens, hc_mult*hc_mult] fp32
     base_comb: torch.Tensor,    # [hc_mult*hc_mult] fp32
-    hc_scale_comb: float,
+    hc_scale_comb: torch.Tensor,  # [3] fp32 tensor; kernel tl.loads element 2
     hc_eps: float,
     sinkhorn_repeat: int,
     hc_mult: int,
@@ -79,7 +81,7 @@ def _fused_comb_mix(
         mixes_comb,
         base_comb,
         out,
-        float(hc_scale_comb),
+        hc_scale_comb,   # pass the full [3] tensor; kernel tl.loads element 2
         hc_eps,
         HC_MULT=hc_mult,
         SINKHORN_REPEAT=sinkhorn_repeat,
@@ -117,7 +119,7 @@ def _mhc_norm_sigmoid_kernel(
     scaled_mixes_ptr,  # [num_tokens, HC_MULT3] fp32 (out: RMSNorm-scaled)
     pre_mix_ptr,    # [num_tokens, HC_MULT] fp32 (out)
     post_mix_ptr,   # [num_tokens, HC_MULT] fp32 (out)
-    hc_scale0, hc_scale1,   # scalars
+    hc_scale_ptr,   # [3] fp32 pointer -- tl.load elements in-kernel (capture-safe)
     base_pre_ptr,   # [HC_MULT] fp32
     base_post_ptr,  # [HC_MULT] fp32
     rms_eps, hc_pre_eps, hc_post_mult,
@@ -129,6 +131,8 @@ def _mhc_norm_sigmoid_kernel(
     BLOCK_R: tl.constexpr,   # reduction block over HC_MULT*HIDDEN
 ):
     n = tl.program_id(0)
+    hc_scale0 = tl.load(hc_scale_ptr + 0)
+    hc_scale1 = tl.load(hc_scale_ptr + 1)
     red_len = HC_MULT * HIDDEN
     # ---- sqrsum reduction over [HC_MULT*HIDDEN] ----
     sq = 0.0
@@ -175,7 +179,7 @@ def fused_mhc_norm_sigmoid(
     m3_pad = triton.next_power_of_2(hc_mult3)
     _mhc_norm_sigmoid_kernel[(n,)](
         residual_flat, mixes, scaled, pre_mix, post_mix,
-        float(hc_scale[0]), float(hc_scale[1]),
+        hc_scale,   # pass the full [3] tensor; kernel tl.loads elements 0/1
         hc_base[:hc_mult].contiguous(), hc_base[hc_mult:2 * hc_mult].contiguous(),
         rms_eps, hc_pre_eps, hc_post_mult,
         residual_flat.stride(0),

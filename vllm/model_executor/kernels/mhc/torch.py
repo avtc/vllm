@@ -101,7 +101,7 @@ def mhc_pre_torch(
         comb_mix_flat = _fused_comb_mix(
             mixes[:, 2 * hc_mult :],          # [N, hc_mult*hc_mult]
             hc_base[2 * hc_mult :],           # [hc_mult*hc_mult]
-            hc_scale[2],
+            hc_scale,                          # full [3] tensor; kernel tl.loads [2]
             hc_sinkhorn_eps,
             sinkhorn_repeat,
             hc_mult,
