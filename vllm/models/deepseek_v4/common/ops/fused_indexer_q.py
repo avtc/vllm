@@ -6,6 +6,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.torch_utils import direct_register_custom_op
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -24,6 +25,37 @@ _IS_CUTEDSL_SM9PLUS_INDEXER: bool = (
     has_cutedsl() and current_platform.get_device_capability()[0] >= 9
 )
 _INDEXER_FP8_DTYPE = current_platform.fp8_dtype()
+
+
+# ---------------------------------------------------------------------------
+# torch.compile custom op: the fp8e4m3fn CAST.
+#
+# Inductor fuses the UE8M0 scale math (max/log2/pow/ceil/clamp) + the final
+# `.to(float8_e4m3fn)` into one Triton kernel that STORES fp8e4nv -- which fails
+# to compile on Ampere (SM86 has no native fp8e4nv; only fp8e5). The cast itself
+# works fine on Ampere (torch emulates it); only the inductor-generated Triton
+# kernel is the problem.
+#
+# Wrapping just the cast in a registered custom op makes it an opaque graph
+# node: inductor still fuses the preceding bf16 scale math (the real win), but
+# emits the cast as a standalone op (torch emulated, Ampere-safe) instead of a
+# fp8e4nv-storing Triton kernel. The fp8 output then flows into the opaque
+# indexer_op Triton kernel, so no inductor kernel ever touches fp8e4nv.
+# ---------------------------------------------------------------------------
+def _dsv4_fp8_cast_e4m3fn_op(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.float8_e4m3fn)
+
+
+def _dsv4_fp8_cast_e4m3fn_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x, dtype=torch.float8_e4m3fn)
+
+
+direct_register_custom_op(
+    op_name="dsv4_fp8_cast_e4m3fn",
+    op_func=_dsv4_fp8_cast_e4m3fn_op,
+    mutates_args=[],
+    fake_impl=_dsv4_fp8_cast_e4m3fn_fake,
+)
 
 
 @triton.jit
@@ -348,7 +380,8 @@ def _fused_indexer_q_rope_quant_sm86_pyref(
         q_full[..., :NOPE_DIM] = nope
     q_full[..., NOPE_DIM:] = rope_rotated
 
-    index_q_fp8 = (q_full / q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    index_q_fp8 = torch.ops.vllm.dsv4_fp8_cast_e4m3fn(
+        q_full / q_scale.unsqueeze(-1))
     iw = index_weights.to(torch.float32)
     weights_out = iw * q_scale * index_weights_softmax_scale * index_weights_head_scale
     return index_q_fp8, weights_out
