@@ -55,6 +55,13 @@ _COMPRESSOR_READBACK_CONFIRMED: dict[str, bool] = {}
 import contextlib as _dsv4_ctxlib
 import os as _dsv4_os
 
+# Static platform dispatch (get_device_capability is @functools.cache-wrapped,
+# untraceable by dynamo under torch.compile). Computed once at module load.
+_COMPRESSOR_IS_SM8X: bool = (
+    current_platform.is_cuda()
+    and current_platform.get_device_capability()[0] < 9
+)
+
 _DSV4_TRACE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1"
 
 
@@ -557,10 +564,7 @@ class DeepseekCompressor(nn.Module):
         # so route head=512 through the Triton store there too. The Triton store
         # only supports the fp8_ds_mla UE8M0 layout, so the full-cache flags must
         # be off (they are, for uint8 fp8_ds_mla kv_cache).
-        is_ampere = (
-            current_platform.is_cuda()
-            and current_platform.get_device_capability()[0] < 9
-        )
+        is_ampere = _COMPRESSOR_IS_SM8X
         compress_norm_rope_store_fn: Any
         if current_platform.is_cuda() and self.head_dim == 512 and not is_ampere:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (

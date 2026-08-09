@@ -10,6 +10,21 @@ from vllm.utils.import_utils import has_cutedsl
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
 
+# Hoist static platform dispatch to module load. current_platform.
+# get_device_capability() / fp8_dtype() are @functools.cache-wrapped (C
+# functions) that torch.compile/dynamo cannot trace ('can't handle functions not
+# implemented in python'), aborting compilation. Device capability is static for
+# the process, so caching once is correct. Reading these module globals lets
+# dynamo specialize on them as guards.
+_IS_SM8X_INDEXER: bool = (
+    current_platform.is_cuda()
+    and current_platform.get_device_capability()[0] < 9
+)
+_IS_CUTEDSL_SM9PLUS_INDEXER: bool = (
+    has_cutedsl() and current_platform.get_device_capability()[0] >= 9
+)
+_INDEXER_FP8_DTYPE = current_platform.fp8_dtype()
+
 
 @triton.jit
 def _get_cos_sin(
@@ -404,7 +419,7 @@ def fused_indexer_q_rope_quant(
             device=index_q.device,
         )
         # cutedsl (CUTLASS DSL) is Hopper/Blackwell-only; SM8x -> Triton.
-        if has_cutedsl() and current_platform.get_device_capability()[0] >= 9:
+        if _IS_CUTEDSL_SM9PLUS_INDEXER:
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
@@ -457,11 +472,11 @@ def fused_indexer_q_rope_quant(
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
 
-    fp8_dtype = current_platform.fp8_dtype()
+    fp8_dtype = _INDEXER_FP8_DTYPE
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
-    if current_platform.is_cuda() and current_platform.get_device_capability()[0] < 9:
+    if _IS_SM8X_INDEXER:
         # SM8x (Ampere): Triton cannot emit fp8e4nv; do RoPE + fp8 quant in
         # torch (torch emulates .to(float8_e4m3fn) on SM8x).
         q_fp8, w_out = _fused_indexer_q_rope_quant_sm86_pyref(
@@ -476,7 +491,7 @@ def fused_indexer_q_rope_quant(
         index_q_fp8.copy_(q_fp8)
         index_weights_out.copy_(w_out)
     # cutedsl (CUTLASS DSL) is Hopper/Blackwell-only; SM8x -> Triton.
-    elif has_cutedsl() and current_platform.get_device_capability()[0] >= 9:
+    elif _IS_CUTEDSL_SM9PLUS_INDEXER:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,

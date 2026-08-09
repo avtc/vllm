@@ -30,6 +30,13 @@ import os
 # Cached at import so torch.compile/dynamo dead-code-eliminates the debug
 # block below (avoids the untraceable `globals()` builtin).
 _KINS_DEBUG: bool = os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
+# Static platform dispatch (get_device_capability is @functools.cache-wrapped,
+# untraceable by dynamo). Computed once at module load.
+_CACHE_IS_SM8X: bool = (
+    current_platform.is_cuda()
+    and current_platform.get_device_capability()[0] < 9
+)
+_CACHE_IS_SM9PLUS: bool = current_platform.get_device_capability()[0] >= 9
 from vllm.v1.worker.cp_utils import (
     DEFAULT_CP_LAYOUT,
     ContextParallelLayout,
@@ -280,9 +287,7 @@ def quantize_and_insert_k_cache(
 
     # SM8x (Ampere): the Triton kernel works but must encode e4m3fn manually
     # (no fp8e4nv casts). Capture-safe, unlike the torch pyref (.nonzero()).
-    use_manual_e4m3 = current_platform.is_cuda() and (
-        current_platform.get_device_capability()[0] < 9
-    )
+    use_manual_e4m3 = _CACHE_IS_SM8X
     import os
 
     if use_manual_e4m3 and os.environ.get("VLLM_SM86_KINS_TORCH") == "1":
@@ -578,7 +583,7 @@ def dequantize_and_gather_k_cache(
     if (
         not cp_layout.enabled
         and has_cutedsl()
-        and current_platform.get_device_capability()[0] >= 9
+        and _CACHE_IS_SM9PLUS
     ):
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
