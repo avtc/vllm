@@ -17,6 +17,7 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_dcp_group
 from vllm.forward_context import get_forward_context
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
@@ -636,6 +637,24 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        # Routed through a registered custom op (torch.ops.vllm.
+        # dsv4_ampere_forward_mqa) so torch.compile/dynamo traces it as an
+        # opaque graph node via the fake impl, instead of entering the body.
+        # The body calls current_workspace_manager().get_simultaneous() which
+        # can reach torch.accelerator.empty_cache() -- a dynamo skip-list
+        # function that hard-errors under aot_compile_fullgraph (used by both
+        # VLLM_COMPILE and DYNAMO_TRACE_ONCE modes). Mirrors the
+        # unified_attention_with_output pattern.
+        torch.ops.vllm.dsv4_ampere_forward_mqa(
+            q, kv, positions, output, self.prefix)
+
+    def _forward_mqa_impl(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )
@@ -995,3 +1014,45 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 output[query_start:query_end] = apply_attn_sink(
                     out, lse, self.attn_sink
                 )
+
+
+# ---------------------------------------------------------------------------
+# torch.compile custom-op registration for the ampere attention decode.
+#
+# forward_mqa() routes through torch.ops.vllm.dsv4_ampere_forward_mqa so that
+# dynamo traces it as a single opaque graph node (using the fake impl below)
+# and never enters the body, which reaches torch.accelerator.empty_cache() via
+# the workspace manager -- a dynamo skip-list function that hard-errors under
+# aot_compile_fullgraph. The real layer instance is recovered at runtime from
+# the forward_context registry (same mechanism as unified_attention_with_output
+# / get_attention_context), keyed by the layer prefix.
+# ---------------------------------------------------------------------------
+def _dsv4_ampere_forward_mqa_op(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context = get_forward_context()
+    attn_layer = forward_context.no_compile_layers[layer_name]
+    attn_layer._forward_mqa_impl(q, kv, positions, output)
+
+
+def _dsv4_ampere_forward_mqa_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # `output` is mutated in place; no new tensor is produced.
+    return
+
+
+direct_register_custom_op(
+    op_name="dsv4_ampere_forward_mqa",
+    op_func=_dsv4_ampere_forward_mqa_op,
+    mutates_args=["output"],
+    fake_impl=_dsv4_ampere_forward_mqa_fake,
+)
