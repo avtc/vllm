@@ -614,6 +614,7 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
+    @torch.compiler.disable
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # Ampere uses BF16 reference wo_a path (same as ROCm).
         from vllm.models.deepseek_v4.amd.rocm import rocm_inv_rope_einsum
@@ -629,6 +630,7 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         )
         return self.wo_b(z.flatten(1))
 
+    @torch.compiler.disable
     def forward_mqa(
         self,
         q: torch.Tensor,
