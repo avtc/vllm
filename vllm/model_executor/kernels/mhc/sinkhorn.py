@@ -125,22 +125,26 @@ def _mhc_norm_sigmoid_kernel(
     HC_MULT: tl.constexpr,
     HIDDEN: tl.constexpr,
     HC_MULT3: tl.constexpr,
+    M3_PAD: tl.constexpr,      # next power of 2 >= HC_MULT3 (tl.arange needs pow2)
     BLOCK_R: tl.constexpr,   # reduction block over HC_MULT*HIDDEN
 ):
     n = tl.program_id(0)
     red_len = HC_MULT * HIDDEN
     # ---- sqrsum reduction over [HC_MULT*HIDDEN] ----
     sq = 0.0
-    for off in tl.range(0, red_len, BLOCK_R):
+    for off in range(0, red_len, BLOCK_R):
         idx = off + tl.arange(0, BLOCK_R)
         m = idx < red_len
         r = tl.load(residual_ptr + n * stride_res_n + idx, mask=m, other=0.0).to(tl.float32)
         sq += tl.sum(r * r)
     rscale = tl.rsqrt(sq / red_len + rms_eps)
     # ---- scale mixes + pre/post sigmoid ----
-    moff = n * HC_MULT3 + tl.arange(0, HC_MULT3)
-    mixes = tl.load(mixes_ptr + moff) * rscale
-    tl.store(scaled_mixes_ptr + moff, mixes)
+    # HC_MULT3 (24) is not a power of 2 -> pad to M3_PAD (32) and mask.
+    m3 = tl.arange(0, M3_PAD)
+    m3mask = m3 < HC_MULT3
+    moff = n * HC_MULT3 + m3
+    mixes = tl.load(mixes_ptr + moff, mask=m3mask, other=0.0) * rscale
+    tl.store(scaled_mixes_ptr + moff, mixes, mask=m3mask)
     # pre: first HC_MULT of mixes
     pi = tl.arange(0, HC_MULT)
     pre_logits = tl.load(mixes_ptr + n * HC_MULT3 + pi) * rscale * hc_scale0 \
@@ -168,13 +172,15 @@ def fused_mhc_norm_sigmoid(
     post_mix = torch.empty((n, hc_mult), dtype=torch.float32, device=mixes.device)
     red_len = hc_mult * hidden
     BLOCK_R = 1024
+    m3_pad = triton.next_power_of_2(hc_mult3)
     _mhc_norm_sigmoid_kernel[(n,)](
         residual_flat, mixes, scaled, pre_mix, post_mix,
         hc_scale[0], hc_scale[1],
         hc_base[:hc_mult].contiguous(), hc_base[hc_mult:2 * hc_mult].contiguous(),
         rms_eps, hc_pre_eps, hc_post_mult,
         residual_flat.stride(0),
-        HC_MULT=hc_mult, HIDDEN=hidden, HC_MULT3=hc_mult3, BLOCK_R=BLOCK_R,
+        HC_MULT=hc_mult, HIDDEN=hidden, HC_MULT3=hc_mult3, M3_PAD=m3_pad,
+        BLOCK_R=BLOCK_R,
     )
     return pre_mix, post_mix, scaled
 
