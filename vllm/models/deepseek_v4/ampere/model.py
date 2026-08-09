@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -87,6 +88,8 @@ def _probe_layers() -> bool:
 # the per-call cost is a boolean check, not a dict lookup (5x43 calls/step).
 import contextlib as _dsv4_ctxlib
 import os as _dsv4_os
+
+logger = init_logger(__name__)
 
 _DSV4_TRACE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1"
 
@@ -1307,8 +1310,21 @@ class DeepseekV4Model(nn.Module):
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        # Disable aux streams on Ampere — no multi-stream overlap support.
-        aux_stream_list = None
+        # Multi-stream overlap: run the indexer / compressor / lighter input
+        # GEMMs on aux CUDA streams in parallel with fused_wqa_wkv + wq_b on
+        # the default stream (TRT-LLM Level-1 overlap, same as the nvidia/
+        # Hopper path). This was disabled during NaN debugging to rule out a
+        # cross-stream race; the NaN root cause was since fixed (recycled-block
+        # zeroing + slot_mapping), and CUDA streams work on all GPUs, so the
+        # overlap is re-enabled by default. Set VLLM_DSV4_AMPERE_AUX_STREAM=0
+        # to fall back to serial execution for A/B comparison.
+        if _dsv4_os.environ.get("VLLM_DSV4_AMPERE_AUX_STREAM", "1") == "1":
+            aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+            logger.info_once(
+                "DSv4 Ampere: aux-stream overlap ENABLED (3 streams). "
+                "Set VLLM_DSV4_AMPERE_AUX_STREAM=0 to disable.")
+        else:
+            aux_stream_list = None
 
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.
