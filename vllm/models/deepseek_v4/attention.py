@@ -8,10 +8,17 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
+
+# [compile-correctness probe] opaque passthrough (registered in ampere/model.py).
+# Used to bisect whether the attention output=0 under torch.compile comes from
+# forward_mqa's MLA kernels, their in-place mutation, or _o_proj.
+_ATTENTION_COMPILE_PROBE_ON: bool = os.environ.get(
+    "VLLM_DSV4_COMPILE_PROBE") == "1"
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -362,6 +369,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             o_padded,
         )
+        if _ATTENTION_COMPILE_PROBE_ON:
+            # Probe the MLA output buffer RIGHT after forward_mqa wrote it
+            # (inside attention_impl). 0 => forward_mqa never wrote o_padded;
+            # nonzero => mutation lost downstream OR _o_proj zeroes it.
+            o_padded = torch.ops.vllm.dsv4_compile_probe(o_padded, "mla_out")
         o = o_padded[:, : self.n_local_heads, :]
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).

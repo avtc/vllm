@@ -47,6 +47,8 @@ import contextlib as _dsv4_ctxlib
 import os as _dsv4_os
 
 _DSV4_TRACE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1"
+_DSV4_COMPILE_PROBE_ON: bool = _dsv4_os.environ.get(
+    "VLLM_DSV4_COMPILE_PROBE") == "1"
 
 
 def _dsv4_trace(name: str):
@@ -719,6 +721,12 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 swa_only=swa_only,
                 output=output[:num_decode_tokens],
             )
+        if _DSV4_COMPILE_PROBE_ON:
+            # Probe output RIGHT after the MLA kernels wrote it (inside the
+            # custom op's real impl). 0 here => kernels didn't write (workspace
+            # /metadata issue); nonzero => the op DID write, so a 0 seen by the
+            # caller means the in-place mutation isn't tracked by aot/inductor.
+            torch.ops.vllm.dsv4_compile_probe(output, f"fmqa_write:{self.prefix}")
 
     def _forward_decode(
         self,
