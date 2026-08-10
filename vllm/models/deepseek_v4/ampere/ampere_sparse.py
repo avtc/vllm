@@ -671,16 +671,16 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         if _DSV4_COMPILE_PROBE_ON and _FMQA_META_N[0] < 80:
             _FMQA_META_N[0] += 1
             if attn_metadata is None:
-                print(f"[FMQA_META] {self.prefix} attn_metadata=None "
-                      f"-> WARMUP BRANCH (output.zero_ + return, kernels skipped)",
-                      flush=True)
+                print(f"[FMQA_META] {self.prefix} id(fc)={id(forward_context)} "
+                      f"attn_metadata=None -> WARMUP BRANCH (output.zero_ + "
+                      f"return, kernels skipped)", flush=True)
             else:
                 _swa = attn_metadata.get(self.swa_cache_layer.prefix)
                 _np = getattr(_swa, "num_prefills", "?")
                 _nd = getattr(_swa, "num_decodes", "?")
                 _ndt = getattr(_swa, "num_decode_tokens", "?")
-                print(f"[FMQA_META] {self.prefix} attn_metadata=dict "
-                      f"num_prefills={_np} num_decodes={_nd} "
+                print(f"[FMQA_META] {self.prefix} id(fc)={id(forward_context)} "
+                      f"attn_metadata=dict num_prefills={_np} num_decodes={_nd} "
                       f"num_decode_tokens={_ndt}", flush=True)
 
         if attn_metadata is None:

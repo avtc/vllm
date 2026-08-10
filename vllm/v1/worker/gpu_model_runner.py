@@ -3889,13 +3889,38 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
+        if os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1":
+            _mfw = getattr(self, "_dsv4_mfw_n", [0])
+            self._dsv4_mfw_n = _mfw
+            if _mfw[0] < 30:
+                _mfw[0] += 1
+                try:
+                    from vllm.forward_context import get_forward_context as _gfc
+                    _fc = _gfc()
+                    _am = _fc.attn_metadata
+                    print(f"[MFW_PRE] id(fc)={id(_fc)} "
+                          f"attn_meta={'None' if _am is None else type(_am).__name__}",
+                          flush=True)
+                except Exception as _e:
+                    print(f"[MFW_PRE] err={_e}", flush=True)
+        result = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        if os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1":
+            try:
+                from vllm.forward_context import get_forward_context as _gfc
+                _fc = _gfc()
+                _am = _fc.attn_metadata
+                print(f"[MFW_POST] id(fc)={id(_fc)} "
+                      f"attn_meta={'None' if _am is None else type(_am).__name__}",
+                      flush=True)
+            except Exception:
+                pass
+        return result
 
     @staticmethod
     def _is_uniform_decode(
