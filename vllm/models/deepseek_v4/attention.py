@@ -454,6 +454,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
+        if _ATTENTION_COMPILE_PROBE_ON:
+            import torch as _t
+            _am = ("None" if attn_metadata is None
+                   else f"dict({len(attn_metadata)}k)" if isinstance(attn_metadata, dict)
+                   else type(attn_metadata).__name__)
+            print(f"[ATTNIMPL_META] {getattr(self, 'prefix', '?')} "
+                  f"is_compiling={_t.compiler.is_compiling()} "
+                  f"attn_metadata={_am}", flush=True)
+
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
