@@ -760,6 +760,7 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::dsv4_ampere_forward_mqa",
+        "vllm::dsv4_ampere_attention_impl",
         "vllm::hpc_rope_norm_forward",
     ]
 

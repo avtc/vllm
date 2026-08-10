@@ -47,6 +47,7 @@ from vllm.config import (
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -359,7 +360,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
         # eagerly between captured graph segments).
-        self.attention_impl(
+        # attention_impl runs eager (split-point op) under compile, so the
+        # compressor store + qnorm_rope kv-insert + forward_mqa all see fresh
+        # attn_metadata and write/read the live kv_cache.
+        torch.ops.vllm.dsv4_ampere_attention_impl(
             hidden_states,
             qr,
             kv,
@@ -368,6 +372,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_weights,
             positions,
             o_padded,
+            self.prefix,
         )
         if _ATTENTION_COMPILE_PROBE_ON:
             # Probe the MLA output buffer RIGHT after forward_mqa wrote it
@@ -439,15 +444,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
-    # Under torch.compile (mode:3), force attention_impl to run EAGER (graph
-    # break). It reads attn_metadata = get_forward_context().attn_metadata,
-    # which dynamo otherwise BAKES to the trace-time value -- so the compressor
-    # store (compress_norm_rope_store) would write to trace-time slots, leaving
-    # the runtime kv_cache empty and forward_mqa reading zeros (confirmed:
-    # KVPOP compressed_k_cache[blk]_absmax=0.0). Eager => fresh per-step
-    # metadata => compressor writes the live kv_cache. No effect under mode:0
-    # (FULL cudagraph, no dynamo) so the working FULL path is unchanged.
-    @torch.compiler.disable
+    # attention_impl is invoked through the registered custom op
+    # torch.ops.vllm.dsv4_ampere_attention_impl (a torch.compile split point --
+    # see module-level registration at the bottom of this file) so that under
+    # mode:3 it runs EAGER with fresh per-step attn_metadata. It reads
+    # attn_metadata = get_forward_context().attn_metadata, which dynamo
+    # otherwise BAKES to the trace-time value -- so the compressor store
+    # (compress_norm_rope_store) would write to trace-time slots, leaving the
+    # runtime kv_cache empty and forward_mqa reading zeros (confirmed: KVPOP
+    # compressed_k_cache[blk]_absmax=0.0). @torch.compiler.disable cannot be
+    # used because mode:3 traces via fullgraph (forbids graph breaks); a
+    # registered custom op is the only split-point mechanism that works.
     @eager_break_during_capture
     def attention_impl(
         self,
@@ -830,3 +837,66 @@ class DeepseekV4Indexer(nn.Module):
             self.aux_stream,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
+
+
+# ---------------------------------------------------------------------------
+# torch.compile custom-op registration for attention_impl.
+#
+# attention_impl() routes through torch.ops.vllm.dsv4_ampere_attention_impl so
+# that under mode:3 (VLLM_COMPILE) it becomes a graph SPLIT POINT (runs eager
+# with fresh per-step forward_context) instead of being compiled inline. It
+# reads attn_metadata = get_forward_context().attn_metadata, which dynamo
+# otherwise BAKES to the trace-time value -- so the compressor store
+# (compress_norm_rope_store) and qnorm_rope kv-insert would write to trace-time
+# slots, leaving the runtime kv_cache empty and forward_mqa reading zeros
+# (confirmed: KVPOP compressed_k_cache[blk]_absmax=0.0). Mirrors the
+# dsv4_ampere_forward_mqa split-point pattern. @torch.compiler.disable cannot
+# be used because mode:3 traces via aot_compile_fullgraph (forbids breaks); a
+# registered custom op is the only mechanism that works.
+# ---------------------------------------------------------------------------
+def _dsv4_ampere_attention_impl_op(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor,
+    indexer_kv_score: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context = get_forward_context()
+    attn_layer = forward_context.no_compile_layers[layer_name]
+    attn_layer.attention_impl(
+        hidden_states,
+        qr,
+        kv,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
+        positions,
+        out,
+    )
+
+
+def _dsv4_ampere_attention_impl_fake(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor,
+    indexer_kv_score: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # `out` is mutated in place; no new tensor is produced.
+    return
+
+
+direct_register_custom_op(
+    op_name="dsv4_ampere_attention_impl",
+    op_func=_dsv4_ampere_attention_impl_op,
+    mutates_args=["out"],
+    fake_impl=_dsv4_ampere_attention_impl_fake,
+)
