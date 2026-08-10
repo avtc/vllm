@@ -117,7 +117,7 @@ def _dsv4_trace(name: str):
 _COMPILE_PROBE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1"
 _COMPILE_PROBE_N = [0]   # throttle: stop logging after this many calls (covers
                           # warmup dummy forwards + first ~10 real forwards)
-_COMPILE_PROBE_LIMIT = 3000
+_COMPILE_PROBE_LIMIT = 20000
 
 
 def _dsv4_compile_probe_op(x: torch.Tensor, tag: str) -> torch.Tensor:

@@ -50,6 +50,7 @@ _DSV4_TRACE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1"
 _DSV4_COMPILE_PROBE_ON: bool = _dsv4_os.environ.get(
     "VLLM_DSV4_COMPILE_PROBE") == "1"
 _FMQA_META_N = [0]  # throttle the FMQA_META metadata-state probe
+_FMQA_META_LIMIT = 2000
 
 
 def _dsv4_trace(name: str):
@@ -668,12 +669,12 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        if _DSV4_COMPILE_PROBE_ON and _FMQA_META_N[0] < 80:
+        if _DSV4_COMPILE_PROBE_ON and _FMQA_META_N[0] < _FMQA_META_LIMIT:
             _FMQA_META_N[0] += 1
             if attn_metadata is None:
                 print(f"[FMQA_META] {self.prefix} id(fc)={id(forward_context)} "
-                      f"attn_metadata=None -> WARMUP BRANCH (output.zero_ + "
-                      f"return, kernels skipped)", flush=True)
+                      f"ntok={q.shape[0]} attn_metadata=None -> WARMUP BRANCH "
+                      f"(output.zero_ + return, kernels skipped)", flush=True)
             else:
                 _swa = attn_metadata.get(self.swa_cache_layer.prefix)
                 _np = getattr(_swa, "num_prefills", "?")
