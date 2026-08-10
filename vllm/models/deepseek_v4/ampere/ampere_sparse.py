@@ -671,10 +671,23 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
 
         if _DSV4_COMPILE_PROBE_ON and _FMQA_META_N[0] < _FMQA_META_LIMIT:
             _FMQA_META_N[0] += 1
+            # Diagnose whether get_forward_context() reads the same module
+            # global the runner sets: log the module identity + live global.
+            import sys as _fmqa_sys
+            _fc_mod = _fmqa_sys.modules.get("vllm.forward_context")
+            _fc_mod_id = id(_fc_mod) if _fc_mod is not None else 0
+            _fc_glob = (_fc_mod._forward_context
+                        if _fc_mod is not None else None)
+            _fc_glob_meta = (
+                "None" if _fc_glob is None
+                else (type(_fc_glob.attn_metadata).__name__
+                      if hasattr(_fc_glob, "attn_metadata") else "?"))
             if attn_metadata is None:
                 print(f"[FMQA_META] {self.prefix} id(fc)={id(forward_context)} "
                       f"ntok={q.shape[0]} attn_metadata=None -> WARMUP BRANCH "
-                      f"(output.zero_ + return, kernels skipped)", flush=True)
+                      f"(output.zero_ + return, kernels skipped) | "
+                      f"mod_id={_fc_mod_id} glob_id={id(_fc_glob)} "
+                      f"glob_meta={_fc_glob_meta}", flush=True)
             else:
                 _swa = attn_metadata.get(self.swa_cache_layer.prefix)
                 _np = getattr(_swa, "num_prefills", "?")
@@ -682,7 +695,9 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 _ndt = getattr(_swa, "num_decode_tokens", "?")
                 print(f"[FMQA_META] {self.prefix} id(fc)={id(forward_context)} "
                       f"attn_metadata=dict num_prefills={_np} num_decodes={_nd} "
-                      f"num_decode_tokens={_ndt}", flush=True)
+                      f"num_decode_tokens={_ndt} | mod_id={_fc_mod_id} "
+                      f"glob_id={id(_fc_glob)} glob_meta={_fc_glob_meta}",
+                      flush=True)
 
         if attn_metadata is None:
             # Warmup dummy run: reserve workspace, skip actual kernels.

@@ -3913,11 +3913,21 @@ class GPUModelRunner(
         if os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1":
             try:
                 from vllm.forward_context import get_forward_context as _gfc
+                import sys as _mfw_sys
                 _fc = _gfc()
                 _am = _fc.attn_metadata
+                _fc_mod = _mfw_sys.modules.get("vllm.forward_context")
+                _fc_mod_id = id(_fc_mod) if _fc_mod is not None else 0
+                _fc_glob = (_fc_mod._forward_context
+                            if _fc_mod is not None else None)
+                _fc_glob_meta = (
+                    "None" if _fc_glob is None
+                    else (type(_fc_glob.attn_metadata).__name__
+                          if hasattr(_fc_glob, "attn_metadata") else "?"))
                 print(f"[MFW_POST] id(fc)={id(_fc)} "
-                      f"attn_meta={'None' if _am is None else type(_am).__name__}",
-                      flush=True)
+                      f"attn_meta={'None' if _am is None else type(_am).__name__} "
+                      f"| mod_id={_fc_mod_id} glob_id={id(_fc_glob)} "
+                      f"glob_meta={_fc_glob_meta}", flush=True)
             except Exception:
                 pass
         return result
