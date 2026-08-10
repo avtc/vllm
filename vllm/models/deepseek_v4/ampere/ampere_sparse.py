@@ -49,6 +49,7 @@ import os as _dsv4_os
 _DSV4_TRACE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_TRACE") == "1"
 _DSV4_COMPILE_PROBE_ON: bool = _dsv4_os.environ.get(
     "VLLM_DSV4_COMPILE_PROBE") == "1"
+_FMQA_META_N = [0]  # throttle the FMQA_META metadata-state probe
 
 
 def _dsv4_trace(name: str):
@@ -666,6 +667,21 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+
+        if _DSV4_COMPILE_PROBE_ON and _FMQA_META_N[0] < 80:
+            _FMQA_META_N[0] += 1
+            if attn_metadata is None:
+                print(f"[FMQA_META] {self.prefix} attn_metadata=None "
+                      f"-> WARMUP BRANCH (output.zero_ + return, kernels skipped)",
+                      flush=True)
+            else:
+                _swa = attn_metadata.get(self.swa_cache_layer.prefix)
+                _np = getattr(_swa, "num_prefills", "?")
+                _nd = getattr(_swa, "num_decodes", "?")
+                _ndt = getattr(_swa, "num_decode_tokens", "?")
+                print(f"[FMQA_META] {self.prefix} attn_metadata=dict "
+                      f"num_prefills={_np} num_decodes={_nd} "
+                      f"num_decode_tokens={_ndt}", flush=True)
 
         if attn_metadata is None:
             # Warmup dummy run: reserve workspace, skip actual kernels.
