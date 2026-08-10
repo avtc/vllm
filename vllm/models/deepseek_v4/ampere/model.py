@@ -101,6 +101,61 @@ def _dsv4_trace(name: str):
     return _dsv4_ctxlib.nullcontext()
 
 
+# ---------------------------------------------------------------------------
+# torch.compile correctness probe.
+#
+# A registered custom op (opaque to inductor) that passes its tensor through
+# unchanged but logs absmax + nan-count. Because it is a registered op, inductor
+# treats it as a black-box node (never fuses/optimizes it), so it runs correctly
+# inside a compiled graph and reports the TRUE intermediate values. Used to
+# localize silent inductor correctness corruption: run mode:0 vs mode:3 and
+# compare the [CPROBE] lines -- the first divergence is the corruption source.
+#
+# NOTE: the real impl does host-sync (.item()); run with cudagraph_mode=NONE
+# (capture forbids host-sync). Env-gated by VLLM_DSV4_COMPILE_PROBE=1.
+# ---------------------------------------------------------------------------
+_COMPILE_PROBE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1"
+_COMPILE_PROBE_N = [0]   # throttle: stop logging after this many calls
+
+
+def _dsv4_compile_probe_op(x: torch.Tensor, tag: str) -> torch.Tensor:
+    if _COMPILE_PROBE_ON and _COMPILE_PROBE_N[0] < 600:
+        _COMPILE_PROBE_N[0] += 1
+        try:
+            xf = x.float()
+            mx = xf.abs().max().item()
+            nn = int(torch.isnan(xf).any().item())
+            print(f"[CPROBE] {tag} absmax={mx:.4f} nan={nn} "
+                  f"shape={tuple(x.shape)} dtype={x.dtype}", flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[CPROBE] {tag} err={_e}", flush=True)
+    return x
+
+
+def _dsv4_compile_probe_fake(x: torch.Tensor, tag: str) -> torch.Tensor:
+    return x
+
+
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op as _dsv4_drcop
+    _dsv4_drcop(
+        op_name="dsv4_compile_probe",
+        op_func=_dsv4_compile_probe_op,
+        mutates_args=[],
+        fake_impl=_dsv4_compile_probe_fake,
+    )
+except Exception as _e:  # noqa: BLE001  (don't break load if registration fails)
+    print(f"[CPROBE] registration skipped: {_e}", flush=True)
+
+
+def _cprobe(tag: str, x: torch.Tensor) -> torch.Tensor:
+    """Opaque passthrough probe. No-op (returns x directly, zero overhead) when
+    VLLM_DSV4_COMPILE_PROBE is unset; calls the registered op only when enabled."""
+    if not _COMPILE_PROBE_ON:
+        return x
+    return torch.ops.vllm.dsv4_compile_probe(x, tag)
+
+
 # [DSv4-ampere debug] Probe 0: confirm whether the residual grows across layers
 # (normal accumulation ~43*50) or explodes (a real bug). One-shot: logs pre_attn
 # absmax for layers {0,3,26,42} at the FIRST real prefill pass only, rank0.
@@ -1251,9 +1306,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         elif _probe_layers():
             _nan_probe(f"L{self._li}.pre_attn", x)
         _probe_residual_baseline(self._li, x)
+        x = _cprobe(f"L{self._li}.pre_attn", x)
         x = self.attn_norm(x)
         with _dsv4_trace(f"L{self._li}.attn"):
             x = self.attn(positions, x, None)
+        x = _cprobe(f"L{self._li}.attn_out", x)
         if self._probe_l0:
             _nan_probe("L0.attn_out", x)
         elif _probe_layers():
@@ -1277,6 +1334,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             _nan_probe("L0.post_mhc", x)
         elif _probe_layers():
             _nan_probe(f"L{self._li}.post_mhc", x)
+        x = _cprobe(f"L{self._li}.post_mhc", x)
         x = self.ffn_norm(x)
         with _dsv4_trace(f"L{self._li}.moe"):
             x = self.ffn(x, input_ids)
@@ -1284,6 +1342,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             _nan_probe("L0.ffn_out", x)
         elif _probe_layers():
             _nan_probe(f"L{self._li}.ffn_out", x)
+        x = _cprobe(f"L{self._li}.ffn_out", x)
         return x, residual, post_mix, res_mix
 
 
@@ -1443,6 +1502,7 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         _nan_probe("embed", hidden_states)
+        hidden_states = _cprobe("embed", hidden_states)
         residual, post_mix, res_mix = None, None, None
         for _li, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -1481,6 +1541,7 @@ class DeepseekV4Model(nn.Module):
         _nan_probe("hc_head", hidden_states)
         hidden_states = self.norm(hidden_states)
         _nan_probe("norm", hidden_states)
+        hidden_states = _cprobe("final_norm", hidden_states)
         _NAN_PASS[0] += 1
         return hidden_states
 
