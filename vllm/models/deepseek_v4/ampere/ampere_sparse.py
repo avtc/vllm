@@ -972,6 +972,25 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
 
         M = N + self.window_size + self.max_num_batched_tokens
         chunk_size_const = self.PREFILL_CHUNK_SIZE
+
+        # [DSv4-ampere compile probe] Is the runtime kv_cache populated before
+        # the gather? 0 => the compressor store never reached the runtime
+        # buffer under compile (captured/broken); nonzero => store worked and
+        # the gather/attention itself is the zero source.
+        import os as _kvpop_os
+        if (_kvpop_os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1"
+                and self.prefix.endswith("layers.2.attn")
+                and not swa_only and compressed_k_cache is not None
+                and attn_metadata is not None):
+            try:
+                _bt = attn_metadata.block_table[num_decodes:]
+                _blk = int(_bt.reshape(-1)[0].item())
+                _ck = float(compressed_k_cache[_blk]
+                           .abs().max().item())
+            except Exception as _e:
+                _blk, _ck = -1, float("nan")
+            print(f"[KVPOP] {self.prefix} prefill block0={_blk} "
+                  f"compressed_k_cache[blk]_absmax={_ck}", flush=True)
         num_chunks = (num_prefills + chunk_size_const - 1) // chunk_size_const
 
         workspace_manager = current_workspace_manager()
