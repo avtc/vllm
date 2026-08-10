@@ -4492,6 +4492,21 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        if os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1":
+            _dsv4_amn = getattr(self, "_dsv4_amn", [0])
+            self._dsv4_amn = _dsv4_amn
+            if _dsv4_amn[0] < 30:
+                _dsv4_amn[0] += 1
+                if attn_metadata is None:
+                    print("[RUNNER_META] set_forward_context attn_metadata=None",
+                          flush=True)
+                elif isinstance(attn_metadata, dict):
+                    print(f"[RUNNER_META] set_forward_context attn_metadata=dict "
+                          f"keys={list(attn_metadata.keys())[:4]} "
+                          f"#keys={len(attn_metadata)}", flush=True)
+                else:
+                    print(f"[RUNNER_META] set_forward_context attn_metadata="
+                          f"{type(attn_metadata).__name__}", flush=True)
         with (
             set_forward_context(
                 attn_metadata,
