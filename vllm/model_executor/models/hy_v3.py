@@ -83,6 +83,25 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Per-phase profiling markers (VLLM_HY3_TRACE=1).
+# Returns a torch.profiler.record_function context when enabled, else a no-op
+# nullcontext. Cached at import (single bool check per call). Works in FULL
+# cudagraph capture (record_function is a no-op annotation). Intended for use
+# with VLLM_HY3_PROFILE / VLLM_HY3_PROFILE_CAPTURE torch.profiler traces, or nsys.
+# ---------------------------------------------------------------------------
+import contextlib as _hy3_ctxlib
+import os as _hy3_os
+
+_HY3_TRACE_ON = _hy3_os.environ.get("VLLM_HY3_TRACE") == "1"
+
+
+def _hy3_trace(name: str):
+    if _HY3_TRACE_ON:
+        return torch.profiler.record_function(name)
+    return _hy3_ctxlib.nullcontext()
+
+
 class HYV3FeedForward(nn.Module):
     def __init__(
         self,
@@ -418,14 +437,16 @@ class HYV3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        with _hy3_trace(f"L{idx}.attn"):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states = self.mlp(hidden_states)
+        with _hy3_trace(f"L{idx}.{self.block_type}"):
+            hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 

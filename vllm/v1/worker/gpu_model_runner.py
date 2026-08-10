@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4156,12 +4157,63 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _maybe_init_hy3_profiler(self) -> None:
+        """Lazy-init a torch.profiler for decode-step profiling.
+
+        Enabled by env var VLLM_HY3_PROFILE=<active_steps> (rank 0 only).
+        Writes a Chrome-trace JSON to VLLM_HY3_PROFILE_DIR (default cwd).
+        Works in FULL cudagraph mode: torch.profiler captures replayed
+        kernels from the CUDA activity timeline outside the graph.
+        """
+        if getattr(self, "_hy3_profiler", "unset") != "unset":
+            return
+        active = os.environ.get("VLLM_HY3_PROFILE")
+        self._hy3_profiler = None
+        if not active:
+            return
+        from vllm.distributed.parallel_state import get_world_group
+        if get_world_group().local_rank != 0:
+            return
+        try:
+            active_n = int(active)
+        except ValueError:
+            active_n = 20
+        prof_dir = os.environ.get("VLLM_HY3_PROFILE_DIR", os.getcwd())
+        os.makedirs(prof_dir, exist_ok=True)
+
+        def _export(prof, rank=0):
+            out = os.path.join(prof_dir, f"hy3_profile_rank{rank}.json")
+            prof.export(out, "chrome://tracing/json")
+            logger.info("[HY3_PROFILE] wrote %s", out)
+
+        self._hy3_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=3, warmup=2, active=active_n, repeat=1
+            ),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            on_trace_ready=_export,
+        )
+        self._hy3_profiler.start()
+        logger.info(
+            "[HY3_PROFILE] rank0 decode profiler started "
+            "(wait=3 warmup=2 active=%d) -> %s",
+            active_n,
+            prof_dir,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        self._maybe_init_hy3_profiler()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4447,6 +4499,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if self._hy3_profiler is not None:
+                self._hy3_profiler.step()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -6817,7 +6871,37 @@ class GPUModelRunner(
         enable_profiler = (
             local_rank == 0
         ) and self.vllm_config.profiler_config.capture_torch_profiler
-        if enable_profiler:
+        hy3_capture = (
+            local_rank == 0
+        ) and os.environ.get("VLLM_HY3_PROFILE_CAPTURE") == "1"
+        if hy3_capture:
+            prof_dir = os.environ.get("VLLM_HY3_PROFILE_DIR", os.getcwd())
+            os.makedirs(prof_dir, exist_ok=True)
+
+            def _export_capture(prof, rank=local_rank):
+                out = os.path.join(
+                    prof_dir, f"hy3_profile_capture_rank{rank}.json"
+                )
+                prof.export(out, "chrome://tracing/json")
+                logger.info("[HY3_PROFILE_CAPTURE] wrote %s", out)
+
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=True,
+                on_trace_ready=_export_capture,
+            )
+            logger.info_once(
+                "[HY3_PROFILE_CAPTURE] rank %d capture profiler enabled "
+                "-> %s",
+                local_rank,
+                prof_dir,
+            )
+        elif enable_profiler:
             trace_dir = (
                 self.vllm_config.profiler_config.torch_profiler_dir + "/capture_traces"
             )
