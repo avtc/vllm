@@ -136,9 +136,11 @@ class HYV3FeedForward(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        with _hy3_trace("ffn.gate_up"):
+            gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
+        with _hy3_trace("ffn.down"):
+            out, _ = self.down_proj(out)
         return out
 
 
@@ -230,11 +232,13 @@ class HYV3MoEFused(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        with _hy3_trace("moe.gate"):
+            router_logits, _ = self.gate(hidden_states)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        with _hy3_trace("moe.experts"):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         return final_hidden_states.view(orig_shape)
 
 
@@ -350,33 +354,39 @@ class HYV3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        with _hy3_trace("attn.qkv_proj"):
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         output_shape = None
         if self.hpc_rope_norm is not None:
             # HPC handles QK-Norm + RoPE + KV-cache write (+ optional FP8 Q
             # quant) internally and returns the processed query. K/V are
             # written into the paged cache by the fused op.
-            q = self.hpc_rope_norm(qkv, self.attn.layer_name)
-            q = q.view(-1, self.num_heads * self.head_dim)
-            attn_output = self.attn(q, k, v, output_shape, self.dtype)
+            with _hy3_trace("attn.rope_norm"):
+                q = self.hpc_rope_norm(qkv, self.attn.layer_name)
+                q = q.view(-1, self.num_heads * self.head_dim)
+            with _hy3_trace("attn.core"):
+                attn_output = self.attn(q, k, v, output_shape, self.dtype)
         else:
-            if self.use_qk_norm:
-                q_by_head = q.view(
-                    *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
-                )
-                q_by_head = self.q_norm(q_by_head)
-                q = q_by_head.view(q.shape)
+            with _hy3_trace("attn.rope_norm"):
+                if self.use_qk_norm:
+                    q_by_head = q.view(
+                        *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+                    )
+                    q_by_head = self.q_norm(q_by_head)
+                    q = q_by_head.view(q.shape)
 
-                k_by_head = k.view(
-                    *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
-                )
-                k_by_head = self.k_norm(k_by_head)
-                k = k_by_head.view(k.shape)
-            q, k = self.rotary_emb(positions, q, k)
-            attn_output = self.attn(q, k, v, output_shape)
+                    k_by_head = k.view(
+                        *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+                    )
+                    k_by_head = self.k_norm(k_by_head)
+                    k = k_by_head.view(k.shape)
+                q, k = self.rotary_emb(positions, q, k)
+            with _hy3_trace("attn.core"):
+                attn_output = self.attn(q, k, v, output_shape)
         attn_output = attn_output.view(q.shape[0], -1)
-        output, _ = self.o_proj(attn_output)
+        with _hy3_trace("attn.o_proj"):
+            output, _ = self.o_proj(attn_output)
         return output
 
 
