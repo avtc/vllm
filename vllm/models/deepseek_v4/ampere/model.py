@@ -115,11 +115,13 @@ def _dsv4_trace(name: str):
 # (capture forbids host-sync). Env-gated by VLLM_DSV4_COMPILE_PROBE=1.
 # ---------------------------------------------------------------------------
 _COMPILE_PROBE_ON: bool = _dsv4_os.environ.get("VLLM_DSV4_COMPILE_PROBE") == "1"
-_COMPILE_PROBE_N = [0]   # throttle: stop logging after this many calls
+_COMPILE_PROBE_N = [0]   # throttle: stop logging after this many calls (covers
+                          # warmup dummy forwards + first ~10 real forwards)
+_COMPILE_PROBE_LIMIT = 3000
 
 
 def _dsv4_compile_probe_op(x: torch.Tensor, tag: str) -> torch.Tensor:
-    if _COMPILE_PROBE_ON and _COMPILE_PROBE_N[0] < 600:
+    if _COMPILE_PROBE_ON and _COMPILE_PROBE_N[0] < _COMPILE_PROBE_LIMIT:
         _COMPILE_PROBE_N[0] += 1
         try:
             xf = x.float()
