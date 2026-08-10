@@ -439,6 +439,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
+    # Under torch.compile (mode:3), force attention_impl to run EAGER (graph
+    # break). It reads attn_metadata = get_forward_context().attn_metadata,
+    # which dynamo otherwise BAKES to the trace-time value -- so the compressor
+    # store (compress_norm_rope_store) would write to trace-time slots, leaving
+    # the runtime kv_cache empty and forward_mqa reading zeros (confirmed:
+    # KVPOP compressed_k_cache[blk]_absmax=0.0). Eager => fresh per-step
+    # metadata => compressor writes the live kv_cache. No effect under mode:0
+    # (FULL cudagraph, no dynamo) so the working FULL path is unchanged.
+    @torch.compiler.disable
     @eager_break_during_capture
     def attention_impl(
         self,
