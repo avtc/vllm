@@ -131,6 +131,18 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
+        # Env override: raise the custom-AR cutoff so larger all-reduce
+        # messages (e.g. prefill chunks > 1024 tokens at hidden 4096 bf16 =>
+        # 8MiB) stay on the custom P2P path instead of falling back to NCCL.
+        # Useful on fully-connected P2P topologies (e.g. 8x3090 PCIe each-to-
+        # each) where custom AR outperforms NCCL. Value is in MiB.
+        import os as _os
+        _ar_override = _os.environ.get("VLLM_CUSTOM_AR_MAX_SIZE_MB")
+        if _ar_override:
+            try:
+                max_size = int(_ar_override) * 1024 * 1024
+            except ValueError:
+                pass
         # device.index is a visible ordinal, not a logical local ID.
         physical_device_id = current_platform.visible_device_id_to_physical_device_id(
             device.index
