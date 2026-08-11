@@ -4168,21 +4168,33 @@ class GPUModelRunner(
         if getattr(self, "_hy3_profiler", "unset") != "unset":
             return
         active = os.environ.get("VLLM_HY3_PROFILE")
+        # VLLM_HY3_PROFILE_PREFILL: capture from step 0 (the first request's
+        # prefill) instead of skipping it. Use wait=0/warmup=0 so the very
+        # first execute_model calls (prefill) land in the active window.
+        prefill_active = os.environ.get("VLLM_HY3_PROFILE_PREFILL")
         self._hy3_profiler = None
-        if not active:
+        if not active and not prefill_active:
             return
         from vllm.distributed.parallel_state import get_world_group
         if get_world_group().local_rank != 0:
             return
-        try:
-            active_n = int(active)
-        except ValueError:
-            active_n = 20
+        if prefill_active:
+            try:
+                active_n = int(prefill_active)
+            except ValueError:
+                active_n = 10
+            wait, warmup, fname, tag = 0, 0, "hy3_profile_prefill_rank", "prefill"
+        else:
+            try:
+                active_n = int(active)
+            except ValueError:
+                active_n = 20
+            wait, warmup, fname, tag = 3, 2, "hy3_profile_rank", "decode"
         prof_dir = os.environ.get("VLLM_HY3_PROFILE_DIR", os.getcwd())
         os.makedirs(prof_dir, exist_ok=True)
 
-        def _export(prof, rank=0):
-            out = os.path.join(prof_dir, f"hy3_profile_rank{rank}.json")
+        def _export(prof, rank=0, _fname=fname):
+            out = os.path.join(prof_dir, f"{_fname}{rank}.json")
             prof.export_chrome_trace(out)
             logger.info("[HY3_PROFILE] wrote %s", out)
 
@@ -4192,7 +4204,7 @@ class GPUModelRunner(
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             schedule=torch.profiler.schedule(
-                wait=3, warmup=2, active=active_n, repeat=1
+                wait=wait, warmup=warmup, active=active_n, repeat=1
             ),
             record_shapes=True,
             profile_memory=False,
@@ -4201,10 +4213,9 @@ class GPUModelRunner(
         )
         self._hy3_profiler.start()
         logger.info(
-            "[HY3_PROFILE] rank0 decode profiler started "
-            "(wait=3 warmup=2 active=%d) -> %s",
-            active_n,
-            prof_dir,
+            "[HY3_PROFILE] rank0 %s profiler started "
+            "(wait=%d warmup=%d active=%d) -> %s",
+            tag, wait, warmup, active_n, prof_dir,
         )
 
     @torch.inference_mode()
