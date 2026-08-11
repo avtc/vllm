@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -476,7 +477,14 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
     ):
-        pin_memory = PIN_MEMORY
+        pin_memory = PIN_MEMORY and os.environ.get(
+            "VLLM_KV_OFFLOAD_DISABLE_PIN") != "1"
+        if PIN_MEMORY and not pin_memory:
+            logger.info(
+                "KV offload pinned memory disabled by "
+                "VLLM_KV_OFFLOAD_DISABLE_PIN=1 (cudaHostAlloc workaround); "
+                "CPU<->GPU copies will use staging buffers."
+            )
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)

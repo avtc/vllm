@@ -4183,7 +4183,7 @@ class GPUModelRunner(
 
         def _export(prof, rank=0):
             out = os.path.join(prof_dir, f"hy3_profile_rank{rank}.json")
-            prof.export(out, "chrome://tracing/json")
+            prof.export_chrome_trace(out)
             logger.info("[HY3_PROFILE] wrote %s", out)
 
         self._hy3_profiler = torch.profiler.profile(
@@ -6882,7 +6882,7 @@ class GPUModelRunner(
                 out = os.path.join(
                     prof_dir, f"hy3_profile_capture_rank{rank}.json"
                 )
-                prof.export(out, "chrome://tracing/json")
+                prof.export_chrome_trace(out)
                 logger.info("[HY3_PROFILE_CAPTURE] wrote %s", out)
 
             profiler = torch.profiler.profile(
