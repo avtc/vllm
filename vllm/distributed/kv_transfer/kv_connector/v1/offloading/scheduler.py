@@ -809,6 +809,23 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
+        try:
+            import os as _os
+            if (
+                _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1"
+                and num_hit_tokens == 0
+                and not request.skip_reading_prefix_cache
+            ):
+                logger.warning(
+                    "[KV_OFFLOAD] LOAD-MISS req=%s num_tokens=%d "
+                    "num_computed=%d -> re-prefill (no CPU hit)",
+                    request.request_id,
+                    request.num_tokens,
+                    num_computed_tokens,
+                )
+        except Exception:
+            pass
+
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(

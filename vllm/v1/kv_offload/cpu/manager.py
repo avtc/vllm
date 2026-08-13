@@ -192,10 +192,41 @@ class CPUOffloadingManager(OffloadingManager):
         self.allocation_sizes_in_current_batch.append(len(keys_to_store))
         num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
 
+        try:
+            import os as _os
+            if _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1" and keys_to_store:
+                import logging as _lg
+                _lg.getLogger("vllm.v1.kv_offload.cpu.manager").warning(
+                    "[KV_OFFLOAD] STORE req_ctx=%s keys=%d free=%d/%d evictable=%d",
+                    getattr(req_context, "request_id", "?"),
+                    len(keys_to_store),
+                    self._get_num_free_blocks(),
+                    self._num_blocks,
+                    self._num_evictable_cache_blocks,
+                )
+        except Exception:
+            pass
+
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
             if num_blocks_to_evict > self._num_evictable_cache_blocks:
                 # Eviction will fail.
+                try:
+                    import os as _os
+                    if _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1":
+                        import logging as _lg
+                        _lg.getLogger(
+                            "vllm.v1.kv_offload.cpu.manager"
+                        ).warning(
+                            "[KV_OFFLOAD] STORE-FAIL: need %d blocks, "
+                            "free=%d evictable=%d (pool too small / pinned) "
+                            "-> KV NOT offloaded, will re-prefill on reuse",
+                            len(keys_to_store),
+                            self._get_num_free_blocks(),
+                            self._num_evictable_cache_blocks,
+                        )
+                except Exception:
+                    pass
                 return None
             # There is a still a chance for eviction failure as some of the
             # idle blocks might be in the protected list.
