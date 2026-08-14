@@ -816,13 +816,27 @@ class OffloadingConnectorScheduler:
                 and num_hit_tokens == 0
                 and not request.skip_reading_prefix_cache
             ):
-                logger.warning(
-                    "[KV_OFFLOAD] LOAD-MISS req=%s num_tokens=%d "
-                    "num_computed=%d -> re-prefill (no CPU hit)",
-                    request.request_id,
-                    request.num_tokens,
-                    num_computed_tokens,
-                )
+                if num_computed_tokens * 2 < request.num_tokens:
+                    # GPU prefix cache also missed most of the prompt.
+                    logger.warning(
+                        "[KV_OFFLOAD] TRUE RE-PREFILL req=%s num_tokens=%d "
+                        "num_computed=%d (GPU cache also missed; CPU had "
+                        "nothing loadable)",
+                        request.request_id,
+                        request.num_tokens,
+                        num_computed_tokens,
+                    )
+                else:
+                    # GPU cache covered most of the prompt; the CPU lookup
+                    # only covers the suffix beyond num_computed and had
+                    # nothing to add. Not a re-prefill.
+                    logger.info(
+                        "[KV_OFFLOAD] cpu-miss (benign) req=%s num_tokens=%d "
+                        "num_computed=%d (GPU cache served the prefix)",
+                        request.request_id,
+                        request.num_tokens,
+                        num_computed_tokens,
+                    )
         except Exception:
             pass
 
