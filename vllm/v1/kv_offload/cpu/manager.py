@@ -79,6 +79,77 @@ class CPUOffloadingManager(OffloadingManager):
             OrderedDict() if store_threshold >= 2 else None
         )
 
+        # Session-LRU (prefix-chain) eviction: chunks are linked into
+        # per-conversation chains via parent pointers supplied by the
+        # scheduler at store time. Only chain leaves (chunks with no live
+        # children) are evictable, so a paused session erodes from its TAIL
+        # and its head (chunk 0) survives as long as possible. Without this,
+        # plain LRU evicts the head first (stored/touched earliest = coldest),
+        # and since lookups count consecutive hits from chunk 0, head loss
+        # turns a 90%-resident session into a total miss.
+        import os as _os
+
+        self._session_lru: bool = (
+            _os.environ.get("VLLM_KV_OFFLOAD_SESSION_LRU", "1") != "0"
+        )
+        # key -> parent key within the same prefix chain (None for roots).
+        self._parent: dict[OffloadKey, OffloadKey | None] = {}
+        # parent key -> live children that are still stored.
+        self._children: dict[OffloadKey, set[OffloadKey]] = {}
+
+    # --- session-chain registry ---
+
+    def _link_chunk(self, key: OffloadKey, parent: OffloadKey | None) -> None:
+        """Record `key` as a child of `parent` in its prefix chain."""
+        self._parent[key] = parent
+        if parent is not None:
+            self._children.setdefault(parent, set()).add(key)
+
+    def _unlink_chunk(self, key: OffloadKey) -> None:
+        """Remove `key` from the chain registry (called when its block leaves
+        the pool). The parent may become a new leaf for future eviction."""
+        parent = self._parent.pop(key, None)
+        if parent is not None:
+            siblings = self._children.get(parent)
+            if siblings is not None:
+                siblings.discard(key)
+                if not siblings:
+                    del self._children[parent]
+        # A key being evicted is always a leaf, but stay defensive.
+        self._children.pop(key, None)
+
+    def _evict_session_lru(
+        self, n: int, protected: set[OffloadKey]
+    ) -> list[tuple[OffloadKey, BlockStatus]] | None:
+        """Evict `n` blocks by eroding prefix chains from their leaves.
+
+        Iterates: evict currently-evictable leaves (LRU order within the
+        policy), which exposes their parents as new leaves, until `n` blocks
+        are freed. Keys with live children are never evicted, so heads are
+        protected while any later chunk of the session survives.
+
+        Returns the freed blocks, possibly fewer than requested `n` when
+        protected ancestors pin the remaining chains; callers must then store
+        a truncated prefix (never fail after eviction).
+        """
+        evicted_all: list[tuple[OffloadKey, BlockStatus]] = []
+        remaining = n
+        while remaining > 0:
+            # Non-leaves: any stored key that still has live children.
+            leaf_protected = protected | set(self._children.keys())
+            # Evict ONE leaf at a time: policies return None when fewer
+            # than `n` candidates exist, but each group iteration only has
+            # as many leaves as chains — and evicting one exposes its parent
+            # as the next leaf.
+            evicted = self._policy.evict(1, leaf_protected)
+            if not evicted:
+                break
+            key, block = evicted[0]
+            self._unlink_chunk(key)
+            evicted_all.append((key, block))
+            remaining -= 1
+        return evicted_all
+
     # --- block pool ---
 
     def _get_num_free_blocks(self) -> int:
@@ -174,6 +245,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        parent_map: dict[OffloadKey, OffloadKey | None] | None = None,
     ) -> PrepareStoreOutput | None:
         if self.counts is not None:
             num_keys = len(keys)
@@ -234,9 +306,21 @@ class CPUOffloadingManager(OffloadingManager):
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
             protected = set(keys)
-            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
-                return None
+            evicted: list[tuple[OffloadKey, BlockStatus]] | None
+            if self._session_lru:
+                evicted = self._evict_session_lru(num_blocks_to_evict, protected)
+                if len(evicted) < num_blocks_to_evict:
+                    # Protected ancestors pinned the rest: store the longest
+                    # prefix that fits. The unstored trailing chunks become
+                    # holes that later requests refill incrementally.
+                    storable = self._get_num_free_blocks()
+                    keys_to_store = keys_to_store[:storable]
+                    if not keys_to_store:
+                        return None
+            else:
+                evicted = self._policy.evict(num_blocks_to_evict, protected)
+                if evicted is None:
+                    return None
 
             # cache-policy removes only idle blocks.
             self._num_evictable_cache_blocks -= len(evicted)
@@ -262,6 +346,10 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
+            if self._session_lru:
+                self._link_chunk(
+                    key, parent_map.get(key) if parent_map is not None else None
+                )
         self._num_write_pending_blocks += len(keys_to_store)
 
         # build store specs for allocated blocks
@@ -297,6 +385,8 @@ class CPUOffloadingManager(OffloadingManager):
                 if block is not None and not block.is_ready:
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
+                    if self._session_lru:
+                        self._unlink_chunk(key)
                     self._free_block(block)
 
         if stored_keys and self.events is not None:
@@ -321,6 +411,8 @@ class CPUOffloadingManager(OffloadingManager):
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
+        self._parent.clear()
+        self._children.clear()
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:

@@ -1005,6 +1005,11 @@ class OffloadingConnectorScheduler:
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            # Parent (positional predecessor) of each stored chunk within its
+            # prefix chain — used by session-LRU eviction to erode paused
+            # sessions from the tail instead of the head. Links are positional:
+            # a skipped hole still forwards chain adjacency to later chunks.
+            parent_map: dict[OffloadKey, OffloadKey | None] = {}
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -1016,6 +1021,11 @@ class OffloadingConnectorScheduler:
                 if num_chunks <= start_chunk_idx:
                     continue
                 offload_keys = group_state.offload_keys[start_chunk_idx:num_chunks]
+                prev_key: OffloadKey | None = (
+                    group_state.offload_keys[start_chunk_idx - 1]
+                    if start_chunk_idx > 0
+                    else None
+                )
                 # For each chunk, take the last corresponding GPU block. For
                 # blocks_per_chunk=3 and GPU block IDs 1 5 6 7 2 4 9 3 8,
                 # this selects GPU blocks 6 4 8.
@@ -1031,6 +1041,8 @@ class OffloadingConnectorScheduler:
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
+                    this_parent = prev_key
+                    prev_key = offload_key
                     if block_id == 0:
                         continue
                     # Skip SWA chunks that can never serve a load hit:
@@ -1048,13 +1060,14 @@ class OffloadingConnectorScheduler:
                     ):
                         continue
                     new_offload_keys.append(offload_key)
+                    parent_map[offload_key] = this_parent
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
+                new_offload_keys, req_status.req_context, parent_map=parent_map
             )
             if store_output is None:
                 self._connector_stats.increase_counter(

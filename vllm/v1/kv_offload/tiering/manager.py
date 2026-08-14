@@ -497,7 +497,10 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def prepare_store(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        parent_map: dict[OffloadKey, OffloadKey | None] | None = None,
     ) -> PrepareStoreOutput | None:
         """
         Prepare blocks to be stored from GPU to primary tier.
@@ -533,7 +536,9 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
-        primary_result = self.primary_tier.prepare_store(keys, req_context)
+        primary_result = self.primary_tier.prepare_store(
+            keys, req_context, parent_map=parent_map
+        )
 
         if primary_result is None:
             return None

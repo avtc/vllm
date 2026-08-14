@@ -969,3 +969,121 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+# ---------------------------------------------------------------------------
+# Session-LRU (prefix-chain) eviction tests
+# ---------------------------------------------------------------------------
+
+
+def _store_chain(
+    manager: CPUOffloadingManager,
+    chain: list[int],
+    req_ctx: ReqContext | None = None,
+):
+    """Store a head->tail chunk chain, passing positional parent links the
+    way the offloading scheduler does. The first element may already be
+    stored (chain anchor from a previous batch); prepare_store filters it.
+    """
+    keys = to_keys(chain)
+    parent_map = {k: p for p, k in zip([None] + keys[:-1], keys)}
+    out = manager.prepare_store(keys, req_ctx or _EMPTY_REQ_CTX, parent_map=parent_map)
+    assert out is not None
+    manager.complete_store(out.keys_to_store, req_ctx or _EMPTY_REQ_CTX)
+    return out
+
+
+def test_session_lru_erodes_tail_not_head(monkeypatch):
+    """With session-LRU, a paused session loses its TAIL chunks first; its
+    head (chunk 0) survives so prefix lookups still return consecutive hits.
+    """
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_SESSION_LRU", "1")
+    manager = make_cpu_manager(num_blocks=6)
+
+    _store_chain(manager, [11, 12, 13, 14])  # session A (older)
+    _store_chain(manager, [21, 22])  # session B (newer)
+
+    # B grows by 2 chunks -> 2 evictions. Session A is the LRU victim and
+    # must erode from its tail: 14 then 13 — never head 11/12.
+    out = _store_chain(manager, [22, 23, 24])
+    assert out.evicted_keys == to_keys([14, 13])
+    assert manager.lookup(to_key(11), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(12), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(13), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+
+def test_session_lru_disabled_evicts_head_first(monkeypatch):
+    """Escape hatch: VLLM_KV_OFFLOAD_SESSION_LRU=0 restores the old plain-LRU
+    behavior that evicts the conversation head first."""
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_SESSION_LRU", "0")
+    manager = make_cpu_manager(num_blocks=6)
+
+    _store_chain(manager, [11, 12, 13, 14])
+    _store_chain(manager, [21, 22])
+
+    out = _store_chain(manager, [22, 23, 24])
+    assert out.evicted_keys == to_keys([11, 12])  # heads evicted (old bug)
+    assert manager.lookup(to_key(11), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+
+def test_session_lru_preserves_prefix_for_lookup(monkeypatch):
+    """User scenario: a paused session's prefix must stay loadable (in full
+    or partial) while newer sessions thrash the pool. Consecutive-from-head
+    coverage is what matters, not total residency."""
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_SESSION_LRU", "1")
+    manager = make_cpu_manager(num_blocks=8)
+
+    _store_chain(manager, [100, 101, 102, 103, 104, 105])  # session A
+    _store_chain(manager, [201, 202])  # session B
+
+    # C stores 4 chunks -> pool full, 4 evictions. A is older: erodes 105,
+    # 104, 103, 102 in tail-first order. B (younger) is untouched.
+    out = _store_chain(manager, [301, 302, 303, 304])
+    assert out.evicted_keys == to_keys([105, 104, 103, 102])
+    # A's surviving head run: 2 consecutive chunks from chunk 0 -> a lookup
+    # now returns a 2-chunk partial hit instead of 0.
+    assert manager.lookup(to_key(100), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(101), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(102), _EMPTY_REQ_CTX) is LookupResult.MISS
+    # B fully intact.
+    assert manager.lookup(to_key(201), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(202), _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_session_lru_shared_prefix_protected_while_descendant_alive(monkeypatch):
+    """Two sessions sharing a common head (system prompt): the shared chunks
+    are never evicted while any descendant session is alive; the dead session
+    erodes completely first."""
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_SESSION_LRU", "1")
+    manager = make_cpu_manager(num_blocks=4)
+
+    _store_chain(manager, [1, 2])  # shared head
+    _store_chain(manager, [2, 11, 12])  # session A extends the shared head
+    # Pool is now full (4 blocks). Session B extends the same shared head:
+    # A must erode completely (12 then 11) while the shared head survives.
+    out = _store_chain(manager, [2, 21, 22])
+    assert out.evicted_keys == to_keys([12, 11])
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(11), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.lookup(to_key(21), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(22), _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_session_lru_truncation_when_ancestors_pinned(monkeypatch):
+    """When the only evictable leaf is also part of the store input
+    (protected), erosion cannot free space: the store proceeds with the
+    longest prefix that fits instead of failing."""
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_SESSION_LRU", "1")
+    manager = make_cpu_manager(num_blocks=4)
+
+    _store_chain(manager, [1, 2, 3])  # 3 stored, 1 free
+
+    # Extend the same chain by 2; the only leaf (3) is protected as input,
+    # so nothing can be evicted -> store the 1 chunk that fits.
+    out = _store_chain(manager, [1, 2, 3, 4, 5])
+    assert out.keys_to_store == to_keys([4])
+    assert out.evicted_keys == []
+    assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.MISS

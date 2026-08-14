@@ -236,6 +236,7 @@ class OffloadingManager(ABC):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        parent_map: dict[OffloadKey, OffloadKey | None] | None = None,
     ) -> PrepareStoreOutput | None:
         """
         Prepare the given blocks to be offloaded.
