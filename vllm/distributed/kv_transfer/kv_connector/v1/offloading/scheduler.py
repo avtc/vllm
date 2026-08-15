@@ -818,13 +818,24 @@ class OffloadingConnectorScheduler:
             ):
                 if num_computed_tokens * 2 < request.num_tokens:
                     # GPU prefix cache also missed most of the prompt.
+                    cpu_chunks = "n/a"
+                    dbg = getattr(self.manager, "debug_prefix_present", None)
+                    if dbg is not None and req_status.group_states:
+                        try:
+                            gkeys = req_status.group_states[0].offload_keys
+                            if gkeys:
+                                lead, present, total = dbg(gkeys)
+                                cpu_chunks = f"{lead}/{present}/{total}"
+                        except Exception:
+                            pass
                     logger.warning(
                         "[KV_OFFLOAD] TRUE RE-PREFILL req=%s num_tokens=%d "
-                        "num_computed=%d (GPU cache also missed; CPU had "
-                        "nothing loadable)",
+                        "num_computed=%d cpu_chunks(lead/present/total)=%s "
+                        "(GPU cache also missed; CPU had nothing loadable)",
                         request.request_id,
                         request.num_tokens,
                         num_computed_tokens,
+                        cpu_chunks,
                     )
                 else:
                     # GPU cache covered most of the prompt; the CPU lookup

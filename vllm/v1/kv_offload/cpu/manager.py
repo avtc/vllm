@@ -415,6 +415,25 @@ class CPUOffloadingManager(OffloadingManager):
         self._children.clear()
 
     @override
+    def debug_prefix_present(
+        self, keys: Collection[OffloadKey]
+    ) -> tuple[int, int, int]:
+        """Diagnostics only: (leading-present run, total present, total keys)
+        for the given chunk keys, regardless of readiness/loadability.
+        Distinguishes 'prefix eroded from CPU pool' (0/N) from 'present but
+        not loadable' (load-path bug)."""
+        lead = 0
+        present = 0
+        leading = True
+        for k in keys:
+            if self._policy.get(k) is not None:
+                present += 1
+                if leading:
+                    lead += 1
+            else:
+                leading = False
+        return lead, present, len(list(keys))
+
     def take_events(self) -> Iterable[OffloadingEvent]:
         if self.events is not None:
             yield from self.events
