@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
@@ -29,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -259,6 +261,9 @@ class RequestGroupState:
     # Number of offloaded chunks hit (including GPU prefix cache)
     # when the request first started
     num_hit_chunks: int = 0
+    # Number of leading offload_keys already linked into the scheduler-wide
+    # chain map (store-on-evict session linkage).
+    chain_linked_upto: int = 0
 
 
 @dataclass(slots=True)
@@ -447,6 +452,44 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+        # --- store-on-evict mode (VLLM_KV_OFFLOAD_STORE_MODE=on_evict) ---
+        # Population model: nothing is stored eagerly during prefill/decode;
+        # instead, cached blocks evicted from the GPU prefix cache are copied
+        # to the CPU tier at eviction time, before the block is reused and
+        # overwritten. The CPU pool then holds exactly the content the GPU
+        # just lost (complementary populations) instead of duplicating what
+        # the GPU still has and eroding before it is needed.
+        import os as _os
+
+        self._store_mode: str = _os.environ.get(
+            "VLLM_KV_OFFLOAD_STORE_MODE", "eager"
+        )
+        if self._store_mode == "on_evict" and self.config.blocks_per_chunk != 1:
+            logger.warning(
+                "VLLM_KV_OFFLOAD_STORE_MODE=on_evict requires "
+                "blocks_per_chunk == 1 (got %d); falling back to eager stores.",
+                self.config.blocks_per_chunk,
+            )
+            self._store_mode = "eager"
+        # OffloadKey -> parent OffloadKey chain links learned from every
+        # request's hash chain; gives request-less on-evict stores their
+        # session linkage for session-LRU tail-first erosion.
+        self._chain_parent: OrderedDict[OffloadKey, OffloadKey | None] = (
+            OrderedDict()
+        )
+        self._chain_parent_cap: int = 262_144
+        # Synthetic identity for request-less on-evict store jobs.
+        self._evict_req_id: str = "__on_evict_store__"
+        self._evict_req_context: ReqContext = ReqContext(
+            req_id=self._evict_req_id, kv_transfer_params=None
+        )
+        try:
+            self._on_evict_max_blocks: int = int(
+                _os.environ.get("VLLM_KV_OFFLOAD_ON_EVICT_MAX_BLOCKS", "32")
+            )
+        except ValueError:
+            self._on_evict_max_blocks = 32
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -951,6 +994,116 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
 
+    def _link_request_chains(self, req_status: RequestOffloadState) -> None:
+        """Record OffloadKey -> parent links from the request's hash chain so
+        on-evict stores (which arrive without an owning request) can still be
+        attached to their conversation for session-LRU tail-first erosion."""
+        for group_state in req_status.group_states:
+            keys = group_state.offload_keys
+            start = max(1, group_state.chain_linked_upto)
+            for i in range(start, len(keys)):
+                self._chain_parent[keys[i]] = keys[i - 1]
+            group_state.chain_linked_upto = len(keys)
+        if len(self._chain_parent) > self._chain_parent_cap:
+            for _ in range(self._chain_parent_cap // 8):
+                self._chain_parent.popitem(last=False)
+
+    def _build_evict_store_jobs(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[int, TransferJob]:
+        """Store-on-evict population: copy prefix-cache blocks evicted by the
+        GPU this step to the CPU tier NOW — the block is about to be reused
+        and overwritten by this step's forward pass, so the copy cannot be
+        deferred (the worker submits and waits on these jobs synchronously
+        before forward)."""
+        if self._store_mode != "on_evict":
+            return {}
+        evictions = getattr(scheduler_output, "evicted_cached_blocks", None)
+        if not evictions:
+            return {}
+
+        num_groups = len(self.config.kv_group_configs)
+        taken = evictions[: self._on_evict_max_blocks]
+        dropped = len(evictions) - len(taken)
+
+        evict_keys: list[OffloadKey] = []
+        # (group position, block_id) parallel to evict_keys
+        evict_blocks: list[tuple[int, int]] = []
+        for block_id, hashes in taken:
+            for bh in hashes:
+                gidx = get_group_id(bh)
+                if not 0 <= gidx < num_groups:
+                    continue
+                key = make_offload_key(get_block_hash(bh), gidx)
+                evict_keys.append(key)
+                evict_blocks.append((gidx, block_id))
+
+        if not evict_keys:
+            return {}
+
+        if dropped:
+            logger.debug(
+                "on-evict store: dropped %d evicted blocks this step "
+                "(cap %d)",
+                dropped,
+                self._on_evict_max_blocks,
+            )
+
+        parent_map = {k: self._chain_parent.get(k) for k in evict_keys}
+        store_output = self.manager.prepare_store(
+            evict_keys, self._evict_req_context, parent_map=parent_map
+        )
+        if store_output is None or not store_output.keys_to_store:
+            return {}
+
+        try:
+            import os as _os
+
+            if _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1":
+                logger.warning(
+                    "[KV_OFFLOAD] ON-EVICT STORE evicted_blocks=%d taken=%d "
+                    "keys_new=%d dropped=%d",
+                    len(evictions),
+                    len(taken),
+                    len(store_output.keys_to_store),
+                    dropped,
+                )
+        except Exception:
+            pass
+
+        keys_to_store = set(store_output.keys_to_store)
+        # Blocks must be ordered by group index for GPULoadStoreSpec.
+        src_block_ids: list[int] = []
+        group_sizes: list[int] = []
+        for gidx in range(num_groups):
+            n = 0
+            for (g, block_id), key in zip(evict_blocks, evict_keys):
+                if g == gidx and key in keys_to_store:
+                    src_block_ids.append(block_id)
+                    n += 1
+            group_sizes.append(n)
+        assert sum(group_sizes) == len(src_block_ids)
+
+        src_spec = GPULoadStoreSpec(
+            src_block_ids,
+            group_sizes=group_sizes,
+            block_indices=[0] * num_groups,
+        )
+        job_id = self._generate_job_id()
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=self._evict_req_id,
+            pending_count=self.config.num_workers,
+            keys=keys_to_store,
+            is_store=True,
+        )
+        return {
+            job_id: TransferJob(
+                req_id=self._evict_req_id,
+                src_spec=src_spec,
+                dst_spec=store_output.store_spec,
+            )
+        }
+
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """
         Update request states from the Scheduler's output.
@@ -964,6 +1117,8 @@ class OffloadingConnectorScheduler:
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             req_status = self._req_status[req_id]
             req_status.update_offload_keys()
+            if self._store_mode == "on_evict":
+                self._link_request_chains(req_status)
 
             if preempted:
                 for group_state in req_status.group_states:
@@ -1006,6 +1161,10 @@ class OffloadingConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
+        if self._store_mode == "on_evict":
+            # Population happens exclusively at GPU-prefix-cache eviction
+            # time (see _build_evict_store_jobs); zero eager store traffic.
+            return {}
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
         for req_id in chain(
@@ -1245,6 +1404,7 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            evict_store_jobs=self._build_evict_store_jobs(scheduler_output),
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1327,7 +1487,18 @@ class OffloadingConnectorScheduler:
                 continue
             assert job_status.pending_count == 0
 
-            req_status = self._req_status[job_status.req_id]
+            req_status = self._req_status.get(job_status.req_id)
+            if req_status is None:
+                # Store-on-evict job: no owning request. Its source GPU
+                # block was copied synchronously before the forward of the
+                # step that evicted it; nothing to unwatch or release.
+                assert job_status.is_store
+                assert job_status.req_id == self._evict_req_id
+                self.manager.complete_store(
+                    job_status.keys, self._evict_req_context
+                )
+                del self._jobs[job_id]
+                continue
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:

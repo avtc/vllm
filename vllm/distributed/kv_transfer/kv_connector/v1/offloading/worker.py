@@ -296,6 +296,21 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
+        # Store-on-evict jobs: their source blocks were evicted from the GPU
+        # prefix cache in THIS scheduling step and are about to be
+        # overwritten by the upcoming forward pass. Unlike regular stores
+        # (deferred to this point from the previous step), these are
+        # submitted now and waited on synchronously so the copy completes
+        # before the forward can race-overwrite the source blocks.
+        evict_job_ids: set[int] = set()
+        for job_id, entry in metadata.evict_store_jobs.items():
+            assert isinstance(entry.src_spec, GPULoadStoreSpec)
+            success = self.worker.submit_store(job_id, entry.src_spec, entry.dst_spec)
+            assert success
+            evict_job_ids.add(job_id)
+        if evict_job_ids:
+            self.worker.wait(evict_job_ids)
+
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)

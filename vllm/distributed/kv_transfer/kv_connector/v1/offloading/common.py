@@ -70,6 +70,12 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # Store-on-evict jobs (VLLM_KV_OFFLOAD_STORE_MODE=on_evict): copies of
+    # prefix-cache blocks evicted by the GPU in THIS step. Unlike
+    # store_jobs, these must NOT be deferred to the next engine step — the
+    # source blocks are overwritten by the current step's forward pass, so
+    # the worker submits them and waits synchronously before forward.
+    evict_store_jobs: dict[int, TransferJob] = field(default_factory=dict)
 
 
 @dataclass

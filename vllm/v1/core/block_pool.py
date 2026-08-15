@@ -195,6 +195,31 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Store-on-evict offloading support: when enabled, cached blocks
+        # evicted from the prefix cache are collected (block_id, hashes) so
+        # the KV connector can copy them to the CPU tier BEFORE the block is
+        # reused and overwritten by this step's forward pass. The content at
+        # eviction time is still the old (evicted) block's KV.
+        import os as _os
+
+        self.evicted_blocks_collection_enabled: bool = (
+            _os.environ.get("VLLM_KV_OFFLOAD_STORE_MODE", "eager") == "on_evict"
+        )
+        self._evicted_blocks_buffer: (
+            list[tuple[int, list[BlockHashWithGroupId]]] | None
+        ) = [] if self.evicted_blocks_collection_enabled else None
+
+    def drain_evicted_blocks(
+        self,
+    ) -> list[tuple[int, list[BlockHashWithGroupId]]]:
+        """Return and clear the blocks evicted from the prefix cache since
+        the last drain. Empty when collection is disabled."""
+        if self._evicted_blocks_buffer is None:
+            return []
+        evicted = self._evicted_blocks_buffer
+        self._evicted_blocks_buffer = []
+        return evicted
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -695,6 +720,9 @@ class BlockPool:
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
+
+        if self._evicted_blocks_buffer is not None:
+            self._evicted_blocks_buffer.append((block.block_id, evicted_hashes))
 
         self._emit_block_removed_events(evicted_hashes)
         return True

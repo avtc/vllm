@@ -1153,6 +1153,11 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            evicted_cached_blocks=(
+                self.kv_cache_manager.drain_evicted_blocks()
+                if self.kv_cache_manager.block_pool.evicted_blocks_collection_enabled
+                else None
+            ),
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
