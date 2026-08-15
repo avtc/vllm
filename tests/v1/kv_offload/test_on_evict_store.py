@@ -157,6 +157,15 @@ def test_build_evict_store_jobs_passes_chain_parents():
         num_blocks=8, cache_policy="lru", enable_events=False, store_threshold=0
     )
     fake = _make_fake_scheduler(manager)
+    # b1 is the root; b2 extends it. b1 must be resident first, otherwise
+    # the reachability filter correctly skips b2 as hole-fronted.
+    first = SimpleNamespace(evicted_cached_blocks=[(6, [_h(b"\xb1" * 8)])])
+    OffloadingConnectorScheduler._build_evict_store_jobs(fake, first)
+    manager.complete_store(
+        list(next(iter(fake._jobs.values())).keys), fake._evict_req_context
+    )
+    fake._jobs.clear()
+
     fake._chain_parent[make_offload_key(b"\xb2" * 8, 0)] = make_offload_key(
         b"\xb1" * 8, 0
     )
@@ -227,3 +236,84 @@ def test_worker_submits_evict_jobs_without_deferral_and_waits():
     # deferred (previous-step) store first, then the same-step evict store,
     # then a synchronous wait BEFORE the method returns (i.e. before forward).
     assert events == [("submit", "prev_deferred"), ("submit", 42), ("wait", (42,))]
+
+
+def _key(b: bytes):
+    return make_offload_key(b, 0)
+
+
+def test_evict_store_reachability_filter_skips_hole_fronted_chunks():
+    """Chunks whose parent is neither captured nor already in the CPU tier
+    are skipped (and transitively, their descendants too) — copying them
+    would create unreachable dead weight behind a permanent hole."""
+    manager = CPUOffloadingManager(
+        num_blocks=8, cache_policy="lru", enable_events=False, store_threshold=0
+    )
+    fake = _make_fake_scheduler(manager)
+    # chain: k1 -> k0, k2 -> k1, k3 -> k2 ; k0 is the root (absent from map)
+    fake._chain_parent[_key(b"\xc1" * 8)] = _key(b"\xc0" * 8)
+    fake._chain_parent[_key(b"\xc2" * 8)] = _key(b"\xc1" * 8)
+    fake._chain_parent[_key(b"\xc3" * 8)] = _key(b"\xc2" * 8)
+
+    # Evicting the middle of the chain without its root: everything skipped.
+    out = SimpleNamespace(
+        evicted_cached_blocks=[
+            (5, [_h(b"\xc1" * 8)]),
+            (6, [_h(b"\xc2" * 8)]),
+            (7, [_h(b"\xc3" * 8)]),
+        ]
+    )
+    assert OffloadingConnectorScheduler._build_evict_store_jobs(fake, out) == {}
+
+    # Evicting from the root: the whole contiguous run is captured.
+    out_root = SimpleNamespace(
+        evicted_cached_blocks=[
+            (4, [_h(b"\xc0" * 8)]),
+            (5, [_h(b"\xc1" * 8)]),
+            (6, [_h(b"\xc2" * 8)]),
+        ]
+    )
+    jobs = OffloadingConnectorScheduler._build_evict_store_jobs(fake, out_root)
+    assert len(jobs) == 1
+    status = next(iter(fake._jobs.values()))
+    manager.complete_store(list(status.keys), fake._evict_req_context)
+    for b in (b"\xc0", b"\xc1", b"\xc2"):
+        assert manager.lookup(_key(b * 8), CTX) is LookupResult.HIT
+
+
+def test_evict_store_reachability_extends_resident_content():
+    """A chunk whose parent is already resident in the CPU tier is copied
+    even when the parent is not part of this eviction batch."""
+    manager = CPUOffloadingManager(
+        num_blocks=8, cache_policy="lru", enable_events=False, store_threshold=0
+    )
+    fake = _make_fake_scheduler(manager)
+    fake._chain_parent[_key(b"\xd1" * 8)] = _key(b"\xd0" * 8)
+    fake._chain_parent[_key(b"\xd2" * 8)] = _key(b"\xd1" * 8)
+
+    # Root captured earlier (previous era) and completed.
+    first = SimpleNamespace(evicted_cached_blocks=[(1, [_h(b"\xd0" * 8)])])
+    OffloadingConnectorScheduler._build_evict_store_jobs(fake, first)
+    manager.complete_store(
+        list(next(iter(fake._jobs.values())).keys), fake._evict_req_context
+    )
+    fake._jobs.clear()
+
+    # The GRANDCHILD alone: its parent (d1) is not resident — copying d2
+    # would land behind a hole. Skipped.
+    tail = SimpleNamespace(evicted_cached_blocks=[(3, [_h(b"\xd2" * 8)])])
+    assert OffloadingConnectorScheduler._build_evict_store_jobs(fake, tail) == {}
+
+    # The direct child of the resident root: chain extension, copied.
+    child = SimpleNamespace(evicted_cached_blocks=[(4, [_h(b"\xd1" * 8)])])
+    jobs = OffloadingConnectorScheduler._build_evict_store_jobs(fake, child)
+    assert len(jobs) == 1
+    manager.complete_store(
+        list(next(iter(fake._jobs.values())).keys), fake._evict_req_context
+    )
+    fake._jobs.clear()
+
+    # Now the grandchild extends the freshly stored child.
+    tail2 = SimpleNamespace(evicted_cached_blocks=[(5, [_h(b"\xd2" * 8)])])
+    jobs2 = OffloadingConnectorScheduler._build_evict_store_jobs(fake, tail2)
+    assert len(jobs2) == 1

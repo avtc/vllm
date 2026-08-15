@@ -466,12 +466,15 @@ class OffloadingConnectorScheduler:
             "VLLM_KV_OFFLOAD_STORE_MODE", "eager"
         )
         if self._store_mode == "on_evict" and self.config.blocks_per_chunk != 1:
-            logger.warning(
+            # An explicitly requested mode must not silently degrade to a
+            # different population model.
+            raise RuntimeError(
                 "VLLM_KV_OFFLOAD_STORE_MODE=on_evict requires "
-                "blocks_per_chunk == 1 (got %d); falling back to eager stores.",
-                self.config.blocks_per_chunk,
+                f"blocks_per_chunk == 1 (got {self.config.blocks_per_chunk}; "
+                "CPU chunk spans multiple GPU blocks, so per-block eviction "
+                "capture cannot assemble complete chunks). Remove the env "
+                "var or set kv_connector_extra_config blocks_per_chunk=1."
             )
-            self._store_mode = "eager"
         # OffloadKey -> parent OffloadKey chain links learned from every
         # request's hash chain; gives request-less on-evict stores their
         # session linkage for session-LRU tail-first erosion.
@@ -1024,29 +1027,63 @@ class OffloadingConnectorScheduler:
 
         num_groups = len(self.config.kv_group_configs)
         taken = evictions[: self._on_evict_max_blocks]
-        dropped = len(evictions) - len(taken)
+        dropped_cap = len(evictions) - len(taken)
 
-        evict_keys: list[OffloadKey] = []
-        # (group position, block_id) parallel to evict_keys
-        evict_blocks: list[tuple[int, int]] = []
+        candidates: list[tuple[int, int, OffloadKey]] = []
+        seen_keys: set[OffloadKey] = set()
         for block_id, hashes in taken:
             for bh in hashes:
                 gidx = get_group_id(bh)
                 if not 0 <= gidx < num_groups:
                     continue
                 key = make_offload_key(get_block_hash(bh), gidx)
-                evict_keys.append(key)
-                evict_blocks.append((gidx, block_id))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                candidates.append((gidx, block_id, key))
+
+        if not candidates:
+            return {}
+
+        # Reachability filter: only copy chunks that keep the CPU content
+        # usable by the consecutive-from-start lookup. A chunk whose parent
+        # is neither captured in this batch nor already resident in the CPU
+        # tier would land behind a permanent hole (e.g. the far tail of a
+        # conversation whose middle exceeded the per-step cap) — unreachable
+        # dead weight that only consumes pool capacity. Skipping it here is
+        # strictly better than copying it.
+        # Eviction order is head-first (a child block is touched after its
+        # parent, so it is freed and evicted later), which lets a single
+        # ordered pass track what is actually being captured.
+        evict_keys: list[OffloadKey] = []
+        # (group position, block_id) parallel to evict_keys
+        evict_blocks: list[tuple[int, int]] = []
+        copied: set[OffloadKey] = set()
+        skipped_unreachable = 0
+        for gidx, block_id, key in candidates:
+            parent = self._chain_parent.get(key)
+            if (
+                parent is not None
+                and parent not in copied
+                and self.manager.lookup(parent, self._evict_req_context)
+                is LookupResult.MISS
+            ):
+                skipped_unreachable += 1
+                continue
+            evict_keys.append(key)
+            evict_blocks.append((gidx, block_id))
+            copied.add(key)
 
         if not evict_keys:
             return {}
 
-        if dropped:
+        if dropped_cap or skipped_unreachable:
             logger.debug(
                 "on-evict store: dropped %d evicted blocks this step "
-                "(cap %d)",
-                dropped,
+                "(cap %d), skipped %d unreachable keys",
+                dropped_cap,
                 self._on_evict_max_blocks,
+                skipped_unreachable,
             )
 
         parent_map = {k: self._chain_parent.get(k) for k in evict_keys}
@@ -1062,11 +1099,12 @@ class OffloadingConnectorScheduler:
             if _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1":
                 logger.warning(
                     "[KV_OFFLOAD] ON-EVICT STORE evicted_blocks=%d taken=%d "
-                    "keys_new=%d dropped=%d",
+                    "keys_new=%d skipped_unreachable=%d dropped_cap=%d",
                     len(evictions),
                     len(taken),
                     len(store_output.keys_to_store),
-                    dropped,
+                    skipped_unreachable,
+                    dropped_cap,
                 )
         except Exception:
             pass
