@@ -482,6 +482,12 @@ class OffloadingConnectorScheduler:
             OrderedDict()
         )
         self._chain_parent_cap: int = 262_144
+        # Keys dropped at eviction time (per-step cap overflow). Their
+        # content is gone forever (the GPU block was overwritten), so any
+        # descendant evicted later is permanently unreachable through the
+        # consecutive-from-start lookup and must not be copied.
+        self._dropped_evict_keys: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._dropped_evict_keys_cap: int = 65_536
         # Synthetic identity for request-less on-evict store jobs.
         self._evict_req_id: str = "__on_evict_store__"
         self._evict_req_context: ReqContext = ReqContext(
@@ -1045,45 +1051,56 @@ class OffloadingConnectorScheduler:
         if not candidates:
             return {}
 
-        # Reachability filter: only copy chunks that keep the CPU content
-        # usable by the consecutive-from-start lookup. A chunk whose parent
-        # is neither captured in this batch nor already resident in the CPU
-        # tier would land behind a permanent hole (e.g. the far tail of a
-        # conversation whose middle exceeded the per-step cap) — unreachable
-        # dead weight that only consumes pool capacity. Skipping it here is
-        # strictly better than copying it.
-        # Eviction order is head-first (a child block is touched after its
-        # parent, so it is freed and evicted later), which lets a single
-        # ordered pass track what is actually being captured.
+        # Reachability: GPU eviction order is coldest-first, and prefix-cache
+        # touches keep a conversation's matched prefix hot, so conversations
+        # erode from just-past-the-last-hit tail toward the head — children
+        # typically evict BEFORE their parents. A merely-absent parent is
+        # therefore NOT a hole (it will usually evict and be captured later,
+        # healing the chain), so chunks are captured optimistically. The only
+        # permanent hole is a parent dropped by cap overflow: its descendants
+        # are skipped forever (they would be unreachable dead weight).
+        dropped_now: list[OffloadKey] = []
+        if dropped_cap:
+            for block_id, hashes in evictions[len(taken) :]:
+                for bh in hashes:
+                    gidx = get_group_id(bh)
+                    if not 0 <= gidx < num_groups:
+                        continue
+                    dropped_now.append(
+                        make_offload_key(get_block_hash(bh), gidx)
+                    )
+
         evict_keys: list[OffloadKey] = []
         # (group position, block_id) parallel to evict_keys
         evict_blocks: list[tuple[int, int]] = []
-        copied: set[OffloadKey] = set()
-        skipped_unreachable = 0
+        skipped_dropped = 0
         for gidx, block_id, key in candidates:
             parent = self._chain_parent.get(key)
-            if (
-                parent is not None
-                and parent not in copied
-                and self.manager.lookup(parent, self._evict_req_context)
-                is LookupResult.MISS
-            ):
-                skipped_unreachable += 1
+            if parent is not None and parent in self._dropped_evict_keys:
+                skipped_dropped += 1
                 continue
             evict_keys.append(key)
             evict_blocks.append((gidx, block_id))
-            copied.add(key)
+
+        # Storing a key heals any earlier drop of the same content (e.g. the
+        # block was recomputed and evicted again).
+        for key in evict_keys:
+            self._dropped_evict_keys.pop(key, None)
+        for key in dropped_now:
+            self._dropped_evict_keys[key] = None
+        while len(self._dropped_evict_keys) > self._dropped_evict_keys_cap:
+            self._dropped_evict_keys.popitem(last=False)
 
         if not evict_keys:
             return {}
 
-        if dropped_cap or skipped_unreachable:
+        if dropped_cap or skipped_dropped:
             logger.debug(
                 "on-evict store: dropped %d evicted blocks this step "
-                "(cap %d), skipped %d unreachable keys",
+                "(cap %d), skipped %d keys behind dropped ancestors",
                 dropped_cap,
                 self._on_evict_max_blocks,
-                skipped_unreachable,
+                skipped_dropped,
             )
 
         parent_map = {k: self._chain_parent.get(k) for k in evict_keys}
@@ -1099,11 +1116,11 @@ class OffloadingConnectorScheduler:
             if _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1":
                 logger.warning(
                     "[KV_OFFLOAD] ON-EVICT STORE evicted_blocks=%d taken=%d "
-                    "keys_new=%d skipped_unreachable=%d dropped_cap=%d",
+                    "keys_new=%d skipped_dropped=%d dropped_cap=%d",
                     len(evictions),
                     len(taken),
                     len(store_output.keys_to_store),
-                    skipped_unreachable,
+                    skipped_dropped,
                     dropped_cap,
                 )
         except Exception:
