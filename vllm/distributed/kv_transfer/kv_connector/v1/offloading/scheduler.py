@@ -493,6 +493,12 @@ class OffloadingConnectorScheduler:
         self._evict_req_context: ReqContext = ReqContext(
             req_id=self._evict_req_id, kv_transfer_params=None
         )
+        # Requests already warned about in the TRUE RE-PREFILL diagnostic.
+        # The scheduler re-consults get_num_new_matched_tokens on EVERY
+        # scheduling attempt (e.g. ~1/s while a large request waits for KV
+        # admission), so without deduplication one request logs dozens of
+        # identical warnings and inflates re-prefill counts.
+        self._reprefill_warned: set[str] = set()
         try:
             self._on_evict_max_blocks: int = int(
                 _os.environ.get("VLLM_KV_OFFLOAD_ON_EVICT_MAX_BLOCKS", "32")
@@ -870,6 +876,11 @@ class OffloadingConnectorScheduler:
             ):
                 if num_computed_tokens * 2 < request.num_tokens:
                     # GPU prefix cache also missed most of the prompt.
+                    if request.request_id not in self._reprefill_warned:
+                        self._reprefill_warned.add(request.request_id)
+                        if len(self._reprefill_warned) > 65536:
+                            self._reprefill_warned.clear()
+                            self._reprefill_warned.add(request.request_id)
                     cpu_chunks = "n/a"
                     dbg = getattr(self.manager, "debug_prefix_present", None)
                     if dbg is not None and req_status.group_states:
