@@ -66,7 +66,7 @@ def _store(store_h, job_id, gpu_blocks, cpu_chunks):
         gpu_blocks, group_sizes=[len(gpu_blocks)], block_indices=[0]
     )
     dst = CPULoadStoreSpec(cpu_chunks)
-    assert store_h.submit_store(job_id, src, dst)
+    assert store_h.transfer_async(job_id, src, dst)
     store_h.wait({job_id})
     results = store_h.get_finished()
     assert results and results[0].success
@@ -88,7 +88,7 @@ def test_roundtrip_chunk_aligned(tensors):
         group_sizes=[num_blocks],
         block_indices=[0],
     )
-    assert load_h.submit_load(2, CPULoadStoreSpec([0, 1, 2, 3]), ldst)
+    assert load_h.transfer_async(2, CPULoadStoreSpec([0, 1, 2, 3]), ldst)
     load_h.wait({2})
     assert load_h.get_finished()
 
@@ -114,7 +114,7 @@ def test_roundtrip_straddling_start(tensors):
         list(range(pending)), group_sizes=[pending], block_indices=[skip]
     )
     lsrc = CPULoadStoreSpec([1, 2, 3, 4, 5])  # chunks covering skip..end
-    assert load_h.submit_load(2, lsrc, ldst)
+    assert load_h.transfer_async(2, lsrc, ldst)
     load_h.wait({2})
     assert load_h.get_finished()
 
@@ -164,7 +164,7 @@ def test_integrity_crc_detects_mutation(tensors, monkeypatch):
         group_sizes=[num_blocks],
         block_indices=[0],
     )
-    assert load_h.submit_load(2, CPULoadStoreSpec([7, 8]), ldst)
+    assert load_h.transfer_async(2, CPULoadStoreSpec([7, 8]), ldst)
     load_h.wait({2})
     load_h.get_finished()
 
