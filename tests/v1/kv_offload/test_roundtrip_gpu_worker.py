@@ -32,7 +32,7 @@ def _pattern_matrix(num_blocks: int) -> torch.Tensor:
     """Vectorized unique per-block pattern: value depends on (block, byte)."""
     b = torch.arange(num_blocks, dtype=torch.int32).view(num_blocks, 1)
     j = torch.arange(PAGE, dtype=torch.int32).view(1, PAGE)
-    return ((b * 131 + j * 7 + 11) & 0xFF).to(torch.uint8)
+    return ((b * 131 + j * 7 + 11) & 0xFF).to(torch.int8)
 
 
 @pytest.fixture(scope="module")
@@ -41,10 +41,10 @@ def tensors():
         pytest.skip("CUDA required for roundtrip tests")
     dev = torch.cuda.current_device()
     pattern = _pattern_matrix(NUM_GPU_BLOCKS)
-    gpu = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.uint8, device=dev)
+    gpu = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
     gpu.copy_(pattern, non_blocking=False)
     cpu = torch.zeros(
-        NUM_CPU_BLOCKS, PAGE * BLOCKS_PER_CHUNK, dtype=torch.uint8
+        NUM_CPU_BLOCKS, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8
     ).pin_memory()
     yield gpu, cpu
 
