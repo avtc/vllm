@@ -66,6 +66,10 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    # Number of leading entries of batch_* that belong to THIS transfer.
+    # Pooled descriptor buffers are reused and may be larger; entries past
+    # this count are stale garbage from older transfers.
+    num_copy_ops: int
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
@@ -445,6 +449,7 @@ class SingleDirectionOffloadingHandler:
                 start_event=start_event,
                 end_event=end_event,
                 num_bytes=num_transfer_bytes,
+                num_copy_ops=num_copy_ops,
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
@@ -467,11 +472,15 @@ class SingleDirectionOffloadingHandler:
 
                 dst_addrs = transfer.batch_dst.numpy()
                 sizes_np = transfer.batch_sizes.numpy()
-                for i in range(len(dst_addrs)):
-                    self._store_crcs[int(dst_addrs[i])] = zlib.crc32(
-                        (ctypes.c_char * int(sizes_np[i])).from_address(
-                            int(dst_addrs[i])
-                        )
+                # Only the first num_copy_ops entries belong to this
+                # transfer; pooled buffers hold stale descriptors past it.
+                for i in range(transfer.num_copy_ops):
+                    addr = int(dst_addrs[i])
+                    nbytes = int(sizes_np[i])
+                    if addr <= 0 or nbytes <= 0 or nbytes > (1 << 26):
+                        continue  # implausible stale/garbage descriptor
+                    self._store_crcs[addr] = zlib.crc32(
+                        (ctypes.c_char * nbytes).from_address(addr)
                     )
             result = TransferResult(
                 job_id=transfer.job_id,
