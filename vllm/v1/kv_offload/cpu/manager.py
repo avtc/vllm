@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
+from vllm.logger import init_logger
+
 from typing import Literal
 
 from typing_extensions import override
@@ -32,6 +34,9 @@ _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
 }
+
+
+logger = init_logger(__name__)
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -68,6 +73,12 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
+        # insertion time of write-pending chunks; used to surface store jobs
+        # whose completion was lost (chunk stuck not-ready forever -> every
+        # lookup over it defers). Observed in log-6: write_usage_perc frozen
+        # at 5 blocks for 3 hours.
+        self._pending_since: dict = {}
+
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -201,6 +212,16 @@ class CPUOffloadingManager(OffloadingManager):
         if block is None:
             return LookupResult.MISS
         if not block.is_ready:
+            import time as _time
+
+            since = self._pending_since.get(key)
+            if since is not None and _time.monotonic() - since > 300.0:
+                self._pending_since[key] = _time.monotonic()  # re-arm (1/300s)
+                logger.warning(
+                    "[KV_OFFLOAD] STUCK PENDING chunk %r: store completion "
+                    "lost for >300s; lookups over it defer indefinitely",
+                    key,
+                )
             return LookupResult.HIT_PENDING
         return LookupResult.HIT
 
@@ -350,7 +371,12 @@ class CPUOffloadingManager(OffloadingManager):
                 self._link_chunk(
                     key, parent_map.get(key) if parent_map is not None else None
                 )
+        import time as _time
+
         self._num_write_pending_blocks += len(keys_to_store)
+        _now = _time.monotonic()
+        for key in keys_to_store:
+            self._pending_since[key] = _now
 
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
@@ -379,6 +405,7 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_evictable_cache_blocks += 1
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
+                    self._pending_since.pop(key, None)
         else:
             for key in keys:
                 block = self._policy.get(key)
@@ -388,6 +415,7 @@ class CPUOffloadingManager(OffloadingManager):
                     if self._session_lru:
                         self._unlink_chunk(key)
                     self._free_block(block)
+                    self._pending_since.pop(key, None)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -408,6 +436,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
+        self._pending_since.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
