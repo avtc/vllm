@@ -173,3 +173,102 @@ def test_integrity_crc_detects_mutation(tensors, monkeypatch):
     assert row_addr not in load_h._store_crcs, "corruption NOT detected"
     chunk8_addr = cpu.data_ptr() + 8 * cpu.stride(0)
     assert chunk8_addr in load_h._store_crcs, "clean range wrongly evicted"
+
+
+def test_roundtrip_multi_group_straddling(tensors):
+    """Production topology: FOUR cache groups with DIFFERENT logical start
+    offsets (e.g. [13, 13, 13, 1] as logged in production) spanning TWO
+    distinct tensors. Log-8 showed stores whose destination pages all held
+    identical bytes (descriptor collapse) and loads reading zero pages -
+    both only reachable through the multi-group descriptor loop, which the
+    single-group tests cannot exercise."""
+    gpu1, cpu1 = tensors  # fixture: unique per-block patterns, pinned cpu
+    dev = gpu1.device
+
+    # A second, independently-patterned tensor pair (production has many
+    # canonical tensors; groups 2-3 here live in tensor 1).
+    gpu2 = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
+    gpu2.copy_(_pattern_matrix(NUM_GPU_BLOCKS + 7)[7:], non_blocking=False)
+    cpu2 = torch.zeros(
+        NUM_CPU_BLOCKS, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8
+    ).pin_memory()
+
+    refs = [
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+        [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+        [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+    ]
+
+    def _handler(gpu_to_cpu: bool) -> SingleDirectionOffloadingHandler:
+        return SingleDirectionOffloadingHandler(
+            gpu_tensors=[gpu1, gpu2],
+            cpu_tensors=[cpu1, cpu2],
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            kv_cache_groups_data_refs=refs,
+            gpu_to_cpu=gpu_to_cpu,
+        )
+
+    store_h = _handler(True)
+    load_h = _handler(False)
+
+    block_indices = [13, 13, 13, 1]  # logical start per group (prod-like)
+    span = 2 * BLOCKS_PER_CHUNK + 5  # blocks transferred per group
+    group_sizes = [span] * 4
+
+    # CPU chunks consumed per group = cdiv(span + dst_skip, bpc)
+    def _chunks_needed(logical_start: int) -> int:
+        skip = logical_start % BLOCKS_PER_CHUNK
+        return (span + skip + BLOCKS_PER_CHUNK - 1) // BLOCKS_PER_CHUNK
+
+    group_chunks: list[list[int]] = []
+    next_chunk = 16  # arbitrary free region of the cpu tensors
+    for g, start in enumerate(block_indices):
+        n = _chunks_needed(start)
+        group_chunks.append(list(range(next_chunk, next_chunk + n)))
+        next_chunk += n
+
+    # STORE: physical source blocks per group; logical start offsets via
+    # block_indices. Group 0-1 read tensor0 rows, group 2-3 tensor1 rows.
+    src_gpu_blocks: list[int] = []
+    group_src_base = [20, 90, 33, 120]
+    for g in range(4):
+        src_gpu_blocks.extend(range(group_src_base[g], group_src_base[g] + span))
+
+    src = GPULoadStoreSpec(
+        src_gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
+    )
+    dst = CPULoadStoreSpec([c for grp in group_chunks for c in grp])
+    assert store_h.transfer_async(1, src, dst)
+    store_h.wait({1})
+    res = store_h.get_finished()
+    assert res and res[0].success
+
+    # LOAD: same chunks, same logical offsets, fresh physical dst blocks.
+    dst_gpu_blocks: list[int] = []
+    group_dst_base = [160, 200, 45, 170]
+    for g in range(4):
+        dst_gpu_blocks.extend(range(group_dst_base[g], group_dst_base[g] + span))
+
+    ldst = GPULoadStoreSpec(
+        dst_gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
+    )
+    lsrc = CPULoadStoreSpec([c for grp in group_chunks for c in grp])
+    assert load_h.transfer_async(2, lsrc, ldst)
+    load_h.wait({2})
+    assert load_h.get_finished()
+
+    pattern1 = _pattern_matrix(NUM_GPU_BLOCKS)
+    pattern2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
+    pos = 0
+    for g in range(4):
+        pattern = pattern1 if g < 2 else pattern2
+        gpu_t = gpu1 if g < 2 else gpu2
+        for k in range(span):
+            got = gpu_t[group_dst_base[g] + k].cpu()
+            want = pattern[group_src_base[g] + k].cpu()
+            assert torch.equal(got, want), (
+                f"group {g} logical pos {k}: bytes misplaced or zeroed"
+            )
+            pos += 1
+    assert pos == sum(group_sizes)

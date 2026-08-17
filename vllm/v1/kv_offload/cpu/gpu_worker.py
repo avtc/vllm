@@ -474,14 +474,35 @@ class SingleDirectionOffloadingHandler:
                 sizes_np = transfer.batch_sizes.numpy()
                 # Only the first num_copy_ops entries belong to this
                 # transfer; pooled buffers hold stale descriptors past it.
+                crcs = []
                 for i in range(transfer.num_copy_ops):
                     addr = int(dst_addrs[i])
                     nbytes = int(sizes_np[i])
                     if addr <= 0 or nbytes <= 0 or nbytes > (1 << 26):
                         continue  # implausible stale/garbage descriptor
-                    self._store_crcs[addr] = zlib.crc32(
-                        (ctypes.c_char * nbytes).from_address(addr)
-                    )
+                    crc = zlib.crc32((ctypes.c_char * nbytes).from_address(addr))
+                    self._store_crcs[addr] = crc
+                    crcs.append(crc)
+                # Replication detector: distinct destination pages of one
+                # store holding byte-identical content means the kernel
+                # copied the same source page everywhere (descriptor
+                # collapse). Real KV never repeats across pages.
+                if len(crcs) >= 4:
+                    uniq = len(set(crcs))
+                    if uniq <= max(2, len(crcs) // 8):
+                        src_np = transfer.batch_src.numpy()
+                        n_src = len(set(int(x) for x in src_np[: transfer.num_copy_ops]))
+                        logger.warning(
+                            "[KV_OFFLOAD] STORE REPLICATION job=%d: %d pages "
+                            "hold only %d distinct contents; src descriptors "
+                            "unique=%d/%d (collapse!) — data corrupted at "
+                            "STORE time",
+                            transfer.job_id,
+                            len(crcs),
+                            uniq,
+                            n_src,
+                            transfer.num_copy_ops,
+                        )
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
