@@ -1001,6 +1001,20 @@ class OffloadingConnectorScheduler:
             src_spec=src_spec,
             dst_spec=dst_spec,
         )
+        try:
+            import os as _os
+
+            if _os.environ.get("VLLM_KV_OFFLOAD_DEBUG") == "1":
+                logger.warning(
+                    "[KV_OFFLOAD] LOAD req=%s chunks=%d dst_gpu_blocks=%d "
+                    "start_logical_blocks=%s",
+                    request.request_id,
+                    len(keys_to_load),
+                    len(dst_block_ids),
+                    block_indices,
+                )
+        except Exception:
+            pass
         # a load can only be issued when no other jobs are pending.
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)

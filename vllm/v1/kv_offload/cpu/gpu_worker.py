@@ -180,6 +180,7 @@ class SingleDirectionOffloadingHandler:
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        integrity_map: dict[int, int] | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -237,6 +238,20 @@ class SingleDirectionOffloadingHandler:
         self._event_pool: list[torch.Event] = []
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+        # Integrity tripwire (env-gated, zero cost when disabled): CRC32 of
+        # each CPU byte-range recorded when a store's D2H completes, verified
+        # when a load reads the same range. Catches any post-store mutation
+        # of cached CPU KV (e.g. buffer reuse races) that would silently
+        # corrupt generation after a load.
+        import os as _os
+
+        self._integrity = _os.environ.get("VLLM_KV_OFFLOAD_INTEGRITY") == "1"
+        # Shared between the store and load handlers of the same worker so
+        # CRCs recorded by completed stores are visible to load verification.
+        self._store_crcs: dict[int, int] = (
+            integrity_map if integrity_map is not None else {}
+        )
 
     def transfer_async(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
@@ -360,6 +375,28 @@ class SingleDirectionOffloadingHandler:
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
+        if self._integrity and not self.gpu_to_cpu:
+            import ctypes
+            import zlib
+
+            for i in range(num_copy_ops):
+                addr = int(all_src[i])
+                nbytes = int(all_sizes[i])
+                stored = self._store_crcs.get(addr)
+                if stored is not None:
+                    now = zlib.crc32((ctypes.c_char * nbytes).from_address(addr))
+                    if now != stored:
+                        logger.warning(
+                            "[KV_OFFLOAD] INTEGRITY FAIL on load: cpu range "
+                            "addr=0x%x size=%d stored_crc=%08x now_crc=%08x "
+                            "(CPU KV mutated since store)",
+                            addr,
+                            nbytes,
+                            stored,
+                            now,
+                        )
+                        self._store_crcs.pop(addr, None)
+
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )
@@ -424,6 +461,18 @@ class SingleDirectionOffloadingHandler:
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
+            if self._integrity and self.gpu_to_cpu:
+                import ctypes
+                import zlib
+
+                dst_addrs = transfer.batch_dst.numpy()
+                sizes_np = transfer.batch_sizes.numpy()
+                for i in range(len(dst_addrs)):
+                    self._store_crcs[int(dst_addrs[i])] = zlib.crc32(
+                        (ctypes.c_char * int(sizes_np[i])).from_address(
+                            int(dst_addrs[i])
+                        )
+                    )
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
@@ -519,6 +568,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
 
+        integrity_map: dict[int, int] = {}
         self._store_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
@@ -526,6 +576,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             mmap_region=mmap_region,
+            integrity_map=integrity_map,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -534,6 +585,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             blocks_per_chunk=blocks_per_chunk,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            integrity_map=integrity_map,
         )
 
     def submit_store(
