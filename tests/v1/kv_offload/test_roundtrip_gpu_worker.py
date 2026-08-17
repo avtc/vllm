@@ -82,11 +82,11 @@ def test_roundtrip_chunk_aligned(tensors):
     num_blocks = 4 * BLOCKS_PER_CHUNK
     _store(store_h, 1, list(range(num_blocks)), [0, 1, 2, 3])
 
-    start = 100  # chunk-aligned destination (100 % 8 == 0)
+    start = 100  # physical destination blocks (arbitrary); logical start is 0
     ldst = GPULoadStoreSpec(
         list(range(start, start + num_blocks)),
         group_sizes=[num_blocks],
-        block_indices=[start],
+        block_indices=[0],
     )
     assert load_h.submit_load(2, CPULoadStoreSpec([0, 1, 2, 3]), ldst)
     load_h.wait({2})
