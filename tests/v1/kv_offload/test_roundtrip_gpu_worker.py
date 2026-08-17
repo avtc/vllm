@@ -231,7 +231,7 @@ def test_roundtrip_multi_group_straddling(tensors):
     # STORE: physical source blocks per group; logical start offsets via
     # block_indices. Group 0-1 read tensor0 rows, group 2-3 tensor1 rows.
     src_gpu_blocks: list[int] = []
-    group_src_base = [20, 90, 33, 120]
+    group_src_base = [50, 90, 33, 120]  # avoid rows 0..45 (earlier tests)
     for g in range(4):
         src_gpu_blocks.extend(range(group_src_base[g], group_src_base[g] + span))
 
@@ -246,7 +246,7 @@ def test_roundtrip_multi_group_straddling(tensors):
 
     # LOAD: same chunks, same logical offsets, fresh physical dst blocks.
     dst_gpu_blocks: list[int] = []
-    group_dst_base = [160, 200, 45, 170]
+    group_dst_base = [160, 217, 45, 170]  # avoid rows 100..132, 200..216
     for g in range(4):
         dst_gpu_blocks.extend(range(group_dst_base[g], group_dst_base[g] + span))
 
@@ -272,3 +272,60 @@ def test_roundtrip_multi_group_straddling(tensors):
             )
             pos += 1
     assert pos == sum(group_sizes)
+
+def test_large_batch_swap_exact(tensors):
+    """Production stores submit THOUSANDS of copy ops in one
+    ops.swap_blocks_batch call (on-evict stores of many chunks x 4 groups x
+    multiple layer refs). log-8 showed replicated + never-written pages -
+    the signature of a driver-side large-batch indexing bug in the
+    cuMemcpyBatchAsync emulation path (CUDA 12.8 driver on Ampere, where
+    batch memcpy is driver-emulated, not hardware). Sweep batch sizes and
+    both production directions (D2H store, H2D load) for exactness."""
+    gpu, _ = tensors
+    dev = gpu.device
+
+    def _run(n_ops, page, direction):
+        src_gpu = torch.zeros(n_ops, page, dtype=torch.int8, device=dev)
+        ids = torch.arange(n_ops, dtype=torch.int32).view(n_ops, 1)
+        offs = torch.arange(page, dtype=torch.int32).view(1, page)
+        src_gpu.copy_(((ids * 131 + offs * 7 + 11) & 0xFF).to(torch.int8))
+
+        if direction == "d2h":
+            dst = torch.zeros(n_ops, page, dtype=torch.int8).pin_memory()
+        else:
+            dst = torch.zeros(n_ops, page, dtype=torch.int8, device=dev)
+
+        perm = torch.randperm(n_ops)
+        src_ptrs = torch.tensor(
+            [src_gpu[i].data_ptr() for i in range(n_ops)],
+            dtype=torch.int64,
+        ).pin_memory()
+        dst_ptrs = torch.tensor(
+            [dst[int(p)].data_ptr() for p in perm], dtype=torch.int64
+        ).pin_memory()
+        sizes = torch.full((n_ops,), page, dtype=torch.int64).pin_memory()
+
+        from vllm import _custom_ops as ops
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+        ev = torch.cuda.Event()
+        ev.record(s)
+        ev.synchronize()
+
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(n_ops)
+        want = src_gpu[inv].cpu()
+        if not torch.equal(dst, want):
+            bad = (dst != want).any(dim=1)
+            pytest.fail(
+                f"{direction} batch n={n_ops} page={page}: "
+                f"{int(bad.sum())}/{n_ops} pages corrupted"
+            )
+
+    for n_ops, page in ((256, 4096), (1024, 4096), (4096, 4096), (1024, 65536)):
+        _run(n_ops, page, "d2h")
+        _run(n_ops, page, "h2d")
+
