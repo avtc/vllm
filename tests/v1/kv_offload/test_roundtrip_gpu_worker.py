@@ -246,6 +246,19 @@ def _run_multi_group(tensors, force_cpp_load: bool):
     res = store_h.get_finished()
     assert res and res[0].success
 
+    # Verify STORED CPU content BEFORE loading: splits store-side vs
+    # load-side corruption decisively.
+    for g, st in enumerate(block_indices):
+        for k in range(span):
+            ch = group_chunks[g][(k + st % BLOCKS_PER_CHUNK) // BLOCKS_PER_CHUNK]
+            sub = (k + st % BLOCKS_PER_CHUNK) % BLOCKS_PER_CHUNK
+            pat = pattern1 if g < 2 else pattern2
+            want = pat[group_src_base[g] + k].numpy()
+            got = (cpu1 if g < 2 else cpu2)[ch, sub * PAGE : (sub + 1) * PAGE].numpy()
+            assert (got == want).all(), (
+                f"STORE misplaced: group {g} pos {k} -> cpu[{ch}][{sub}]"
+            )
+
     # LOAD: same chunks, same logical offsets, fresh physical dst blocks.
     dst_gpu_blocks: list[int] = []
     group_dst_base = [160, 217, 45, 170]  # avoid rows 100..132, 200..216
