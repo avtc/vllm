@@ -839,12 +839,9 @@ def test_roundtrip_mmap_rank_interleaved_layout(tensors):
             os.remove(path)
 
 
-def test_concurrent_store_load_streams(tensors):
-    """Production runs store and load handlers on INDEPENDENT streams that
-    can execute SIMULTANEOUSLY (on-evict store + prefix load in the same
-    step). Both batch DMAs hit the same pinned CPU region concurrently.
-    Sequential submission with overlapped execution, disjoint cells -
-    verify both transfers stay byte-exact."""
+def _run_store_load_streams(tensors, concurrent: bool):
+    """Store+load on independent streams; concurrent=True overlaps their
+    execution (production: on-evict store + prefix load in one step)."""
     gpu1, _ = tensors
     dev = gpu1.device
 
@@ -900,6 +897,9 @@ def test_concurrent_store_load_streams(tensors):
         block_indices=[0, 0],
     )
     assert store_h.transfer_async(2, store_spec, store_dst)
+    if not concurrent:
+        store_h.wait({2})
+        assert store_h.get_finished()
     assert load_h.transfer_async(3, load_src, load_dst)
     store_h.wait({2})
     load_h.wait({3})
@@ -908,8 +908,31 @@ def test_concurrent_store_load_streams(tensors):
 
     pat1 = _pattern_matrix(NUM_GPU_BLOCKS)
     pat2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
+    # post-phase-2 CPU sanity: chunks 0..2 (group0) must still hold rows
+    # 10..33; chunks 8..9 the phase-2 store; then verify the loads
     for k in range(span1):
-        assert torch.equal(gpu1[150 + k].cpu(), pat1[10 + k]), f"load t0 {k}"
+        ch = k // BLOCKS_PER_CHUNK
+        sub = k % BLOCKS_PER_CHUNK
+        assert (
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[10 + k]
+        ).all(), f"CPU chunk {ch} sub {sub} corrupted after phase 2"
+    for k in range(span1):
+        got = gpu1[150 + k].cpu()
+        want = pat1[10 + k]
+        if not torch.equal(got, want):
+            s_desc, d_desc, _sz = load_h.last_descriptors
+            o = 0
+            cpu_base = cpu1.data_ptr()
+            so = int(s_desc[o]) - cpu_base
+            do = int(d_desc[o]) - gpu1.data_ptr()
+            torch.equal(
+                got, want
+            ) is True, (
+                f"load t0 {k}: got=pat[{(int(got[0]) - 11) % 256}]-ish; "
+                f"desc0 src=cpu+0x{so:x} (chunk {so // cpu1.stride(0)} "
+                f"sub {(so % cpu1.stride(0)) // PAGE}) "
+                f"dst=gpu1[{do // PAGE}]"
+            )
         assert torch.equal(gpu2[170 + k].cpu(), pat2[30 + k]), f"load t1 {k}"
     for k in range(span2):
         # concurrent store: chunks 8..11 hold rows 60.. / 100..
@@ -923,6 +946,17 @@ def test_concurrent_store_load_streams(tensors):
         assert (
             cpu2[ch1, sub * PAGE : (sub + 1) * PAGE] == pat2[100 + k]
         ).all(), f"store t1 {k}"
+
+
+def test_concurrent_store_load_streams(tensors):
+    _run_store_load_streams(tensors, concurrent=True)
+
+
+def test_sequential_store_load_streams(tensors):
+    """Control for the concurrent variant: identical transfers, but the
+    store fully completes before the load is submitted. If this fails
+    too, the bug is in the transfer shape, not the concurrency."""
+    _run_store_load_streams(tensors, concurrent=False)
 
 
 def _mp_dma_child(rank, engine_id, geometry, barrier, out_q):
@@ -1088,3 +1122,142 @@ def test_mmap_two_process_concurrent_dma(tensors):
                 p.terminate()
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_pageable_cpu_batch_memcpy(tensors):
+    """PRODUCTION MEMORY MIX (VLLM_KV_OFFLOAD_DISABLE_PIN=1): PINNED
+    descriptor arrays + UNPINNED (pageable) CPU KV tensors, all through
+    cuMemcpyBatchAsync. Every prior test used pinned CPU memory - the one
+    variable production has that nothing reproduced. The driver accepts
+    pageable host ranges silently; if its emulated batch staging corrupts
+    them, this reproduces the log-8 store corruption (replicated pages +
+    never-written zeros)."""
+    gpu1, _ = tensors
+    dev = gpu1.device
+    from vllm import _custom_ops as ops
+
+    PAGE_BIG = 917504  # exact production op size
+
+    def _run(n_ops, page, tag):
+        src_gpu = torch.zeros(n_ops, page, dtype=torch.int8, device=dev)
+        ids = torch.arange(n_ops, dtype=torch.int32).view(n_ops, 1)
+        offs = torch.arange(page, dtype=torch.int32).view(1, page)
+        src_gpu.copy_(((ids * 131 + offs * 7 + 11) & 0xFF).to(torch.int8))
+
+        # PAGEABLE cpu destination - production memory type
+        dst = torch.zeros(n_ops, page, dtype=torch.int8)
+
+        perm = torch.randperm(n_ops)
+        # PINNED descriptor arrays - exactly like _new_descriptor_buffers
+        src_ptrs = torch.tensor(
+            [src_gpu[i].data_ptr() for i in range(n_ops)],
+            dtype=torch.int64,
+        ).pin_memory()
+        dst_ptrs = torch.tensor(
+            [dst[int(p)].data_ptr() for p in perm], dtype=torch.int64
+        ).pin_memory()
+        sizes = torch.full((n_ops,), page, dtype=torch.int64).pin_memory()
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+        ev = torch.cuda.Event()
+        ev.record(s)
+        ev.synchronize()
+
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(n_ops)
+        want = src_gpu[inv].cpu()
+        if not torch.equal(dst, want):
+            bad = (dst != want).any(dim=1)
+            return (
+                f"{tag} n={n_ops} page={page}: {int(bad.sum())}/{n_ops} "
+                f"pages corrupted (first op {int(bad.nonzero()[0])})"
+            )
+        return None
+
+    # production store = D2H onto pageable memory
+    failures = []
+    for n_ops, page in (
+        (84, 4096),        # the failing multi-group store shape
+        (84, 917504),      # production op size
+        (256, 917504),     # production store scale
+        (1024, 917504),    # large on-evict store scale
+    ):
+        f = _run(n_ops, page, "d2h")
+        if f:
+            failures.append(f)
+    assert not failures, "; ".join(failures)
+
+
+def test_pageable_roundtrip_via_handler(tensors):
+    """Full handler roundtrip (store then load) with PAGEABLE CPU tensors,
+    the exact VLLM_KV_OFFLOAD_DISABLE_PIN=1 production configuration."""
+    gpu1, _ = tensors
+    dev = gpu1.device
+
+    # unpinned - production memory type under DISABLE_PIN
+    cpu1 = torch.zeros(64, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8)
+    cpu2 = torch.zeros(64, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8)
+    gpu2 = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
+    gpu2.copy_(_pattern_matrix(NUM_GPU_BLOCKS + 7)[7:])
+
+    refs = [
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+        [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+    ]
+    store_h = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu1, gpu2],
+        cpu_tensors=[cpu1, cpu2],
+        blocks_per_chunk=BLOCKS_PER_CHUNK,
+        kv_cache_groups_data_refs=refs,
+        gpu_to_cpu=True,
+    )
+    load_h = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu1, gpu2],
+        cpu_tensors=[cpu1, cpu2],
+        blocks_per_chunk=BLOCKS_PER_CHUNK,
+        kv_cache_groups_data_refs=refs,
+        gpu_to_cpu=False,
+    )
+
+    span = 24
+    src_content = [gpu1[10 + k].clone() for k in range(span)]
+    src_content2 = [gpu2[30 + k].clone() for k in range(span)]
+    sspec = GPULoadStoreSpec(
+        list(range(10, 10 + span)) + list(range(30, 30 + span)),
+        group_sizes=[span, span],
+        block_indices=[0, 0],
+    )
+    dspec = CPULoadStoreSpec([0, 1, 2, 3, 4, 5])
+    assert store_h.transfer_async(1, sspec, dspec)
+    store_h.wait({1})
+    assert store_h.get_finished()
+
+    pat1 = _pattern_matrix(NUM_GPU_BLOCKS)
+    for k in range(span):
+        ch = k // BLOCKS_PER_CHUNK
+        sub = k % BLOCKS_PER_CHUNK
+        assert (
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == src_content[k].cpu()
+        ).all(), f"pageable store t0 misplaced at {k}"
+        assert (
+            cpu2[ch, sub * PAGE : (sub + 1) * PAGE] == src_content2[k].cpu()
+        ).all(), f"pageable store t1 misplaced at {k}"
+
+    ldst = GPULoadStoreSpec(
+        list(range(150, 150 + span)) + list(range(170, 170 + span)),
+        group_sizes=[span, span],
+        block_indices=[0, 0],
+    )
+    assert load_h.transfer_async(2, dspec, ldst)
+    load_h.wait({2})
+    assert load_h.get_finished()
+    for k in range(span):
+        assert torch.equal(
+            gpu1[150 + k].cpu(), src_content[k].cpu()
+        ), f"pageable load t0 misplaced at {k}"
+        assert torch.equal(
+            gpu2[170 + k].cpu(), src_content2[k].cpu()
+        ), f"pageable load t1 misplaced at {k}"
