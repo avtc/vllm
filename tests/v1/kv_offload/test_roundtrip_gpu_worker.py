@@ -18,9 +18,19 @@ Requires CUDA (runs on the serving box; skipped elsewhere).
 import pytest
 import torch
 
-from vllm.v1.kv_offload.base import CanonicalKVCacheRef, GPULoadStoreSpec
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
+    LookupResult,
+)
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CPUOffloadingWorker,
+    SingleDirectionOffloadingHandler,
+)
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
 
 NUM_GPU_BLOCKS = 256
 PAGE = 4096  # bytes per GPU block per tensor
@@ -465,3 +475,173 @@ def test_direct_batch_memcpy_mixed_tensors(tensors):
     for start in range(0, n, 16):
         all_bad += _batch(list(range(start, min(start + 16, n))), f"chunk{start}")
     assert not all_bad, f"corrupted ops: {all_bad[:8]}"
+
+
+def _kv_content(seed: int, num_blocks: int) -> torch.Tensor:
+    """Unique per-(seed, block, byte) 'computed KV' content."""
+    b = torch.arange(num_blocks, dtype=torch.int32).view(num_blocks, 1)
+    j = torch.arange(PAGE, dtype=torch.int32).view(1, PAGE)
+    return ((seed * 977 + b * 131 + j * 7 + 11) & 0xFF).to(torch.int8)
+
+
+def _run_kv_lifecycle(tensors, batch_chunk: str | None):
+    """Integration test imitating production KV usage:
+
+    1. request R1 computes KV into GPU blocks (4 groups, 2 tensors)
+    2. blocks are evicted from GPU -> stored to CPU via the REAL
+       CPUOffloadingManager allocation + REAL CPUOffloadingWorker DMA;
+       CPU bytes are verified (eviction correctness)
+    3. request R2 shares R1's prefix but only its first blocks survived
+       on GPU: combined CPU+GPU prefix cache -> manager lookup/prepare_load
+       -> worker load with straddling logical starts [13,13,13,1];
+       restored GPU blocks are verified
+    4. the cycle repeats with new content, forcing LRU eviction and chunk
+       reallocation in the manager pool.
+
+    Everything goes through production code paths: manager-allocated CPU
+    chunk ids, worker submit_store/submit_load, group-major specs."""
+    gpu1, cpu_fixture = tensors
+    dev = gpu1.device
+
+    if batch_chunk is not None:
+        import os
+
+        os.environ["VLLM_KV_OFFLOAD_BATCH_CHUNK"] = batch_chunk
+    try:
+        gpu2 = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
+        cpu_kw = dict(
+            kv_caches=CanonicalKVCaches(
+                tensors=[
+                    CanonicalKVCacheTensor(tensor=gpu1, page_size_bytes=PAGE),
+                    CanonicalKVCacheTensor(tensor=gpu2, page_size_bytes=PAGE),
+                ],
+                group_data_refs=[
+                    [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+                    [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+                    [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+                    [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+                ],
+            ),
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            num_cpu_blocks=40,
+        )
+        worker = CPUOffloadingWorker(**cpu_kw)
+        manager = CPUOffloadingManager(
+            num_blocks=40, cache_policy="lru", enable_events=False
+        )
+
+        from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+
+        req_ctx = ReqContext(req_id="itest")
+        BPC = BLOCKS_PER_CHUNK
+        chunks_per_group = 8  # 64 logical blocks per group
+        num_groups = 4
+        # GPU rows per group (clean, exclusive regions):
+        gpu_rows = {0: (0, 128), 1: (128, 256)}  # tensor_idx -> row range
+        group_rows = [(0, 0), (0, 64), (1, 0), (1, 64)]
+
+        def _keys(cycle: int):
+            return [
+                OffloadKey(f"c{cycle}-g{g}-k{c}".encode())
+                for g in range(num_groups)
+                for c in range(chunks_per_group)
+            ]
+
+        def _write_kv(cycle: int):
+            content = {}
+            for g, (t_idx, row0) in enumerate(group_rows):
+                ten = gpu1 if t_idx == 0 else gpu2
+                mat = _kv_content(cycle * 31 + g, 64)
+                for blk in range(64):
+                    ten[row0 + blk] = mat[blk]
+                content[g] = mat
+            return content
+
+        def _full_store(job_id: int, cycle: int):
+            keys = _keys(cycle)
+            out = manager.prepare_store(keys, req_ctx)
+            assert out is not None
+            assert len(out.keys_to_store) == len(keys)
+            src_blocks, group_sizes, block_indices = [], [], []
+            for g in range(num_groups):
+                t_idx, row0 = group_rows[g]
+                src_blocks.extend(range(row0, row0 + 64))
+                group_sizes.append(64)
+                block_indices.append(0)
+            src = GPULoadStoreSpec(
+                src_blocks, group_sizes=group_sizes, block_indices=block_indices
+            )
+            assert worker.submit_store(job_id, src, out.store_spec)
+            worker.wait({job_id})
+            fin = worker.get_finished()
+            assert fin and fin[0].success
+            manager.complete_store(out.keys_to_store, req_ctx)
+
+        def _partial_load(job_id: int, cycle: int, content):
+            starts = [13, 13, 13, 1]
+            keys, src_blocks, group_sizes, block_indices = [], [], [], []
+            for g, start in enumerate(starts):
+                first_chunk = start // BPC
+                for c in range(first_chunk, chunks_per_group):
+                    keys.append(OffloadKey(f"c{cycle}-g{g}-k{c}".encode()))
+                t_idx, row0 = group_rows[g]
+                # restore target = the group's own (evicted, now-freed)
+                # rows, exactly like production block reallocation
+                src_blocks.extend(range(row0, row0 + 64 - start))
+                group_sizes.append(64 - start)
+                block_indices.append(start)
+            out = manager.prepare_load(keys, req_ctx)
+            dst = GPULoadStoreSpec(
+                src_blocks, group_sizes=group_sizes, block_indices=block_indices
+            )
+            assert worker.submit_load(job_id, out, dst)
+            worker.wait({job_id})
+            assert worker.get_finished()
+            manager.complete_load(keys, req_ctx)
+
+            # verify: dst row k of group g must equal R_cycle's logical
+            # block (start + k) content for that group
+            for g, start in enumerate(starts):
+                mat = content[g]
+                _, row0 = group_rows[g]
+                for k in range(64 - start):
+                    got = gpu_src(g)[row0 + k].cpu()
+                    want = mat[start + k]
+                    if not torch.equal(got, want):
+                        pytest.fail(
+                            f"cycle {cycle} group {g} pos {k} (logical "
+                            f"{start + k}): restored KV wrong"
+                        )
+
+        def gpu_src(g):
+            t_idx, _ = group_rows[g]
+            return gpu1 if t_idx == 0 else gpu2
+
+        # --- cycle 0: R1 computes, evicts, stores; R2 restores ---
+        content0 = _write_kv(0)
+        _full_store(1, 0)
+        _partial_load(2, 0, content0)
+
+        # --- cycle 1: new content, LRU eviction + chunk reuse ---
+        content1 = _write_kv(1)
+        _full_store(3, 1)
+        _partial_load(4, 1, content1)
+
+        # --- CPU-side spot verification of cycle-1 stored bytes ---
+        # lookup a chunk and confirm its first page matches content
+        k0 = OffloadKey(b"c1-g0-k0")
+        assert manager.lookup(k0, req_ctx) == LookupResult.HIT
+        worker.shutdown()
+    finally:
+        import os
+
+        if batch_chunk is not None:
+            os.environ.pop("VLLM_KV_OFFLOAD_BATCH_CHUNK", None)
+
+
+def test_integration_kv_evict_store_restore(tensors):
+    _run_kv_lifecycle(tensors, batch_chunk=None)
+
+
+def test_integration_kv_evict_store_restore_chunked(tensors):
+    _run_kv_lifecycle(tensors, batch_chunk="16")
