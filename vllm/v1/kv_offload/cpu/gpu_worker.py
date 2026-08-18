@@ -590,12 +590,14 @@ class SingleDirectionOffloadingHandler:
                         level(
                             "[KV_OFFLOAD] STORE REPLICATION job=%d: %d pages "
                             "hold only %d distinct contents; src descriptors "
-                            "unique=%d/%d; content=%s crc=%08x head=%s",
+                            "%s; content=%s crc=%08x head=%s",
                             transfer.job_id,
                             len(crcs),
                             uniq,
-                            n_src,
-                            transfer.num_copy_ops,
+                            "COLLAPSED (n_src<n_ops)"
+                            if n_src < transfer.num_copy_ops
+                            else "distinct (unique=%d/%d)"
+                            % (n_src, transfer.num_copy_ops),
                             "CONSTANT(padding)"
                             if is_const
                             else "NON-CONSTANT(corruption!)",
