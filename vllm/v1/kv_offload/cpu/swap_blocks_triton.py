@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -19,6 +21,10 @@ from vllm.triton_utils import tl, triton
 NUM_SMS = 12
 THRESHOLD_BYTES = 28 * 1024
 MIN_N = 16
+
+# (completion event, descriptor upload tensors) pairs; pruned once the
+# kernel finishes so the uploads never die before their kernel.
+_keepalive: deque = deque()
 
 
 @triton.jit
@@ -72,10 +78,24 @@ def swap_blocks_batch(
     # from earlier transfers - the kernel then copies from wrong
     # addresses (observed: GPU->GPU copies via stale GPU pointers in the
     # src array). The arrays are tiny (8B/op); sync upload is negligible.
-    _swap_blocks_kernel[(min(NUM_SMS, n),)](
+    temps = (
         src_addrs.to("cuda", non_blocking=False),
         dst_addrs.to("cuda", non_blocking=False),
         sizes.to("cuda", non_blocking=False),
+    )
+    _swap_blocks_kernel[(min(NUM_SMS, n),)](
+        temps[0],
+        temps[1],
+        temps[2],
         n,
         BYTES_PER_CHUNK=bytes_per_chunk,
     )
+    # Keep the descriptor copies alive until the kernel completes: the
+    # async kernel may otherwise outlive the temps, whose memory the
+    # caching allocator can hand to another (cross-stream) allocation
+    # while the kernel still dereferences it.
+    ev = torch.cuda.Event()
+    ev.record()
+    _keepalive.append((ev, temps))
+    while _keepalive and _keepalive[0][0].query():
+        _keepalive.popleft()
