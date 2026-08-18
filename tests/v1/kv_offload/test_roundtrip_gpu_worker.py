@@ -251,13 +251,20 @@ def _run_multi_group(tensors, force_cpp_load: bool):
         src_gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
     )
     dst = CPULoadStoreSpec([c for grp in group_chunks for c in grp])
+    # Snapshot the ACTUAL current bytes of every source row: the fixture
+    # tensor is module-scoped and earlier tests write into it, so
+    # reconstructing expected content from the pattern formula is wrong.
+    # Correctness = CPU holds exactly what the source rows held.
+    src_content = {}
+    for g in range(4):
+        gpu_t = gpu1 if g < 2 else gpu2
+        src_content[g] = [
+            gpu_t[b].clone() for b in range(group_src_base[g], group_src_base[g] + span)
+        ]
     assert store_h.transfer_async(1, src, dst)
     store_h.wait({1})
     res = store_h.get_finished()
     assert res and res[0].success
-
-    pattern1 = _pattern_matrix(NUM_GPU_BLOCKS)
-    pattern2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
 
     # Verify STORED CPU content BEFORE loading: splits store-side vs
     # load-side corruption decisively.
@@ -265,8 +272,7 @@ def _run_multi_group(tensors, force_cpp_load: bool):
         for k in range(span):
             ch = group_chunks[g][(k + st % BLOCKS_PER_CHUNK) // BLOCKS_PER_CHUNK]
             sub = (k + st % BLOCKS_PER_CHUNK) % BLOCKS_PER_CHUNK
-            pat = pattern1 if g < 2 else pattern2
-            want = pat[group_src_base[g] + k].numpy()
+            want = src_content[g][k].cpu().numpy()
             got = (cpu1 if g < 2 else cpu2)[ch, sub * PAGE : (sub + 1) * PAGE].numpy()
             if not (got == want).all():
                 s_desc, d_desc, sz_desc = store_h.last_descriptors
@@ -299,11 +305,10 @@ def _run_multi_group(tensors, force_cpp_load: bool):
 
     op = 0
     for g in range(4):
-        pattern = pattern1 if g < 2 else pattern2
         gpu_t = gpu1 if g < 2 else gpu2
         for k in range(span):
             got = gpu_t[group_dst_base[g] + k].cpu()
-            want = pattern[group_src_base[g] + k].cpu()
+            want = src_content[g][k].cpu()
             if not torch.equal(got, want):
                 s_desc, d_desc, sz_desc = load_h.last_descriptors
                 cpu_base = cpu1.data_ptr() if g < 2 else cpu2.data_ptr()
@@ -645,3 +650,175 @@ def test_integration_kv_evict_store_restore(tensors):
 
 def test_integration_kv_evict_store_restore_chunked(tensors):
     _run_kv_lifecycle(tensors, batch_chunk="16")
+
+
+def test_roundtrip_production_page_size(tensors):
+    """Production dimension: 917504-byte pages (896 KiB) - the exact op
+    size the serving box uses - through the C++ batch path both
+    directions, mixed with a second tensor of a DIFFERENT page size in
+    the same batch (production canonical tensors have diverse page
+    sizes)."""
+    gpu1, _ = tensors
+    dev = gpu1.device
+    from vllm import _custom_ops as ops
+
+    PAGE_BIG = 917504
+    PAGE_ALT = 524288
+    bpc = 8
+    n_big, n_alt = 21, 13
+
+    g1 = torch.zeros(64, PAGE_BIG, dtype=torch.int8, device=dev)
+    g2 = torch.zeros(64, PAGE_ALT, dtype=torch.int8, device=dev)
+    for t, page, seed in ((g1, PAGE_BIG, 1), (g2, PAGE_ALT, 2)):
+        ids = torch.arange(64, dtype=torch.int32).view(64, 1)
+        offs = torch.arange(page, dtype=torch.int32).view(1, page)
+        t.copy_(((seed * 977 + ids * 131 + offs * 7 + 11) & 0xFF).to(torch.int8))
+
+    c1 = torch.zeros(16, PAGE_BIG * bpc, dtype=torch.int8).pin_memory()
+    c2 = torch.zeros(16, PAGE_ALT * bpc, dtype=torch.int8).pin_memory()
+
+    srcs = [g1[i].data_ptr() for i in range(n_big)] + [
+        g2[i].data_ptr() for i in range(n_alt)
+    ]
+    dsts = (
+        [c1.data_ptr() + 0 * c1.stride(0) + j * PAGE_BIG for j in range(n_big)]
+        + [c2.data_ptr() + 0 * c2.stride(0) + j * PAGE_ALT for j in range(n_alt)]
+    )
+    sizes = [PAGE_BIG] * n_big + [PAGE_ALT] * n_alt
+
+    s = torch.tensor(srcs, dtype=torch.int64).pin_memory()
+    d = torch.tensor(dsts, dtype=torch.int64).pin_memory()
+    sz = torch.tensor(sizes, dtype=torch.int64).pin_memory()
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        ops.swap_blocks_batch(s, d, sz)
+    ev = torch.cuda.Event()
+    ev.record(st)
+    ev.synchronize()
+    for j in range(n_big):
+        assert torch.equal(c1[0, j * PAGE_BIG : (j + 1) * PAGE_BIG].cpu(), g1[j].cpu())
+    for j in range(n_alt):
+        assert torch.equal(c2[0, j * PAGE_ALT : (j + 1) * PAGE_ALT].cpu(), g2[j].cpu())
+
+
+def test_roundtrip_mmap_rank_interleaved_layout(tensors):
+    """Production dimension: the SharedOffloadRegion mmap layout - CPU
+    'tensors' are STRIDED VIEWS into one shared file, rows interleaved
+    per rank (row = [rank0 cell | rank1 cell], cell holds all that
+    rank's tensors concatenated). Verifies two independent rank views
+    store/load correctly AND that rank 0's stores never leak into rank
+    1's cells. Linux-only (/dev/shm)."""
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("SharedOffloadRegion requires Linux /dev/shm")
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    gpu1, _ = tensors
+    dev = gpu1.device
+
+    W = PAGE * BLOCKS_PER_CHUNK  # per-tensor width
+    cpu_page_size = 2 * W  # two tensors per rank
+    row_stride = cpu_page_size * 2  # two ranks
+    num_blocks = 40
+    engine_id = "itest-mmap"
+
+    import os
+
+    path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+    if os.path.exists(path):
+        os.remove(path)
+
+    try:
+        regions = [
+            SharedOffloadRegion(
+                engine_id=engine_id,
+                num_blocks=num_blocks,
+                rank=r,
+                kv_bytes_per_block=row_stride,
+                cpu_page_size=cpu_page_size,
+            )
+            for r in range(2)
+        ]
+        gpu2 = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
+        refs = [
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+            [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+            [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+        ]
+        # Both ranks' handlers use the SAME canonical GPU tensor order;
+        # each rank stores into ITS OWN strided views of the shared mmap.
+        cpu_r0 = [regions[0].create_next_view(W) for _ in range(2)]
+        cpu_r1 = [regions[1].create_next_view(W) for _ in range(2)]
+        store_r0 = SingleDirectionOffloadingHandler(
+            gpu_tensors=[gpu1, gpu2],
+            cpu_tensors=cpu_r0,
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            kv_cache_groups_data_refs=refs,
+            gpu_to_cpu=True,
+        )
+        store_r1 = SingleDirectionOffloadingHandler(
+            gpu_tensors=[gpu1, gpu2],
+            cpu_tensors=cpu_r1,
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            kv_cache_groups_data_refs=refs,
+            gpu_to_cpu=True,
+        )
+
+        span = 21
+        starts = [13, 13, 13, 1]
+        src_base = [50, 90, 33, 120]
+        # rank 1 uses different source rows so contents are distinguishable
+        src_base_r1 = [150, 190, 70, 10]
+
+        def _store_verify(store_h, cpu_views, src_base, tag):
+            chunk_lists = [
+                list(range(4, 8)),
+                list(range(8, 12)),
+                list(range(12, 16)),
+                list(range(16, 19)),
+            ]
+            srcs, sizes, indices = [], [], []
+            content = {}
+            for g in range(4):
+                gpu_t = gpu1 if g < 2 else gpu2
+                row0 = src_base[g]
+                content[g] = [gpu_t[row0 + k].clone() for k in range(span)]
+                srcs.extend(range(row0, row0 + span))
+                sizes.append(span)
+                indices.append(starts[g])
+            spec = GPULoadStoreSpec(
+                list(srcs), group_sizes=sizes, block_indices=indices
+            )
+            dst = CPULoadStoreSpec([c for cl in chunk_lists for c in cl])
+            assert store_h.transfer_async(1, spec, dst)
+            store_h.wait({1})
+            assert store_h.get_finished()
+            for g in range(4):
+                for k in range(span):
+                    pos = starts[g] % BLOCKS_PER_CHUNK + k
+                    ch = chunk_lists[g][pos // BLOCKS_PER_CHUNK]
+                    sub = pos % BLOCKS_PER_CHUNK
+                    want = content[g][k].cpu().numpy()
+                    got = cpu_views[g // 2][
+                        ch, sub * PAGE : (sub + 1) * PAGE
+                    ].numpy()
+                    assert (got == want).all(), (
+                        f"{tag} group {g} pos {k}: mmap store misplaced"
+                    )
+
+        _store_verify(store_r0, cpu_r0, src_base, "rank0")
+        _store_verify(store_r1, cpu_r1, src_base_r1, "rank1")
+
+        # cross-rank leak check: rank0's chunk 4 page 0 must equal rank0's
+        # stored content, and rank1's view of ITS chunk 4 must differ
+        v0 = cpu_r0[0][4, 0:PAGE].numpy()
+        v1 = cpu_r1[0][4, 0:PAGE].numpy()
+        assert not (v0 == v1).all(), "rank views alias the same memory!"
+    finally:
+        for r in regions:
+            r.cleanup()
+        if os.path.exists(path):
+            os.remove(path)
