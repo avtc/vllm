@@ -696,10 +696,17 @@ def test_roundtrip_production_page_size(tensors):
     ev = torch.cuda.Event()
     ev.record(st)
     ev.synchronize()
+    # dsts pack contiguously from each tensor's base (spanning rows)
+    f1 = c1.reshape(-1)
+    f2 = c2.reshape(-1)
     for j in range(n_big):
-        assert torch.equal(c1[0, j * PAGE_BIG : (j + 1) * PAGE_BIG].cpu(), g1[j].cpu())
+        assert torch.equal(
+            f1[j * PAGE_BIG : (j + 1) * PAGE_BIG].cpu(), g1[j].cpu()
+        ), f"big-page op {j} misplaced"
     for j in range(n_alt):
-        assert torch.equal(c2[0, j * PAGE_ALT : (j + 1) * PAGE_ALT].cpu(), g2[j].cpu())
+        assert torch.equal(
+            f2[j * PAGE_ALT : (j + 1) * PAGE_ALT].cpu(), g2[j].cpu()
+        ), f"alt-page op {j} misplaced"
 
 
 def test_roundtrip_mmap_rank_interleaved_layout(tensors):
@@ -812,11 +819,19 @@ def test_roundtrip_mmap_rank_interleaved_layout(tensors):
         _store_verify(store_r0, cpu_r0, src_base, "rank0")
         _store_verify(store_r1, cpu_r1, src_base_r1, "rank1")
 
-        # cross-rank leak check: rank0's chunk 4 page 0 must equal rank0's
-        # stored content, and rank1's view of ITS chunk 4 must differ
-        v0 = cpu_r0[0][4, 0:PAGE].numpy()
-        v1 = cpu_r1[0][4, 0:PAGE].numpy()
+        # Cross-rank leak check: the FIRST WRITTEN page of chunk 4 is
+        # sub 5 (straddling starts). Rank 0 and rank 1 stored DIFFERENT
+        # source rows there; identical bytes would mean the views alias.
+        v0 = cpu_r0[0][4, 5 * PAGE : 6 * PAGE].numpy()
+        v1 = cpu_r1[0][4, 5 * PAGE : 6 * PAGE].numpy()
         assert not (v0 == v1).all(), "rank views alias the same memory!"
+        # and each must match its own group-0 first stored block
+        assert (v0 == gpu1[src_base[0]].cpu().numpy()).all(), (
+            "rank0 first page mismatch"
+        )
+        assert (v1 == gpu1[src_base_r1[0]].cpu().numpy()).all(), (
+            "rank1 first page mismatch"
+        )
     finally:
         for r in regions:
             r.cleanup()
