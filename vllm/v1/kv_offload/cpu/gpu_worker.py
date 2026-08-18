@@ -568,16 +568,39 @@ class SingleDirectionOffloadingHandler:
                     if uniq <= max(2, len(crcs) // 8):
                         src_np = transfer.batch_src.numpy()
                         n_src = len(set(int(x) for x in src_np[: transfer.num_copy_ops]))
-                        logger.warning(
+                        # classify: byte-CONSTANT content (zeros/padding -
+                        # e.g. SWA/compressor layers beyond the window) is
+                        # benign; non-constant identical KV across pages
+                        # is real replication corruption.
+                        addr0 = int(dst_addrs[0])
+                        nbytes0 = int(sizes_np[0])
+                        head = (ctypes.c_char * 16).from_address(addr0)[:16]
+                        is_const = (
+                            nbytes0 > 0
+                            and zlib.crc32(
+                                (ctypes.c_char * nbytes0).from_address(addr0)
+                            )
+                            == zlib.crc32(
+                                bytes([head[0]]) * nbytes0
+                            )
+                        )
+                        level = (
+                            logger.info if is_const else logger.warning
+                        )
+                        level(
                             "[KV_OFFLOAD] STORE REPLICATION job=%d: %d pages "
                             "hold only %d distinct contents; src descriptors "
-                            "unique=%d/%d (collapse!) — data corrupted at "
-                            "STORE time",
+                            "unique=%d/%d; content=%s crc=%08x head=%s",
                             transfer.job_id,
                             len(crcs),
                             uniq,
                             n_src,
                             transfer.num_copy_ops,
+                            "CONSTANT(padding)"
+                            if is_const
+                            else "NON-CONSTANT(corruption!)",
+                            crcs[0],
+                            head.hex(),
                         )
             result = TransferResult(
                 job_id=transfer.job_id,
