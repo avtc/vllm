@@ -881,6 +881,18 @@ def _run_store_load_streams(tensors, concurrent: bool):
     store_h.wait({1})
     assert store_h.get_finished()
 
+    # checkpoint after phase 1: isolate which phase corrupts
+    pat1_pre = _pattern_matrix(NUM_GPU_BLOCKS)
+    for k in range(span1):
+        ch = k // BLOCKS_PER_CHUNK
+        sub = k % BLOCKS_PER_CHUNK
+        assert (
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1_pre[10 + k]
+        ).all(), f"PHASE 1 already wrong: cpu1[{ch}][{sub}] (k={k})"
+        assert (
+            cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] != 0
+        ).all(), f"PHASE 1 group1 never written: cpu2[{3 + ch}][{sub}]"
+
     # phase 2: CONCURRENT store (new chunks) + load (old chunks), no wait
     # between submissions so the two streams overlap in execution
     span2 = 16
@@ -912,9 +924,51 @@ def _run_store_load_streams(tensors, concurrent: bool):
     for k in range(span1):
         ch = k // BLOCKS_PER_CHUNK
         sub = k % BLOCKS_PER_CHUNK
-        assert (
+        if not (
             cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[10 + k]
-        ).all(), f"CPU chunk {ch} sub {sub} corrupted after phase 2"
+        ).all():
+            from vllm import _custom_ops as ops
+
+            s_d, d_d, z_d = store_h.last_descriptors
+            decoded = "; ".join(
+                f"op{j}:src=g1[{(int(s_d[j]) - gpu1.data_ptr()) // PAGE}]"
+                f"->c1[{(int(d_d[j]) - cpu1.data_ptr()) // 32768}]"
+                if int(d_d[j]) - cpu1.data_ptr() < cpu1.numel()
+                and int(d_d[j]) >= cpu1.data_ptr()
+                else f"op{j}:dst=+0x{int(d_d[j]):x}"
+                for j in range(0, min(6, len(s_d)))
+            )
+            # same-descriptor direct retry: bisects handler context vs
+            # driver behavior
+            retry = torch.zeros_like(cpu1)
+            rd = []
+            for j in range(len(s_d)):
+                base = int(d_d[j]) - cpu1.data_ptr()
+                rd.append(retry.data_ptr() + base)
+            rs = torch.tensor(
+                [int(x) for x in s_d[: len(rd)]], dtype=torch.int64
+            ).pin_memory()
+            rd_t = torch.tensor(rd, dtype=torch.int64).pin_memory()
+            rz = torch.tensor(
+                [int(x) for x in z_d[: len(rd)]], dtype=torch.int64
+            ).pin_memory()
+            st2 = torch.cuda.Stream()
+            st2.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(st2):
+                ops.swap_blocks_batch(rs, rd_t, rz)
+            ev2 = torch.cuda.Event()
+            ev2.record(st2)
+            ev2.synchronize()
+            retry_ok = (
+                retry.view(-1)[:PAGE] == pat1[10]
+            ).all()
+            assert (
+                cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[10 + k]
+            ).all(), (
+                f"CPU chunk {ch} sub {sub} corrupted after phase 2; "
+                f"store descs: {decoded}; direct retry of same descs: "
+                f"{'CORRECT' if retry_ok else 'ALSO WRONG'}"
+            )
     for k in range(span1):
         got = gpu1[150 + k].cpu()
         want = pat1[10 + k]
