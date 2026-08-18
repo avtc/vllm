@@ -879,7 +879,7 @@ def test_concurrent_store_load_streams(tensors):
         group_sizes=[span1, span1],
         block_indices=[0, 0],
     )
-    dspec = CPULoadStoreSpec([0, 1, 2, 3])
+    dspec = CPULoadStoreSpec([0, 1, 2, 3, 4, 5])  # 3 chunks per group
     assert store_h.transfer_async(1, sspec, dspec)
     store_h.wait({1})
     assert store_h.get_finished()
@@ -892,8 +892,8 @@ def test_concurrent_store_load_streams(tensors):
         group_sizes=[span2, span2],
         block_indices=[0, 0],
     )
-    store_dst = CPULoadStoreSpec([8, 9, 10, 11])
-    load_src = CPULoadStoreSpec([0, 1, 2, 3])
+    store_dst = CPULoadStoreSpec([8, 9, 10, 11])  # 2 chunks per group
+    load_src = CPULoadStoreSpec([0, 1, 2, 3, 4, 5])  # 3 chunks per group
     load_dst = GPULoadStoreSpec(
         list(range(150, 150 + span1)) + list(range(170, 170 + span1)),
         group_sizes=[span1, span1],
@@ -919,8 +919,9 @@ def test_concurrent_store_load_streams(tensors):
         assert (
             cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[60 + k]
         ).all(), f"store t0 {k}"
+        ch1 = 10 + pos // BLOCKS_PER_CHUNK
         assert (
-            cpu2[ch, sub * PAGE : (sub + 1) * PAGE] == pat2[100 + k]
+            cpu2[ch1, sub * PAGE : (sub + 1) * PAGE] == pat2[100 + k]
         ).all(), f"store t1 {k}"
 
 
@@ -979,7 +980,7 @@ def _mp_dma_child(rank, engine_id, geometry, barrier, out_q):
             group_sizes=[span, span],
             block_indices=[5, 5],
         )
-        dst = CPULoadStoreSpec([2, 3, 4, 5, 6, 7])
+        dst = CPULoadStoreSpec([2, 3, 4, 5, 6, 7, 8, 9])  # 4 per group
         barrier.wait()  # both ranks submit simultaneously
         assert handler.transfer_async(1, spec, dst)
         handler.wait({1})
@@ -999,7 +1000,7 @@ def _mp_dma_child(rank, engine_id, geometry, barrier, out_q):
                 detail = f"rank{rank} t0 k={k}"
                 break
             if not (
-                views[1][ch, sub * PAGE : (sub + 1) * PAGE].cpu()
+                views[1][6 + pos // BPC, sub * PAGE : (sub + 1) * PAGE].cpu()
                 == g2[24 + k].cpu()
             ).all():
                 ok = False
