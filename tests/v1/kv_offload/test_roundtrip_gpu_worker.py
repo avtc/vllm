@@ -837,3 +837,253 @@ def test_roundtrip_mmap_rank_interleaved_layout(tensors):
             r.cleanup()
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_concurrent_store_load_streams(tensors):
+    """Production runs store and load handlers on INDEPENDENT streams that
+    can execute SIMULTANEOUSLY (on-evict store + prefix load in the same
+    step). Both batch DMAs hit the same pinned CPU region concurrently.
+    Sequential submission with overlapped execution, disjoint cells -
+    verify both transfers stay byte-exact."""
+    gpu1, _ = tensors
+    dev = gpu1.device
+
+    cpu1 = torch.zeros(32, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8).pin_memory()
+    cpu2 = torch.zeros(32, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8).pin_memory()
+    gpu2 = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
+    gpu2.copy_(_pattern_matrix(NUM_GPU_BLOCKS + 7)[7:])
+
+    refs = [
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+        [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+    ]
+    store_h = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu1, gpu2],
+        cpu_tensors=[cpu1, cpu2],
+        blocks_per_chunk=BLOCKS_PER_CHUNK,
+        kv_cache_groups_data_refs=refs,
+        gpu_to_cpu=True,
+    )
+    load_h = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu1, gpu2],
+        cpu_tensors=[cpu1, cpu2],
+        blocks_per_chunk=BLOCKS_PER_CHUNK,
+        kv_cache_groups_data_refs=refs,
+        gpu_to_cpu=False,
+    )
+
+    # phase 1: store blocks into chunks 0..3 of both tensors
+    span1 = 24
+    sspec = GPULoadStoreSpec(
+        list(range(10, 10 + span1)) + list(range(30, 30 + span1)),
+        group_sizes=[span1, span1],
+        block_indices=[0, 0],
+    )
+    dspec = CPULoadStoreSpec([0, 1, 2, 3])
+    assert store_h.transfer_async(1, sspec, dspec)
+    store_h.wait({1})
+    assert store_h.get_finished()
+
+    # phase 2: CONCURRENT store (new chunks) + load (old chunks), no wait
+    # between submissions so the two streams overlap in execution
+    span2 = 16
+    store_spec = GPULoadStoreSpec(
+        list(range(60, 60 + span2)) + list(range(100, 100 + span2)),
+        group_sizes=[span2, span2],
+        block_indices=[0, 0],
+    )
+    store_dst = CPULoadStoreSpec([8, 9, 10, 11])
+    load_src = CPULoadStoreSpec([0, 1, 2, 3])
+    load_dst = GPULoadStoreSpec(
+        list(range(150, 150 + span1)) + list(range(170, 170 + span1)),
+        group_sizes=[span1, span1],
+        block_indices=[0, 0],
+    )
+    assert store_h.transfer_async(2, store_spec, store_dst)
+    assert load_h.transfer_async(3, load_src, load_dst)
+    store_h.wait({2})
+    load_h.wait({3})
+    assert store_h.get_finished()
+    assert load_h.get_finished()
+
+    pat1 = _pattern_matrix(NUM_GPU_BLOCKS)
+    pat2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
+    for k in range(span1):
+        assert torch.equal(gpu1[150 + k].cpu(), pat1[10 + k]), f"load t0 {k}"
+        assert torch.equal(gpu2[170 + k].cpu(), pat2[30 + k]), f"load t1 {k}"
+    for k in range(span2):
+        # concurrent store: chunks 8..11 hold rows 60.. / 100..
+        pos = k
+        ch = 8 + pos // BLOCKS_PER_CHUNK
+        sub = pos % BLOCKS_PER_CHUNK
+        assert (
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[60 + k]
+        ).all(), f"store t0 {k}"
+        assert (
+            cpu2[ch, sub * PAGE : (sub + 1) * PAGE] == pat2[100 + k]
+        ).all(), f"store t1 {k}"
+
+
+def _mp_dma_child(rank, engine_id, geometry, barrier, out_q):
+    """Child process: own CUDA context, own mmap VA of the shared file,
+    registers the ENTIRE region (production behavior), waits on the
+    barrier, then stores rank-unique content into its own cells."""
+    import torch
+
+    from vllm.v1.kv_offload.base import CanonicalKVCacheRef, GPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu.gpu_worker import (
+        SingleDirectionOffloadingHandler,
+        pin_mmap_region,
+    )
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    n_blocks, row_stride, cpu_page_size, W = geometry
+    PAGE = W // 8
+    BPC = 8
+    try:
+        region = SharedOffloadRegion(
+            engine_id=engine_id,
+            num_blocks=n_blocks,
+            rank=rank,
+            kv_bytes_per_block=row_stride,
+            cpu_page_size=cpu_page_size,
+        )
+        pin_mmap_region(region)
+        views = [region.create_next_view(W) for _ in range(2)]
+
+        g1 = torch.zeros(48, PAGE, dtype=torch.int8, device="cuda")
+        g2 = torch.zeros(48, PAGE, dtype=torch.int8, device="cuda")
+        for t in (g1, g2):
+            ids = torch.arange(48, dtype=torch.int32).view(48, 1)
+            offs = torch.arange(PAGE, dtype=torch.int32).view(1, PAGE)
+            t.copy_(
+                ((rank * 51000 + ids * 131 + offs * 7 + 11) & 0xFF).to(
+                    torch.int8
+                )
+            )
+        refs = [
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=PAGE)],
+            [CanonicalKVCacheRef(tensor_idx=1, page_size_bytes=PAGE)],
+        ]
+        handler = SingleDirectionOffloadingHandler(
+            gpu_tensors=[g1, g2],
+            cpu_tensors=views,
+            blocks_per_chunk=BPC,
+            kv_cache_groups_data_refs=refs,
+            gpu_to_cpu=True,
+        )
+        span = 20
+        spec = GPULoadStoreSpec(
+            list(range(4, 4 + span)) + list(range(24, 24 + span)),
+            group_sizes=[span, span],
+            block_indices=[5, 5],
+        )
+        dst = CPULoadStoreSpec([2, 3, 4, 5, 6, 7])
+        barrier.wait()  # both ranks submit simultaneously
+        assert handler.transfer_async(1, spec, dst)
+        handler.wait({1})
+        assert handler.get_finished()
+
+        ok = True
+        detail = ""
+        for k in range(span):
+            pos = 5 + k
+            ch = 2 + pos // BPC
+            sub = pos % BPC
+            if not (
+                views[0][ch, sub * PAGE : (sub + 1) * PAGE].cpu()
+                == g1[4 + k].cpu()
+            ).all():
+                ok = False
+                detail = f"rank{rank} t0 k={k}"
+                break
+            if not (
+                views[1][ch, sub * PAGE : (sub + 1) * PAGE].cpu()
+                == g2[24 + k].cpu()
+            ).all():
+                ok = False
+                detail = f"rank{rank} t1 k={k}"
+                break
+        out_q.put((rank, ok, detail, [v.data_ptr() for v in views]))
+    except Exception as e:  # noqa: BLE001
+        out_q.put((rank, False, f"exception: {e!r}", []))
+
+
+def test_mmap_two_process_concurrent_dma(tensors):
+    """THE last untested production dimension: multiple worker PROCESSES,
+    separate CUDA contexts, one shared mmap file, each registering the
+    ENTIRE region with cudaHostRegister, CONCURRENT batch DMAs from both
+    contexts into rank-interleaved cells. After both stores, a scheduler-
+    style rank=None mapping independently verifies every byte - catching
+    any cross-context aliasing the workers themselves cannot see."""
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("SharedOffloadRegion requires Linux /dev/shm")
+    import multiprocessing as mp
+
+    W = PAGE * BLOCKS_PER_CHUNK
+    cpu_page_size = 2 * W
+    row_stride = cpu_page_size * 2
+    n_blocks = 16
+    engine_id = "itest-mp"
+    import os
+
+    path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+    if os.path.exists(path):
+        os.remove(path)
+
+    ctx = mp.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    out_q = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_mp_dma_child,
+            args=(
+                r,
+                engine_id,
+                (n_blocks, row_stride, cpu_page_size, W),
+                barrier,
+                out_q,
+            ),
+        )
+        for r in range(2)
+    ]
+    try:
+        for p in procs:
+            p.start()
+        results = [out_q.get(timeout=180) for _ in range(2)]
+        for p in procs:
+            p.join(timeout=60)
+        for rank, ok, detail, ptrs in results:
+            assert ok, f"rank {rank} self-verification failed: {detail}"
+
+        # scheduler-style independent view: verify both ranks' bytes
+        from vllm.v1.kv_offload.cpu.shared_offload_region import (
+            SharedOffloadRegion,
+        )
+
+        sched = SharedOffloadRegion(
+            engine_id=engine_id,
+            num_blocks=n_blocks,
+            rank=None,
+            kv_bytes_per_block=row_stride,
+            cpu_page_size=cpu_page_size,
+        )
+        base = sched._base.view(n_blocks, row_stride)
+        for rank in range(2):
+            off = rank * cpu_page_size
+            v0 = base[2, off + 5 * PAGE : off + 6 * PAGE]
+            g1_first = (rank * 51000 + 4 * 131 + 11) & 0xFF
+            assert int(v0[0]) == g1_first, (
+                f"scheduler view: rank{rank} chunk2 t0 first byte "
+                f"{int(v0[0])} != {g1_first} (cross-context aliasing!)"
+            )
+        sched.cleanup()
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        if os.path.exists(path):
+            os.remove(path)
