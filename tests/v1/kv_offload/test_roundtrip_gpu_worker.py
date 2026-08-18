@@ -429,8 +429,12 @@ def test_direct_batch_memcpy_mixed_tensors(tensors):
     n = len(srcs)
 
     def _batch(copy_slice, tag):
-        s = torch.tensor(srcs[copy_slice], dtype=torch.int64).pin_memory()
-        d = torch.tensor(dsts[copy_slice], dtype=torch.int64).pin_memory()
+        s = torch.tensor(
+            [srcs[j] for j in copy_slice], dtype=torch.int64
+        ).pin_memory()
+        d = torch.tensor(
+            [dsts[j] for j in copy_slice], dtype=torch.int64
+        ).pin_memory()
         sz = torch.full((len(copy_slice),), PAGE, dtype=torch.int64).pin_memory()
         st = torch.cuda.Stream()
         st.wait_stream(torch.cuda.current_stream())
