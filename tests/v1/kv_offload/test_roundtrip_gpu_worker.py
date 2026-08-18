@@ -883,6 +883,7 @@ def _run_store_load_streams(tensors, concurrent: bool):
 
     # checkpoint after phase 1: isolate which phase corrupts
     pat1_pre = _pattern_matrix(NUM_GPU_BLOCKS)
+    pat2_pre = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
     for k in range(span1):
         ch = k // BLOCKS_PER_CHUNK
         sub = k % BLOCKS_PER_CHUNK
@@ -890,8 +891,8 @@ def _run_store_load_streams(tensors, concurrent: bool):
             cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1_pre[10 + k]
         ).all(), f"PHASE 1 already wrong: cpu1[{ch}][{sub}] (k={k})"
         assert (
-            cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] != 0
-        ).all(), f"PHASE 1 group1 never written: cpu2[{3 + ch}][{sub}]"
+            cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] == pat2_pre[30 + k]
+        ).all(), f"PHASE 1 already wrong: cpu2[{3 + ch}][{sub}] (k={k})"
 
     # phase 2: CONCURRENT store (new chunks) + load (old chunks), no wait
     # between submissions so the two streams overlap in execution
@@ -1296,7 +1297,7 @@ def test_pageable_roundtrip_via_handler(tensors):
             cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == src_content[k].cpu()
         ).all(), f"pageable store t0 misplaced at {k}"
         assert (
-            cpu2[ch, sub * PAGE : (sub + 1) * PAGE] == src_content2[k].cpu()
+            cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] == src_content2[k].cpu()
         ).all(), f"pageable store t1 misplaced at {k}"
 
     ldst = GPULoadStoreSpec(
