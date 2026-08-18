@@ -65,10 +65,17 @@ def swap_blocks_batch(
             is_src_access_order_any=is_src_access_order_any,
         )
         return
+    # Descriptor upload MUST be synchronous (or explicitly kept alive
+    # past kernel completion). The temporaries returned by .to() are freed
+    # at function return; with non_blocking=True the kernel can execute
+    # against allocator-REUSED device memory holding stale pointer values
+    # from earlier transfers - the kernel then copies from wrong
+    # addresses (observed: GPU->GPU copies via stale GPU pointers in the
+    # src array). The arrays are tiny (8B/op); sync upload is negligible.
     _swap_blocks_kernel[(min(NUM_SMS, n),)](
-        src_addrs.to("cuda", non_blocking=True),
-        dst_addrs.to("cuda", non_blocking=True),
-        sizes.to("cuda", non_blocking=True),
+        src_addrs.to("cuda", non_blocking=False),
+        dst_addrs.to("cuda", non_blocking=False),
+        sizes.to("cuda", non_blocking=False),
         n,
         BYTES_PER_CHUNK=bytes_per_chunk,
     )
