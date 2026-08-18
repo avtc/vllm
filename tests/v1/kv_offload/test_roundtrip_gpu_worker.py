@@ -246,6 +246,9 @@ def _run_multi_group(tensors, force_cpp_load: bool):
     res = store_h.get_finished()
     assert res and res[0].success
 
+    pattern1 = _pattern_matrix(NUM_GPU_BLOCKS)
+    pattern2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
+
     # Verify STORED CPU content BEFORE loading: splits store-side vs
     # load-side corruption decisively.
     for g, st in enumerate(block_indices):
@@ -273,8 +276,6 @@ def _run_multi_group(tensors, force_cpp_load: bool):
     load_h.wait({2})
     assert load_h.get_finished()
 
-    pattern1 = _pattern_matrix(NUM_GPU_BLOCKS)
-    pattern2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
     op = 0
     for g in range(4):
         pattern = pattern1 if g < 2 else pattern2
