@@ -601,6 +601,9 @@ class CPUOffloadingWorker(OffloadingWorker):
                 "CPU<->GPU copies will use staging buffers."
             )
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+        # CPU KV tensors we cudaHostRegister'ed ourselves (unregistered on
+        # shutdown). Only populated under VLLM_KV_OFFLOAD_REGISTER_PIN=1.
+        self._registered_cpu_tensors: list[torch.Tensor] = []
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
 
@@ -615,6 +618,46 @@ class CPUOffloadingWorker(OffloadingWorker):
 
             if mmap_region is not None:
                 cpu_tensor = mmap_region.create_next_view(cpu_page_size_bytes)
+            elif (
+                os.environ.get("VLLM_KV_OFFLOAD_REGISTER_PIN") == "1"
+                and current_platform.is_cuda_alike()
+            ):
+                # Pin via cudaHostRegister on a PLAIN allocation. Bypasses
+                # torch's CUDACachingHostAllocator, which rounds every
+                # pin_memory=True request up to the next power of two
+                # (e.g. 36 GiB -> 64 GiB) and fails on RAM-constrained
+                # boxes - the reason VLLM_KV_OFFLOAD_DISABLE_PIN exists.
+                # Pageable CPU ranges in cuMemcpyBatchAsync are accepted
+                # silently but corrupt under the driver's emulated batch
+                # staging; registration restores true pinned DMA.
+                t0 = time.monotonic()
+                cpu_tensor = torch.zeros(
+                    (num_cpu_blocks, cpu_page_size_bytes),
+                    dtype=torch.int8,
+                    device="cpu",
+                )
+                res = torch.cuda.cudart().cudaHostRegister(
+                    cpu_tensor.data_ptr(), cpu_tensor.numel(), 0
+                )
+                if res.value != 0:
+                    logger.error(
+                        "cudaHostRegister failed (%s) for %d x %d CPU KV "
+                        "tensor; falling back to PAGEABLE memory - batch "
+                        "memcpy corruption risk",
+                        res.value,
+                        num_cpu_blocks,
+                        cpu_page_size_bytes,
+                    )
+                else:
+                    self._registered_cpu_tensors.append(cpu_tensor)
+                    logger.info(
+                        "cudaHostRegister CPU KV tensor %d×%d (%.2f GB) "
+                        "in %.3f s",
+                        num_cpu_blocks,
+                        cpu_page_size_bytes,
+                        cpu_tensor.numel() / 1e9,
+                        time.monotonic() - t0,
+                    )
             else:
                 t0 = time.monotonic()
                 cpu_tensor = torch.zeros(
@@ -676,3 +719,9 @@ class CPUOffloadingWorker(OffloadingWorker):
     def shutdown(self) -> None:
         self._store_handler.shutdown()
         self._load_handler.shutdown()
+        for tensor in getattr(self, "_registered_cpu_tensors", []):
+            try:
+                torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+            except Exception:
+                logger.debug("cudaHostUnregister failed for CPU KV tensor")
+        self._registered_cpu_tensors.clear()

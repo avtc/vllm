@@ -1261,3 +1261,53 @@ def test_pageable_roundtrip_via_handler(tensors):
         assert torch.equal(
             gpu2[170 + k].cpu(), src_content2[k].cpu()
         ), f"pageable load t1 misplaced at {k}"
+
+
+def test_register_pin_batch_memcpy(tensors):
+    """The FIX candidate path: plain (pageable) allocation pinned via
+    cudaHostRegister - bypasses torch's power-of-2 pinned allocator (the
+    reason VLLM_KV_OFFLOAD_DISABLE_PIN exists) while restoring true
+    pinned DMA for cuMemcpyBatchAsync. Production scale: 917504B ops."""
+    gpu1, _ = tensors
+    dev = gpu1.device
+    from vllm import _custom_ops as ops
+
+    PAGE_BIG = 917504
+    n_ops = 256
+
+    src_gpu = torch.zeros(n_ops, PAGE_BIG, dtype=torch.int8, device=dev)
+    ids = torch.arange(n_ops, dtype=torch.int32).view(n_ops, 1)
+    offs = torch.arange(PAGE_BIG, dtype=torch.int32).view(1, PAGE_BIG)
+    src_gpu.copy_(((ids * 131 + offs * 7 + 11) & 0xFF).to(torch.int8))
+
+    dst = torch.zeros(n_ops, PAGE_BIG, dtype=torch.int8)  # pageable
+    res = torch.cuda.cudart().cudaHostRegister(
+        dst.data_ptr(), dst.numel(), 0
+    )
+    assert res.value == 0, f"cudaHostRegister failed: {res.value}"
+    try:
+        perm = torch.randperm(n_ops)
+        src_ptrs = torch.tensor(
+            [src_gpu[i].data_ptr() for i in range(n_ops)],
+            dtype=torch.int64,
+        ).pin_memory()
+        dst_ptrs = torch.tensor(
+            [dst[int(p)].data_ptr() for p in perm], dtype=torch.int64
+        ).pin_memory()
+        sizes = torch.full((n_ops,), PAGE_BIG, dtype=torch.int64).pin_memory()
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+        ev = torch.cuda.Event()
+        ev.record(s)
+        ev.synchronize()
+
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(n_ops)
+        assert torch.equal(dst, src_gpu[inv].cpu()), (
+            "registered-pinned batch memcpy corrupted bytes"
+        )
+    finally:
+        torch.cuda.cudart().cudaHostUnregister(dst.data_ptr())
