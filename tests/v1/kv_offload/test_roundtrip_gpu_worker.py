@@ -175,13 +175,11 @@ def test_integrity_crc_detects_mutation(tensors, monkeypatch):
     assert chunk8_addr in load_h._store_crcs, "clean range wrongly evicted"
 
 
-def test_roundtrip_multi_group_straddling(tensors):
-    """Production topology: FOUR cache groups with DIFFERENT logical start
-    offsets (e.g. [13, 13, 13, 1] as logged in production) spanning TWO
-    distinct tensors. Log-8 showed stores whose destination pages all held
-    identical bytes (descriptor collapse) and loads reading zero pages -
-    both only reachable through the multi-group descriptor loop, which the
-    single-group tests cannot exercise."""
+def _run_multi_group(tensors, force_cpp_load: bool):
+    """Multi-group roundtrip body; force_cpp_load bypasses the Triton load
+    path to bisect Triton vs C++ misplacement. Production topology: FOUR
+    cache groups with DIFFERENT logical start offsets (e.g. [13, 13, 13, 1]
+    as logged in production) spanning TWO distinct tensors."""
     gpu1, cpu1 = tensors  # fixture: unique per-block patterns, pinned cpu
     dev = gpu1.device
 
@@ -211,6 +209,10 @@ def test_roundtrip_multi_group_straddling(tensors):
 
     store_h = _handler(True)
     load_h = _handler(False)
+    if force_cpp_load:
+        from vllm import _custom_ops as ops
+
+        load_h._swap_blocks_batch = ops.swap_blocks_batch
 
     block_indices = [13, 13, 13, 1]  # logical start per group (prod-like)
     span = 2 * BLOCKS_PER_CHUNK + 5  # blocks transferred per group
@@ -260,18 +262,37 @@ def test_roundtrip_multi_group_straddling(tensors):
 
     pattern1 = _pattern_matrix(NUM_GPU_BLOCKS)
     pattern2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
-    pos = 0
+    op = 0
     for g in range(4):
         pattern = pattern1 if g < 2 else pattern2
         gpu_t = gpu1 if g < 2 else gpu2
         for k in range(span):
             got = gpu_t[group_dst_base[g] + k].cpu()
             want = pattern[group_src_base[g] + k].cpu()
-            assert torch.equal(got, want), (
-                f"group {g} logical pos {k}: bytes misplaced or zeroed"
-            )
-            pos += 1
-    assert pos == sum(group_sizes)
+            if not torch.equal(got, want):
+                s_desc, d_desc, sz_desc = load_h.last_descriptors
+                src_ptr = int(s_desc[op])
+                cpu_base = cpu1.data_ptr() if g < 2 else cpu2.data_ptr()
+                gpu_base = (gpu1 if g < 2 else gpu2).data_ptr()
+                off = src_ptr - cpu_base
+                assert torch.equal(
+                    got, want
+                ), (
+                    f"group {g} pos {k} (load op {op}): misplaced. "
+                    f"load src desc off=0x{off:x} (chunk {off // (PAGE*BLOCKS_PER_CHUNK)}"
+                    f" sub {off % (PAGE*BLOCKS_PER_CHUNK) // PAGE}); "
+                    f"dst desc off=0x{int(d_desc[op]) - gpu_base:x}"
+                )
+            op += 1
+
+
+def test_roundtrip_multi_group_straddling(tensors):
+    _run_multi_group(tensors, force_cpp_load=False)
+
+
+def test_roundtrip_multi_group_straddling_cpp_load(tensors):
+    _run_multi_group(tensors, force_cpp_load=True)
+
 
 def test_large_batch_swap_exact(tensors):
     """Production stores submit THOUSANDS of copy ops in one

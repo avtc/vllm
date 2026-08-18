@@ -232,6 +232,8 @@ class SingleDirectionOffloadingHandler:
 
         # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
         self._mmap_region = mmap_region
+        # descriptor arrays of the most recent transfer (debug aid)
+        self.last_descriptors: tuple | None = None
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
@@ -378,6 +380,14 @@ class SingleDirectionOffloadingHandler:
         assert src_offset == num_src_blocks
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
+
+        # Debug capture: descriptor arrays as computed at submit time, so
+        # tests can compare intent vs effect when a kernel misplaces bytes.
+        self.last_descriptors = (
+            all_src.copy(),
+            all_dst.copy(),
+            all_sizes.copy(),
+        )
 
         if self._integrity and not self.gpu_to_cpu:
             import ctypes
