@@ -887,9 +887,61 @@ def _run_store_load_streams(tensors, concurrent: bool):
     for k in range(span1):
         ch = k // BLOCKS_PER_CHUNK
         sub = k % BLOCKS_PER_CHUNK
-        assert (
+        if not (
             cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1_pre[10 + k]
-        ).all(), f"PHASE 1 already wrong: cpu1[{ch}][{sub}] (k={k})"
+        ).all():
+            s_cap, d_cap, z_cap = store_h.last_descriptors
+            # post-hoc re-read of the POOLED buffer (returned to pool at
+            # get_finished): if it differs from the submit-time capture,
+            # something MUTATED the descriptors after submission
+            pooled = ""
+            if store_h._buffer_pool:
+                bs, bd, bz = store_h._buffer_pool[-1]
+                pooled = "; ".join(
+                    f"pooled[{j}]src=0x{int(bs.numpy()[j]):x}"
+                    for j in range(min(4, bs.numel()))
+                )
+            cap = "; ".join(
+                f"cap[{j}]src=g1[{(int(s_cap[j]) - gpu1.data_ptr()) // PAGE}]"
+                if gpu1.data_ptr()
+                <= int(s_cap[j])
+                < gpu1.data_ptr() + gpu1.numel()
+                else f"cap[{j}]src=0x{int(s_cap[j]):x}"
+                for j in range(min(4, len(s_cap)))
+            )
+            # direct retry of the CAPTURED descriptors into scratch
+            from vllm import _custom_ops as ops
+
+            scratch = torch.zeros_like(cpu1)
+            rd = [
+                scratch.data_ptr() + (int(d_cap[j]) - cpu1.data_ptr())
+                for j in range(len(s_cap))
+                if 0 <= int(d_cap[j]) - cpu1.data_ptr() < cpu1.numel()
+            ]
+            rs = torch.tensor(
+                [int(x) for x in s_cap[: len(rd)]], dtype=torch.int64
+            ).pin_memory()
+            rdt = torch.tensor(rd, dtype=torch.int64).pin_memory()
+            rz = torch.tensor(
+                [int(x) for x in z_cap[: len(rd)]], dtype=torch.int64
+            ).pin_memory()
+            st2 = torch.cuda.Stream()
+            st2.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(st2):
+                ops.swap_blocks_batch(rs, rdt, rz)
+            ev2 = torch.cuda.Event()
+            ev2.record(st2)
+            ev2.synchronize()
+            retry_ok = (
+                scratch.view(-1)[:PAGE] == pat1_pre[10]
+            ).all()
+            assert (
+                cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1_pre[10 + k]
+            ).all(), (
+                f"PHASE 1 wrong: cpu1[{ch}][{sub}] k={k}; {cap}; {pooled}; "
+                f"direct retry of captured descs: "
+                f"{'CORRECT' if retry_ok else 'ALSO WRONG'}"
+            )
         assert (
             cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] == pat2_pre[30 + k]
         ).all(), f"PHASE 1 already wrong: cpu2[{3 + ch}][{sub}] (k={k})"
