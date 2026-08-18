@@ -869,8 +869,15 @@ def _run_store_load_streams(tensors, concurrent: bool):
         gpu_to_cpu=False,
     )
 
-    # phase 1: store blocks into chunks 0..3 of both tensors
+    # phase 1: store blocks into chunks 0..3 of both tensors.
+    # SNAPSHOT actual source bytes at store time: the module fixture is
+    # shared and earlier tests legitimately rewrite gpu rows, so pattern
+    # formulas are NOT valid expectations (a numeric aliasing coincidence
+    # between integration-test content and pat1[92] mimicked an
+    # impossible cross-address copy for three debugging rounds).
     span1 = 24
+    snap1 = [gpu1[b].clone() for b in range(10, 10 + span1)]
+    snap2 = [gpu2[b].clone() for b in range(30, 30 + span1)]
     sspec = GPULoadStoreSpec(
         list(range(10, 10 + span1)) + list(range(30, 30 + span1)),
         group_sizes=[span1, span1],
@@ -881,74 +888,22 @@ def _run_store_load_streams(tensors, concurrent: bool):
     store_h.wait({1})
     assert store_h.get_finished()
 
-    # checkpoint after phase 1: isolate which phase corrupts
-    pat1_pre = _pattern_matrix(NUM_GPU_BLOCKS)
-    pat2_pre = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
+    # checkpoint after phase 1 (against snapshots)
     for k in range(span1):
         ch = k // BLOCKS_PER_CHUNK
         sub = k % BLOCKS_PER_CHUNK
-        if not (
-            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1_pre[10 + k]
-        ).all():
-            s_cap, d_cap, z_cap = store_h.last_descriptors
-            # post-hoc re-read of the POOLED buffer (returned to pool at
-            # get_finished): if it differs from the submit-time capture,
-            # something MUTATED the descriptors after submission
-            pooled = ""
-            if store_h._buffer_pool:
-                bs, bd, bz = store_h._buffer_pool[-1]
-                pooled = "; ".join(
-                    f"pooled[{j}]src=0x{int(bs.numpy()[j]):x}"
-                    for j in range(min(4, bs.numel()))
-                )
-            cap = "; ".join(
-                f"cap[{j}]src=g1[{(int(s_cap[j]) - gpu1.data_ptr()) // PAGE}]"
-                if gpu1.data_ptr()
-                <= int(s_cap[j])
-                < gpu1.data_ptr() + gpu1.numel()
-                else f"cap[{j}]src=0x{int(s_cap[j]):x}"
-                for j in range(min(4, len(s_cap)))
-            )
-            # direct retry of the CAPTURED descriptors into scratch
-            from vllm import _custom_ops as ops
-
-            scratch = torch.zeros_like(cpu1)
-            rd = [
-                scratch.data_ptr() + (int(d_cap[j]) - cpu1.data_ptr())
-                for j in range(len(s_cap))
-                if 0 <= int(d_cap[j]) - cpu1.data_ptr() < cpu1.numel()
-            ]
-            rs = torch.tensor(
-                [int(x) for x in s_cap[: len(rd)]], dtype=torch.int64
-            ).pin_memory()
-            rdt = torch.tensor(rd, dtype=torch.int64).pin_memory()
-            rz = torch.tensor(
-                [int(x) for x in z_cap[: len(rd)]], dtype=torch.int64
-            ).pin_memory()
-            st2 = torch.cuda.Stream()
-            st2.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(st2):
-                ops.swap_blocks_batch(rs, rdt, rz)
-            ev2 = torch.cuda.Event()
-            ev2.record(st2)
-            ev2.synchronize()
-            retry_ok = (
-                scratch.view(-1)[:PAGE] == pat1_pre[10]
-            ).all()
-            assert (
-                cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1_pre[10 + k]
-            ).all(), (
-                f"PHASE 1 wrong: cpu1[{ch}][{sub}] k={k}; {cap}; {pooled}; "
-                f"direct retry of captured descs: "
-                f"{'CORRECT' if retry_ok else 'ALSO WRONG'}"
-            )
         assert (
-            cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] == pat2_pre[30 + k]
-        ).all(), f"PHASE 1 already wrong: cpu2[{3 + ch}][{sub}] (k={k})"
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == snap1[k].cpu()
+        ).all(), f"PHASE 1 wrong: cpu1[{ch}][{sub}] (k={k})"
+        assert (
+            cpu2[3 + ch, sub * PAGE : (sub + 1) * PAGE] == snap2[k].cpu()
+        ).all(), f"PHASE 1 wrong: cpu2[{3 + ch}][{sub}] (k={k})"
 
     # phase 2: CONCURRENT store (new chunks) + load (old chunks), no wait
     # between submissions so the two streams overlap in execution
     span2 = 16
+    snap1b = [gpu1[b].clone() for b in range(60, 60 + span2)]
+    snap2b = [gpu2[b].clone() for b in range(100, 100 + span2)]
     store_spec = GPULoadStoreSpec(
         list(range(60, 60 + span2)) + list(range(100, 100 + span2)),
         group_sizes=[span2, span2],
@@ -970,87 +925,31 @@ def _run_store_load_streams(tensors, concurrent: bool):
     assert store_h.get_finished()
     assert load_h.get_finished()
 
-    pat1 = _pattern_matrix(NUM_GPU_BLOCKS)
-    pat2 = _pattern_matrix(NUM_GPU_BLOCKS + 7)[7:]
-    # post-phase-2 CPU sanity: chunks 0..2 (group0) must still hold rows
-    # 10..33; chunks 8..9 the phase-2 store; then verify the loads
+    # post-phase-2 verification against store-time snapshots
     for k in range(span1):
         ch = k // BLOCKS_PER_CHUNK
         sub = k % BLOCKS_PER_CHUNK
-        if not (
-            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[10 + k]
-        ).all():
-            from vllm import _custom_ops as ops
-
-            s_d, d_d, z_d = store_h.last_descriptors
-            decoded = "; ".join(
-                f"op{j}:src=g1[{(int(s_d[j]) - gpu1.data_ptr()) // PAGE}]"
-                f"->c1[{(int(d_d[j]) - cpu1.data_ptr()) // 32768}]"
-                if int(d_d[j]) - cpu1.data_ptr() < cpu1.numel()
-                and int(d_d[j]) >= cpu1.data_ptr()
-                else f"op{j}:dst=+0x{int(d_d[j]):x}"
-                for j in range(0, min(6, len(s_d)))
-            )
-            # same-descriptor direct retry: bisects handler context vs
-            # driver behavior
-            retry = torch.zeros_like(cpu1)
-            rd = []
-            for j in range(len(s_d)):
-                base = int(d_d[j]) - cpu1.data_ptr()
-                rd.append(retry.data_ptr() + base)
-            rs = torch.tensor(
-                [int(x) for x in s_d[: len(rd)]], dtype=torch.int64
-            ).pin_memory()
-            rd_t = torch.tensor(rd, dtype=torch.int64).pin_memory()
-            rz = torch.tensor(
-                [int(x) for x in z_d[: len(rd)]], dtype=torch.int64
-            ).pin_memory()
-            st2 = torch.cuda.Stream()
-            st2.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(st2):
-                ops.swap_blocks_batch(rs, rd_t, rz)
-            ev2 = torch.cuda.Event()
-            ev2.record(st2)
-            ev2.synchronize()
-            retry_ok = (
-                retry.view(-1)[:PAGE] == pat1[10]
-            ).all()
-            assert (
-                cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[10 + k]
-            ).all(), (
-                f"CPU chunk {ch} sub {sub} corrupted after phase 2; "
-                f"store descs: {decoded}; direct retry of same descs: "
-                f"{'CORRECT' if retry_ok else 'ALSO WRONG'}"
-            )
+        assert (
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == snap1[k].cpu()
+        ).all(), f"cpu1[{ch}][{sub}] corrupted after phase 2 (k={k})"
     for k in range(span1):
-        got = gpu1[150 + k].cpu()
-        want = pat1[10 + k]
-        if not torch.equal(got, want):
-            s_desc, d_desc, _sz = load_h.last_descriptors
-            o = 0
-            cpu_base = cpu1.data_ptr()
-            so = int(s_desc[o]) - cpu_base
-            do = int(d_desc[o]) - gpu1.data_ptr()
-            torch.equal(
-                got, want
-            ) is True, (
-                f"load t0 {k}: got=pat[{(int(got[0]) - 11) % 256}]-ish; "
-                f"desc0 src=cpu+0x{so:x} (chunk {so // cpu1.stride(0)} "
-                f"sub {(so % cpu1.stride(0)) // PAGE}) "
-                f"dst=gpu1[{do // PAGE}]"
-            )
-        assert torch.equal(gpu2[170 + k].cpu(), pat2[30 + k]), f"load t1 {k}"
+        assert torch.equal(gpu1[150 + k].cpu(), snap1[k].cpu()), (
+            f"load t0 {k} misplaced"
+        )
+        assert torch.equal(gpu2[170 + k].cpu(), snap2[k].cpu()), (
+            f"load t1 {k} misplaced"
+        )
     for k in range(span2):
         # concurrent store: chunks 8..11 hold rows 60.. / 100..
         pos = k
         ch = 8 + pos // BLOCKS_PER_CHUNK
         sub = pos % BLOCKS_PER_CHUNK
         assert (
-            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == pat1[60 + k]
+            cpu1[ch, sub * PAGE : (sub + 1) * PAGE] == snap1b[k].cpu()
         ).all(), f"store t0 {k}"
         ch1 = 10 + pos // BLOCKS_PER_CHUNK
         assert (
-            cpu2[ch1, sub * PAGE : (sub + 1) * PAGE] == pat2[100 + k]
+            cpu2[ch1, sub * PAGE : (sub + 1) * PAGE] == snap2b[k].cpu()
         ).all(), f"store t1 {k}"
 
 
