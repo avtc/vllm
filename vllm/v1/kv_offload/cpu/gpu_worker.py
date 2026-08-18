@@ -33,20 +33,46 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 logger = init_logger(__name__)
 
 
+def _chunked_swap_blocks_fn(fn, chunk_size: int):
+    """Wrap ops.swap_blocks_batch to submit in fixed-size chunks.
+
+    VLLM_KV_OFFLOAD_BATCH_CHUNK=N splits descriptor arrays into N-op
+    batches. Workaround vehicle for driver-side cuMemcpyBatchAsync
+    emulation bugs on large/mixed batches (isolated-op corruption seen on
+    CUDA 12.8 driver + Ampere); per-chunk semantics are identical."""
+
+    def _fn(src, dst, sizes, is_src_access_order_any=False):
+        n = src.numel()
+        for i in range(0, n, chunk_size):
+            fn(
+                src[i : i + chunk_size],
+                dst[i : i + chunk_size],
+                sizes[i : i + chunk_size],
+                is_src_access_order_any,
+            )
+
+    return _fn
+
+
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
 ):
     """Resolve the swap_blocks function for a handler at init time."""
+    chunk = int(os.environ.get("VLLM_KV_OFFLOAD_BATCH_CHUNK", "0") or 0)
+
+    def _maybe_chunk(fn):
+        return _chunked_swap_blocks_fn(fn, chunk) if chunk > 0 else fn
+
     # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
     if gpu_to_cpu:
-        return ops.swap_blocks_batch
+        return _maybe_chunk(ops.swap_blocks_batch)
     # Fall back to the C++ DMA path on platforms where Triton isn't usable
     # (e.g. ROCm builds without Triton) or where GPU kernels cannot directly
     # dereference CPU pointers (XPU lacks CUDA's unified virtual address space,
     # so the Triton kernel's tl.load(cpu_ptr) is invalid on XPU).
     if not HAS_TRITON or current_platform.is_xpu():
-        return ops.swap_blocks_batch
+        return _maybe_chunk(ops.swap_blocks_batch)
     page_sizes = [r.page_size_bytes for g in kv_cache_groups_data_refs for r in g]
     # Triton wins only on small, 8-byte-aligned payloads.
     if (
@@ -54,7 +80,7 @@ def _select_swap_blocks_fn(
         or max(page_sizes) >= THRESHOLD_BYTES
         or any(s % 8 for s in page_sizes)
     ):
-        return ops.swap_blocks_batch
+        return _maybe_chunk(ops.swap_blocks_batch)
     chunk = min(triton.next_power_of_2(max(page_sizes)), 8192)
     return functools.partial(swap_blocks_batch, bytes_per_chunk=chunk)
 

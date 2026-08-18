@@ -258,9 +258,20 @@ def _run_multi_group(tensors, force_cpp_load: bool):
             pat = pattern1 if g < 2 else pattern2
             want = pat[group_src_base[g] + k].numpy()
             got = (cpu1 if g < 2 else cpu2)[ch, sub * PAGE : (sub + 1) * PAGE].numpy()
-            assert (got == want).all(), (
-                f"STORE misplaced: group {g} pos {k} -> cpu[{ch}][{sub}]"
-            )
+            if not (got == want).all():
+                s_desc, d_desc, sz_desc = store_h.last_descriptors
+                op_idx = sum(group_sizes[:g]) + k
+                cpu_base = cpu1.data_ptr() if g < 2 else cpu2.data_ptr()
+                gpu_base = (gpu1 if g < 2 else gpu2).data_ptr()
+                soff = int(s_desc[op_idx]) - gpu_base
+                doff = int(d_desc[op_idx]) - cpu_base
+                assert (got == want).all(), (
+                    f"STORE misplaced: group {g} pos {k} (op {op_idx}) -> "
+                    f"cpu[{ch}][{sub}]; store desc says src=gpu"
+                    f"[{soff // PAGE}] dst=cpu"
+                    f"[{doff // (PAGE*BLOCKS_PER_CHUNK)}]"
+                    f"[{doff % (PAGE*BLOCKS_PER_CHUNK) // PAGE}]"
+                )
 
     # LOAD: same chunks, same logical offsets, fresh physical dst blocks.
     dst_gpu_blocks: list[int] = []
@@ -369,7 +380,8 @@ def test_large_batch_swap_exact(tensors):
         inv = torch.empty_like(perm)
         inv[perm] = torch.arange(n_ops)
         want = src_gpu[inv].cpu()
-        if not torch.equal(dst, want):
+        got = dst.cpu() if dst.is_cuda else dst
+        if not torch.equal(got, want):
             bad = (dst != want).any(dim=1)
             pytest.fail(
                 f"{direction} batch n={n_ops} page={page}: "
@@ -380,3 +392,72 @@ def test_large_batch_swap_exact(tensors):
         _run(n_ops, page, "d2h")
         _run(n_ops, page, "h2d")
 
+
+def test_direct_batch_memcpy_mixed_tensors(tensors):
+    """Minimal repro: pure ops.swap_blocks_batch with EXACTLY the failing
+    multi-group store shape (84 ops, TWO source tensors, 4096B pages) -
+    no handler code involved. If this corrupts, the bug is in the C++
+    wrapper or the driver's cuMemcpyBatchAsync emulation; the sub-cases
+    bisect tensor-mixing and batch size, and the chunked variant tests
+    the candidate fix."""
+    gpu1, cpu1 = tensors
+    dev = gpu1.device
+    from vllm import _custom_ops as ops
+
+    gpu2 = torch.zeros(NUM_GPU_BLOCKS, PAGE, dtype=torch.int8, device=dev)
+    gpu2.copy_(_pattern_matrix(NUM_GPU_BLOCKS + 7)[7:], non_blocking=False)
+    cpu2 = torch.zeros(
+        NUM_CPU_BLOCKS, PAGE * BLOCKS_PER_CHUNK, dtype=torch.int8
+    ).pin_memory()
+
+    span = 21
+    group_src_base = [50, 90, 33, 120]
+    chunk_lists = [[16, 17, 18, 19], [20, 21, 22, 23], [24, 25, 26, 27], [28, 29, 30]]
+    skips = [5, 5, 5, 1]
+
+    srcs, dsts = [], []
+    for g in range(4):
+        gt = gpu1 if g < 2 else gpu2
+        ct = cpu1 if g < 2 else cpu2
+        pos = skips[g]
+        for k in range(span):
+            srcs.append(gt[group_src_base[g] + k].data_ptr())
+            ch = chunk_lists[g][pos // BLOCKS_PER_CHUNK]
+            sub = pos % BLOCKS_PER_CHUNK
+            dsts.append(ct.data_ptr() + ch * ct.stride(0) + sub * PAGE)
+            pos += 1
+    n = len(srcs)
+
+    def _batch(copy_slice, tag):
+        s = torch.tensor(srcs[copy_slice], dtype=torch.int64).pin_memory()
+        d = torch.tensor(dsts[copy_slice], dtype=torch.int64).pin_memory()
+        sz = torch.full((len(copy_slice),), PAGE, dtype=torch.int64).pin_memory()
+        st = torch.cuda.Stream()
+        st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            ops.swap_blocks_batch(s, d, sz)
+        ev = torch.cuda.Event()
+        ev.record(st)
+        ev.synchronize()
+        bad = []
+        for i, j in enumerate(copy_slice):
+            g = min(j // span, 3)
+            k = j - g * span
+            gt = gpu1 if g < 2 else gpu2
+            ct = cpu1 if g < 2 else cpu2
+            pos = skips[g] + k
+            ch = chunk_lists[g][pos // BLOCKS_PER_CHUNK]
+            sub = pos % BLOCKS_PER_CHUNK
+            want = gt[group_src_base[g] + k]
+            got = ct[ch, sub * PAGE : (sub + 1) * PAGE]
+            if not torch.equal(got.cpu(), want.cpu()):
+                bad.append((tag, j, g, k))
+        return bad
+
+    all_bad = []
+    all_bad += _batch(list(range(n)), "full-84")
+    all_bad += _batch(list(range(n)), "full-84-repeat")
+    all_bad += _batch(list(range(64)), "first-64")
+    for start in range(0, n, 16):
+        all_bad += _batch(list(range(start, min(start + 16, n))), f"chunk{start}")
+    assert not all_bad, f"corrupted ops: {all_bad[:8]}"
