@@ -644,6 +644,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         # CPU KV tensors we cudaHostRegister'ed ourselves (unregistered on
         # shutdown). Only populated under VLLM_KV_OFFLOAD_REGISTER_PIN=1.
         self._registered_cpu_tensors: list[torch.Tensor] = []
+        self._registered_cpu_mmaps: list = []
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
 
@@ -670,14 +671,29 @@ class CPUOffloadingWorker(OffloadingWorker):
                 # Pageable CPU ranges in cuMemcpyBatchAsync are accepted
                 # silently but corrupt under the driver's emulated batch
                 # staging; registration restores true pinned DMA.
+                import mmap as _mmap_mod
+
                 t0 = time.monotonic()
-                cpu_tensor = torch.zeros(
-                    (num_cpu_blocks, cpu_page_size_bytes),
-                    dtype=torch.int8,
-                    device="cpu",
-                )
+                # Page-aligned, zero-filled, OUTSIDE the malloc heap.
+                # torch.zeros lands in glibc's arena/brk for some sizes -
+                # mid-heap, NOT page-aligned - and cudaHostRegister then
+                # fails with CUDA_ERROR_INVALID_VALUE (observed: ~half of
+                # tensors fail, mixed with successes from mmap'd
+                # allocations), while partially-registered ranges pin
+                # pages shared with malloc metadata and poison the CUDA
+                # context (subsequent trivial ops die with 'invalid
+                # argument'). Anonymous private mmap is page-aligned by
+                # construction (same pattern as SharedOffloadRegion).
+                nbytes = num_cpu_blocks * cpu_page_size_bytes
+                page = _mmap_mod.PAGESIZE
+                map_len = ((nbytes + page - 1) // page) * page
+                mapped = _mmap_mod.mmap(-1, map_len)
+                cpu_tensor = torch.frombuffer(
+                    memoryview(mapped), dtype=torch.int8
+                ).view(num_cpu_blocks, cpu_page_size_bytes)
+                self._registered_cpu_mmaps.append(mapped)
                 res = torch.cuda.cudart().cudaHostRegister(
-                    cpu_tensor.data_ptr(), cpu_tensor.numel(), 0
+                    cpu_tensor.data_ptr(), map_len, 0
                 )
                 if res.value != 0:
                     logger.error(
@@ -765,3 +781,9 @@ class CPUOffloadingWorker(OffloadingWorker):
             except Exception:
                 logger.debug("cudaHostUnregister failed for CPU KV tensor")
         self._registered_cpu_tensors.clear()
+        for mapped in getattr(self, "_registered_cpu_mmaps", []):
+            try:
+                mapped.close()
+            except Exception:
+                logger.debug("mmap close failed for CPU KV tensor")
+        self._registered_cpu_mmaps.clear()
