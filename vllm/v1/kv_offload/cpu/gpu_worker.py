@@ -33,6 +33,46 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 logger = init_logger(__name__)
 
 
+def _contiguous_run_swap_fn(fn):
+    """Split a batched copy into CONTIGUOUS RUNS before submission.
+
+    The driver's (emulated, pre-Hopper) cuMemcpyBatchAsync silently
+    drops or misdirects ops when a single batch spans multiple
+    non-contiguous host/device ranges - reproduced with both pinned and
+    pageable CPU tensors when one store touches two separate CPU tensors
+    (second range never written / first range read from wrong addresses).
+    Production stores span MANY canonical tensors per call. Splitting at
+    every (src, dst) discontinuity preserves semantics exactly while
+    keeping each driver batch within one contiguous run."""
+
+    def _fn(src, dst, sizes, is_src_access_order_any=False):
+        s_np = src.numpy()
+        d_np = dst.numpy()
+        z_np = sizes.numpy()
+        n = len(s_np)
+        start = 0
+        for i in range(1, n):
+            if (
+                int(d_np[i]) != int(d_np[i - 1]) + int(z_np[i - 1])
+                or int(s_np[i]) != int(s_np[i - 1]) + int(z_np[i - 1])
+            ):
+                fn(
+                    src[start:i],
+                    dst[start:i],
+                    sizes[start:i],
+                    is_src_access_order_any,
+                )
+                start = i
+        fn(
+            src[start:n],
+            dst[start:n],
+            sizes[start:n],
+            is_src_access_order_any,
+        )
+
+    return _fn
+
+
 def _chunked_swap_blocks_fn(fn, chunk_size: int):
     """Wrap ops.swap_blocks_batch to submit in fixed-size chunks.
 
@@ -247,8 +287,8 @@ class SingleDirectionOffloadingHandler:
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
-        self._swap_blocks_batch = _select_swap_blocks_fn(
-            kv_cache_groups_data_refs, gpu_to_cpu
+        self._swap_blocks_batch = _contiguous_run_swap_fn(
+            _select_swap_blocks_fn(kv_cache_groups_data_refs, gpu_to_cpu)
         )
 
         # GPU blocks may be smaller

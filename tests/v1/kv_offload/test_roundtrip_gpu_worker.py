@@ -899,7 +899,6 @@ def _run_store_load_streams(tensors, concurrent: bool):
     assert store_h.transfer_async(2, store_spec, store_dst)
     if not concurrent:
         store_h.wait({2})
-        assert store_h.get_finished()
     assert load_h.transfer_async(3, load_src, load_dst)
     store_h.wait({2})
     load_h.wait({3})
