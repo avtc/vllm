@@ -271,17 +271,33 @@ def _run_multi_group(tensors, force_cpp_load: bool):
             want = pattern[group_src_base[g] + k].cpu()
             if not torch.equal(got, want):
                 s_desc, d_desc, sz_desc = load_h.last_descriptors
-                src_ptr = int(s_desc[op])
                 cpu_base = cpu1.data_ptr() if g < 2 else cpu2.data_ptr()
                 gpu_base = (gpu1 if g < 2 else gpu2).data_ptr()
-                off = src_ptr - cpu_base
+
+                def _dec(p):
+                    off = int(p) - cpu_base
+                    if 0 <= off < NUM_CPU_BLOCKS * PAGE * BLOCKS_PER_CHUNK:
+                        return (
+                            f"cpu[{off // (PAGE*BLOCKS_PER_CHUNK)}]"
+                            f"[{off % (PAGE*BLOCKS_PER_CHUNK) // PAGE}]"
+                        )
+                    return f"cpu+0x{off:x}!"
+
+                def _gdec(p):
+                    return f"gpu[{(int(p) - gpu_base) // PAGE}]"
+
+                nb = []
+                for j in range(max(0, op - 2), min(len(s_desc), op + 3)):
+                    nb.append(
+                        f"op{j}:src={_dec(s_desc[j])}"
+                        f"->dst={_gdec(d_desc[j])}"
+                        f"{' <<<' if j == op else ''}"
+                    )
                 assert torch.equal(
                     got, want
                 ), (
-                    f"group {g} pos {k} (load op {op}): misplaced. "
-                    f"load src desc off=0x{off:x} (chunk {off // (PAGE*BLOCKS_PER_CHUNK)}"
-                    f" sub {off % (PAGE*BLOCKS_PER_CHUNK) // PAGE}); "
-                    f"dst desc off=0x{int(d_desc[op]) - gpu_base:x}"
+                    f"group {g} pos {k} (load op {op}): misplaced; "
+                    f"descriptors: {'; '.join(nb)}"
                 )
             op += 1
 
