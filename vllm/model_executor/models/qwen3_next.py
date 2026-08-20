@@ -77,6 +77,37 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+
+def _dbg_layers_dump(layer, hidden_states):
+    """Env-gated per-layer hidden-state dump for cross-stack layer diffing.
+
+    Writes the hidden state entering each decoder layer to
+    VLLM_DUMP_LAYERS_DIR (rank 0 only) so vLLM forwards can be compared
+    layer-by-layer against a reference implementation. No effect unless the
+    environment variable is set.
+    """
+    import os as _os
+
+    d = _os.environ.get("VLLM_DUMP_LAYERS_DIR")
+    if not d or hidden_states is None or hidden_states.dim() != 2:
+        return
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank as _rank
+
+        if _rank() != 0:
+            return
+    except Exception:
+        return
+    idx = getattr(layer, "layer_idx", -1)
+    seq = layer.__dict__.setdefault("_dbg_seq", 0)
+    layer._dbg_seq += 1
+    _os.makedirs(d, exist_ok=True)
+    torch.save(
+        {"layer_idx": idx, "seq": seq, "n_tokens": hidden_states.shape[0],
+         "hidden": hidden_states.detach().float().cpu()},
+        f"{d}/in_{idx:02d}_{seq:03d}.pt",
+    )
+
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -496,6 +527,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        _dbg_layers_dump(self, hidden_states)
         full_num_tokens = positions.shape[-1]
         input_is_sequence_parallel = (
             self.use_attn_reduce_scatter_for_moe
