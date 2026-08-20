@@ -78,13 +78,14 @@ from .utils import (
 logger = init_logger(__name__)
 
 
-def _dbg_layers_dump(layer, hidden_states):
+def _dbg_layers_dump(layer, hidden_states, stage="in"):
     """Env-gated per-layer hidden-state dump for cross-stack layer diffing.
 
-    Writes the hidden state entering each decoder layer to
-    VLLM_DUMP_LAYERS_DIR (rank 0 only) so vLLM forwards can be compared
-    layer-by-layer against a reference implementation. No effect unless the
-    environment variable is set.
+    Writes hidden states at decoder-layer stages ("in" entering the layer,
+    "attn" after the attention/linear-attn module before the residual add,
+    "mlp" after the MLP/MoE module before the residual add) to
+    VLLM_DUMP_LAYERS_DIR (rank 0 only). No effect unless the environment
+    variable is set.
     """
     import os as _os
 
@@ -105,7 +106,7 @@ def _dbg_layers_dump(layer, hidden_states):
     torch.save(
         {"layer_idx": idx, "seq": seq, "n_tokens": hidden_states.shape[0],
          "hidden": hidden_states.detach().float().cpu()},
-        f"{d}/in_{idx:02d}_{seq:03d}.pt",
+        f"{d}/stg_{stage}_{idx:02d}_{seq:03d}.pt",
     )
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -555,6 +556,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
+        _dbg_layers_dump(self, hidden_states, "attn")
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -584,6 +587,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
+
+        _dbg_layers_dump(self, hidden_states, "mlp")
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
