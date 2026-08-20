@@ -87,6 +87,13 @@ class MRotaryEmbeddingInterleaved(MRotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Interleave the rotary embedding"""
         cos_sin = self.cos_sin_cache[positions]
+        if positions.ndim == 1:
+            # Text-only inputs carry a single position per token, so the
+            # T/H/W mrope sections coincide and the interleaved layout must
+            # degenerate to the plain (identity) frequency order. Applying the
+            # section permutation here would assign each rotary dim the
+            # frequency of a different dim and structurally distort the model.
+            return cos_sin, positions
         mrope_section_3d = [1] * len(self.mrope_dim)
         mrope_dim = self.mrope_dim
         cos_sin = torch.cat(

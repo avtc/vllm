@@ -234,3 +234,43 @@ def test_mrope_torch_compile_tracing(
 
     except Exception as e:
         pytest.fail(f"forward_cuda failed to trace with torch.compile inductor: {e}")
+
+
+def test_mrope_interleaved_text_only_matches_plain_rope():
+    """1D (text-only) positions must degenerate to plain rope frequency order.
+
+    With a single position per token the T/H/W mrope sections coincide, so the
+    interleaved layout must equal the identity layout. A permutation here
+    assigns each rotary dim another dim's frequency and structurally distorts
+    text-only inference of interleaved-mrope models (e.g. qwen3.5 VLM wrappers
+    serving text traffic on the eager path).
+    """
+    torch.manual_seed(0)
+    head_size, rotary_dim = 256, 64
+    params = {
+        "rope_type": "default",
+        "rope_theta": 10000000.0,
+        "partial_rotary_factor": 0.25,
+    }
+    rope_interleaved = get_rope(
+        head_size=head_size,
+        max_position=512,
+        is_neox_style=True,
+        rope_parameters=dict(params, mrope_section=[11, 11, 10], mrope_interleaved=True),
+    )
+    assert type(rope_interleaved).__name__ == "MRotaryEmbeddingInterleaved"
+    rope_plain = get_rope(
+        head_size=head_size,
+        max_position=512,
+        is_neox_style=True,
+        rope_parameters=dict(params),
+    )
+
+    q = torch.randn(13, 4 * head_size, dtype=torch.float32, device=device)
+    k = torch.randn(13, 2 * head_size, dtype=torch.float32, device=device)
+    pos = torch.randint(0, 512, (13,), device=device)
+
+    q_i, k_i = rope_interleaved(pos, q.clone(), k.clone())
+    q_p, k_p = rope_plain(pos, q.clone(), k.clone())
+    torch.testing.assert_close(q_i, q_p)
+    torch.testing.assert_close(k_i, k_p)
